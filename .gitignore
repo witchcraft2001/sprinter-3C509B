@@ -1,0 +1,6 @@
+/build/
+/distr/
+.DS_Store
+*.bak
+*.swp
+*~
