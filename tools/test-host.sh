@@ -18,7 +18,7 @@ sjasmplus --version 2>&1 | head -n 1
 
 bash -n "$script_dir/artifacts.sh" "$script_dir/build.sh" \
   "$script_dir/image.sh" "$script_dir/package.sh" "$script_dir/test-host.sh" \
-  "$script_dir/test-stage3-asm.sh"
+  "$script_dir/test-stage3-asm.sh" "$script_dir/test-stage4-asm.sh"
 sh -n "$script_dir/3com.sh"
 input_profile="$repo_root/config/mame/sprinter.cfg"
 ui_profile="$repo_root/config/mame/default.cfg"
@@ -39,6 +39,7 @@ perl -c "$script_dir/check-hello.pl" >/dev/null
 perl -c "$script_dir/check-text.pl" >/dev/null
 perl -c "$script_dir/check-stage1-audit.pl" >/dev/null
 perl -c "$script_dir/check-stage3.pl" >/dev/null
+perl -c "$script_dir/check-stage4.pl" >/dev/null
 
 "$script_dir/build.sh"
 perl "$script_dir/check-hello.pl" \
@@ -46,6 +47,8 @@ perl "$script_dir/check-hello.pl" \
 perl "$script_dir/check-stage1-audit.pl" "$repo_root/docs/STAGE1_AUDIT.md"
 perl "$script_dir/check-stage3.pl" "$repo_root" EL3INFO EL3EEP ISAPROBE
 "$script_dir/test-stage3-asm.sh"
+perl "$script_dir/check-stage4.pl" "$repo_root"
+"$script_dir/test-stage4-asm.sh"
 
 artifact_validate_manifest IMG
 artifact_validate_manifest ZIP
@@ -57,7 +60,7 @@ text_copy="$(mktemp "${TMPDIR:-/tmp}/sprinter-509b-text.XXXXXX")"
 binary_copy="$(mktemp "${TMPDIR:-/tmp}/sprinter-509b-binary.XXXXXX")"
 trap 'rm -f "$expected_img" "$expected_zip" "$actual_names" "$text_copy" "$binary_copy"' EXIT
 
-printf '%s\n' EL3EEP.EXE EL3INFO.EXE EL3INFO.TXT HELLO.EXE ISAPROBE.EXE \
+printf '%s\n' EL3EEP.EXE EL3INFO.EXE EL3INFO.TXT EL3REG.EXE EL3REG.TXT HELLO.EXE ISAPROBE.EXE \
   LICENSE.TXT NETSMPL.CFG README.TXT READMERU.TXT \
   | LC_ALL=C sort > "$expected_img"
 artifact_names IMG | LC_ALL=C sort > "$actual_names"
@@ -89,7 +92,7 @@ if iconv -f CP866 -t UTF-8 "$text_copy" | grep -Eqi \
   exit 1
 fi
 
-for binary in HELLO EL3INFO EL3EEP ISAPROBE; do
+for binary in HELLO EL3INFO EL3EEP EL3REG ISAPROBE; do
   artifact_copy binary "$repo_root/build/$binary.EXE" "$binary_copy" "$script_dir"
   cmp "$repo_root/build/$binary.EXE" "$binary_copy"
 done
@@ -100,7 +103,7 @@ if [ "$version" != "0.0.1" ] || ! grep -q 'PACKAGE_VERSION.*"0.0.1"' \
   echo "Error: package version declarations disagree" >&2
   exit 1
 fi
-for binary in EL3INFO EL3EEP ISAPROBE; do
+for binary in EL3INFO EL3EEP EL3REG ISAPROBE; do
   if ! grep -a -q "v0.0.1" "$repo_root/build/$binary.EXE"; then
     echo "Error: $binary banner is not version 0.0.1" >&2
     exit 1

@@ -26,9 +26,9 @@ START
 	LD	A,EL3_STAGE_ARGS
 	LD	(EL3_LAST_STAGE),A
 	XOR	A
-	LD	(EL3_LAST_TICKS),A
 	LD	H,A
 	LD	L,A
+	LD	(EL3_LAST_TICKS),HL
 	LD	(EL3_LAST_STATUS),HL
 	LD	(EL3_BASE),HL
 	LD	HL,MSG_BANNER
@@ -209,7 +209,7 @@ MSG_HELP_1	DB "Usage: EL3INFO [-v] [-s 0|1] [-p #100..#1F0]",0
 MSG_HELP_2	DB "               [-b AUTO|#200..#3E0]",0
 MSG_ERROR_STAGE	DB "ERROR stage=",0
 MSG_ERROR_CODE	DB " code=",0
-MSG_ERROR_TICKS	DB " ticks=",0
+MSG_ERROR_TICKS	DB " waitq=",0
 MSG_ERROR_SLOT	DB " slot=",0
 MSG_ERROR_IDPORT DB " idport=",0
 MSG_ERROR_BASE	DB " base=",0
@@ -224,4 +224,6 @@ FAIL_CODE	DB 0
 	INCLUDE "cli.asm"
 	INCLUDE "console.asm"
 	INCLUDE "isa.asm"
+	INCLUDE "el3_io.asm"
+	INCLUDE "el3_regs.asm"
 	INCLUDE "el3.asm"

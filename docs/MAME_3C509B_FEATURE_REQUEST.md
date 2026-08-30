@@ -1,5 +1,12 @@
 # 3C509B ISA8 accuracy follow-up for MAME 0.287
 
+Status on 2026-08-30: the neighbouring MAME worktree implements the differences
+listed below, including Read Zero Mask polarity, timed reset/CIP, threshold
+readback, FIFO/TX/RX behaviour and save-state support. This document records the
+review baseline and reproduction scenarios; it is not a list of currently
+missing Stage 4 features. Reproducible guest and real-card evidence is still
+required before the corresponding acceptance items can be closed.
+
 ## Tested snapshot and scope
 
 This request is based on MAME 0.287 at commit
@@ -71,7 +78,7 @@ Stage 3 FAT12 image.
    RX packets; the operation and latch state must resume deterministically.
 
 Expected diagnostics always end with `RESULT OK` or `RESULT FAIL code=N`.
-Timeout lines include stage, elapsed ticks, slot/base, and the last status.
+Timeout lines include stage, elapsed CYCLES21 `waitq`, slot/base, and status.
 
 ## Suggested acceptance
 

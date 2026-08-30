@@ -1,4 +1,4 @@
-; Read-only 3C509B discovery, EEPROM, activation, and bounded waits.
+; Read-only 3C509B discovery, EEPROM and activation.
 ; SPDX-License-Identifier: BSD-3-Clause
 
 	IFNDEF	_EL3_ASM
@@ -44,6 +44,8 @@ CONFIGURE
 ; Out: EL3_OK/CF=0 or explicit error/CF=1. Preserves IX and IY.
 DISCOVER
 	PUSH	IX,IY
+	LD	HL,0
+	LD	(EL3_LAST_TICKS),HL
 	LD	A,EL3_STAGE_RESET
 	LD	(EL3_LAST_STAGE),A
 	CALL	ID_SEQUENCE
@@ -51,9 +53,7 @@ DISCOVER
 	LD	A,EL3_ID_GLOBAL_RESET
 	CALL	ID_WRITE
 	JR	C,.RETURN
-	LD	B,2
-	CALL	WAIT_FRAME_TRANSITIONS
-	JR	C,.RETURN
+	CALL	WAIT_ONE_QUANTUM
 	CALL	ID_SEQUENCE
 	JR	C,.RETURN
 	LD	A,EL3_ID_TAG_ZERO
@@ -215,7 +215,7 @@ ID_WRITE
 
 ; ID_READ_WORD
 ; In: A=EEPROM address 00..3F. Out: HL=word and CF=0, or error.
-; The documented 162 us operation is given more than 40 ms of CTC time;
+; The documented 162 us operation is followed by one CYCLES21 quantum;
 ; the ISA window is closed for the entire wait.
 ; Preserves IX and IY.
 ID_READ_WORD
@@ -225,9 +225,7 @@ ID_READ_WORD
 	OR	EL3_ID_EEPROM_READ
 	CALL	ID_WRITE
 	JR	C,.RETURN
-	LD	B,2
-	CALL	WAIT_FRAME_TRANSITIONS
-	JR	C,.RETURN
+	CALL	WAIT_ONE_QUANTUM
 	LD	A,(SLOT)
 	CALL	@ISA.OPEN
 	JR	C,.ISA_ERROR
@@ -259,50 +257,9 @@ ID_READ_WORD
 	SCF
 	JR	.RETURN
 
-; READ16
-; In: E=even register offset, base from EL3_BASE. Out: HL=word.
-; Low byte is read immediately before high byte in one ISA critical section.
-; Preserves IX and IY.
-READ16
-	PUSH	IX,IY
-	LD	A,E
-	AND	1
-	JR	NZ,.BAD_OFFSET
-	LD	A,(SLOT)
-	CALL	@ISA.OPEN
-	JR	C,.ISA_ERROR
-	LD	BC,(EL3_BASE)
-	LD	A,C
-	ADD	A,E
-	LD	C,A
-	JR	NC,.NO_CARRY
-	INC	B
-.NO_CARRY
-	CALL	@ISA.MAP_POINTER
-	LD	E,(HL)
-	INC	HL
-	LD	D,(HL)
-	CALL	@ISA.CLOSE
-	JR	C,.ISA_ERROR
-	EX	DE,HL
-	LD	(EL3_LAST_STATUS),HL
-	XOR	A
-	POP	IY,IX
-	RET
-.BAD_OFFSET
-	LD	A,EL3_ERR_PARAMETER
-	SCF
-	POP	IY,IX
-	RET
-.ISA_ERROR
-	LD	A,EL3_ERR_ISA_STATE
-	SCF
-	POP	IY,IX
-	RET
-
 ; WINDOW_EEPROM_READ
 ; In: A=address 00..3F. Out: HL=word. READ opcode only; no write/erase API.
-; Busy is checked before and after issuing READ, with finite timing.
+; Busy is checked before and after READ with finite CYCLES21 timing.
 ; Preserves IX and IY.
 WINDOW_EEPROM_READ
 	PUSH	IX,IY
@@ -318,9 +275,7 @@ WINDOW_EEPROM_READ
 	LD	E,EL3_REG_EEPROM_CMD
 	CALL	WRITE16
 	JR	C,.RETURN
-	LD	B,2
-	CALL	WAIT_FRAME_TRANSITIONS
-	JR	C,.RETURN
+	CALL	WAIT_ONE_QUANTUM
 	CALL	WAIT_EEPROM_READY
 	JR	C,.RETURN
 	LD	E,EL3_REG_EEPROM_DATA
@@ -333,141 +288,51 @@ WINDOW_EEPROM_READ
 	SCF
 	JR	.RETURN
 
-; WRITE16 is private to read-only commands: currently only EEPROM READ command.
-; In: HL=word, E=even offset. Out: status. Low then high without intervening I/O.
-WRITE16
-	LD	(WRITE_WORD),HL
-	LD	A,(SLOT)
-	CALL	@ISA.OPEN
-	JR	C,.ERROR
-	LD	BC,(EL3_BASE)
-	LD	A,C
-	ADD	A,E
-	LD	C,A
-	JR	NC,.NO_CARRY
-	INC	B
-.NO_CARRY
-	CALL	@ISA.MAP_POINTER
-	LD	DE,(WRITE_WORD)
-	LD	(HL),E
-	INC	HL
-	LD	(HL),D
-	CALL	@ISA.CLOSE
-	RET	C
-	XOR	A
-	RET
-.ERROR
-	LD	A,EL3_ERR_ISA_STATE
-	SCF
-	RET
-
 ; WAIT_EEPROM_READY
-; Polls EBY with ISA closed between reads. Deadline is at least 100 ms,
-; plus a finite emergency loop for a stalled CTC source.
+; Polls EBY with ISA closed and one CYCLES21 quantum between reads.
 WAIT_EEPROM_READY
-	LD	A,EL3_CTC_TIMEOUT_WRAPS
-	CALL	CTC_DEADLINE_START
+	LD	HL,0
+	LD	(EL3_LAST_TICKS),HL
 .POLL
 	LD	E,EL3_REG_EEPROM_CMD
 	CALL	READ16
 	RET	C
+	LD	(EL3_LAST_STATUS),HL
 	BIT	7,H
 	JR	Z,.READY
-	CALL	CTC_DEADLINE_UPDATE
-	JR	NC,.POLL
-	RET
+	LD	HL,(EL3_LAST_TICKS)
+	LD	DE,EL3_WAIT_QUANTA
+	OR	A
+	SBC	HL,DE
+	JR	NC,.TIMEOUT
+	CALL	WAIT_QUANTUM
+	LD	HL,(EL3_LAST_TICKS)
+	INC	HL
+	LD	(EL3_LAST_TICKS),HL
+	JR	.POLL
 .READY
 	XOR	A
 	RET
 
-; WAIT_FRAME_TRANSITIONS
-; In: B=2. Out: elapsed CTC wraps in EL3_LAST_TICKS (at least 40 ms).
-; The ISA window remains closed and the DSS-owned CTC is never reprogrammed.
-; Preserves IX and IY.
-WAIT_FRAME_TRANSITIONS
-	PUSH	IX,IY
-	LD	A,B
-	CP	2
-	JR	NZ,.BAD_COUNT
-	LD	A,EL3_CTC_SETTLE_WRAPS + 1
-	CALL	CTC_DEADLINE_START
-.WAIT
-	CALL	CTC_DEADLINE_UPDATE
-	JR	C,.RETURN
-	LD	A,(EL3_LAST_TICKS)
-	CP	EL3_CTC_SETTLE_WRAPS
-	JR	C,.WAIT
-	XOR	A
-.RETURN
-	POP	IY,IX
-	RET
-.BAD_COUNT
-	LD	A,EL3_ERR_PARAMETER
-	SCF
-	JR	.RETURN
-
-; CTC_DEADLINE_START
-; In: A=wrap deadline. Starts a read-only CTC0 deadline and emergency guard.
-CTC_DEADLINE_START
-	LD	(CTC_WRAP_LIMIT),A
-	IN	A,(CTC_CHANNEL0)
-	LD	(CTC_MARK),A
-	XOR	A
-	LD	(EL3_LAST_TICKS),A
-	LD	HL,0
-	LD	(EMERGENCY_COUNT),HL
-	RET
-
-; CTC_DEADLINE_UPDATE
-; Out: CF=0 while active; CF=1/A=EL3_ERR_TIMER at the wrap deadline or if
-; the observed down-counter stops changing for 65536 consecutive samples.
-CTC_DEADLINE_UPDATE
-	IN	A,(CTC_CHANNEL0)
-	LD	B,A
-	LD	A,(CTC_MARK)
-	CP	B
-	JR	Z,.NO_MOVEMENT
-	LD	D,0
-	JR	NC,.STORE_SAMPLE
-	INC	D
-.STORE_SAMPLE
-	LD	A,B
-	LD	(CTC_MARK),A
-	LD	HL,0
-	LD	(EMERGENCY_COUNT),HL
-	LD	A,D
-	OR	A
-	JR	Z,.ACTIVE
-	LD	A,(EL3_LAST_TICKS)
-	INC	A
-	LD	(EL3_LAST_TICKS),A
-	LD	D,A
-	LD	A,(CTC_WRAP_LIMIT)
-	CP	D
-	JR	Z,.TIMEOUT
-	JR	C,.TIMEOUT
-.ACTIVE
-	XOR	A
-	RET
-.NO_MOVEMENT
-	LD	HL,(EMERGENCY_COUNT)
-	DEC	HL
-	LD	(EMERGENCY_COUNT),HL
-	LD	A,H
-	OR	L
-	JR	NZ,.ACTIVE
 .TIMEOUT
+	LD	HL,EL3_COUNT_TIMEOUT
+	CALL	INC_WORD
 	LD	A,EL3_ERR_TIMER
 	SCF
 	RET
 
+; WAIT_ONE_QUANTUM
+; Close-window cycle delay used after ID reset and EEPROM READ.
+WAIT_ONE_QUANTUM
+	CALL	WAIT_QUANTUM
+	LD	HL,1
+	LD	(EL3_LAST_TICKS),HL
+	XOR	A
+	RET
+
 SLOT			DB ISA_SLOT_1
-CTC_MARK		DB 0
-CTC_WRAP_LIMIT		DB 0
 CURRENT_EEPROM_ADDRESS	DB 0
 ID_COMMAND		DB 0
-WRITE_WORD		DW 0
-EMERGENCY_COUNT	DW 0
 
 	ENDMODULE
 	ENDIF

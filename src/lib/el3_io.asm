@@ -1,0 +1,149 @@
+; Physical Sprinter ISA8 provider for the EL3 register core.
+; SPDX-License-Identifier: BSD-3-Clause
+
+	IFNDEF	_EL3_IO_ASM
+	DEFINE	_EL3_IO_ASM
+
+	INCLUDE "el3.inc"
+	INCLUDE "memory.inc"
+
+	MODULE EL3IO
+
+; READ8
+; In: E=register offset. Out: A=value/CF=0 or explicit status/CF=1.
+; Preserves BC, DE, HL, IX and IY. The ISA window is closed on return.
+READ8
+	PUSH	BC,DE,HL,IX,IY
+	LD	A,E
+	CP	0x10
+	JR	NC,.BAD_READ
+	CALL	OPEN_REGISTER
+	JR	C,.READ_ERROR
+	LD	A,(HL)
+	LD	(READ_VALUE),A
+	CALL	@ISA.CLOSE
+	JR	C,.READ_ERROR
+	LD	A,(READ_VALUE)
+	OR	A
+	POP	IY,IX,HL,DE,BC
+	RET
+.BAD_READ
+	LD	A,EL3_ERR_PARAMETER
+	SCF
+.READ_ERROR
+	POP	IY,IX,HL,DE,BC
+	RET
+
+; WRITE8
+; In: E=register offset, A=value. Out: status in A/CF.
+; Preserves BC, DE, HL, IX and IY. The ISA window is closed on return.
+WRITE8
+	PUSH	BC,DE,HL,IX,IY
+	LD	(WRITE_VALUE),A
+	LD	A,E
+	CP	0x10
+	JR	NC,.BAD_WRITE
+	CALL	OPEN_REGISTER
+	JR	C,.WRITE_ERROR
+	LD	A,(WRITE_VALUE)
+	LD	(HL),A
+	CALL	@ISA.CLOSE
+	JR	C,.WRITE_ERROR
+	XOR	A
+	POP	IY,IX,HL,DE,BC
+	RET
+.BAD_WRITE
+	LD	A,EL3_ERR_PARAMETER
+	SCF
+.WRITE_ERROR
+	POP	IY,IX,HL,DE,BC
+	RET
+
+; READ16
+; In: E=even register offset. Out: HL=word/CF=0 or explicit status/CF=1.
+; The low byte is read immediately before the high byte in one ISA window.
+; Preserves BC, DE, IX and IY.
+READ16
+	PUSH	BC,DE,IX,IY
+	LD	A,E
+	AND	1
+	JR	NZ,.BAD_READ16
+	LD	A,E
+	CP	0x0F
+	JR	NC,.BAD_READ16
+	CALL	OPEN_REGISTER
+	JR	C,.READ16_ERROR
+	LD	E,(HL)
+	INC	HL
+	LD	D,(HL)
+	CALL	@ISA.CLOSE
+	JR	C,.READ16_ERROR
+	EX	DE,HL
+	XOR	A
+	POP	IY,IX,DE,BC
+	RET
+.BAD_READ16
+	LD	A,EL3_ERR_PARAMETER
+	SCF
+.READ16_ERROR
+	POP	IY,IX,DE,BC
+	RET
+
+; WRITE16
+; In: E=even register offset, HL=word. Out: status in A/CF.
+; The low byte is written immediately before the high byte in one ISA window.
+; Preserves BC, DE, HL, IX and IY.
+WRITE16
+	PUSH	BC,DE,HL,IX,IY
+	LD	(WRITE_WORD),HL
+	LD	A,E
+	AND	1
+	JR	NZ,.BAD_WRITE16
+	LD	A,E
+	CP	0x0F
+	JR	NC,.BAD_WRITE16
+	CALL	OPEN_REGISTER
+	JR	C,.WRITE16_ERROR
+	LD	DE,(WRITE_WORD)
+	LD	(HL),E
+	INC	HL
+	LD	(HL),D
+	CALL	@ISA.CLOSE
+	JR	C,.WRITE16_ERROR
+	XOR	A
+	POP	IY,IX,HL,DE,BC
+	RET
+.BAD_WRITE16
+	LD	A,EL3_ERR_PARAMETER
+	SCF
+.WRITE16_ERROR
+	POP	IY,IX,HL,DE,BC
+	RET
+
+; OPEN_REGISTER
+; In: E=offset. Out: HL=mapped address with the ISA window open.
+OPEN_REGISTER
+	LD	A,(@EL3.SLOT)
+	CALL	@ISA.OPEN
+	JR	C,.ISA_ERROR
+	LD	BC,(EL3_BASE)
+	LD	A,C
+	ADD	A,E
+	LD	C,A
+	JR	NC,.MAP
+	INC	B
+.MAP
+	CALL	@ISA.MAP_POINTER
+	XOR	A
+	RET
+.ISA_ERROR
+	LD	A,EL3_ERR_ISA_STATE
+	SCF
+	RET
+
+READ_VALUE	DB 0
+WRITE_VALUE	DB 0
+WRITE_WORD	DW 0
+
+	ENDMODULE
+	ENDIF

@@ -22,9 +22,9 @@ START
 	LD	A,EL3_STAGE_ARGS
 	LD	(EL3_LAST_STAGE),A
 	XOR	A
-	LD	(EL3_LAST_TICKS),A
 	LD	H,A
 	LD	L,A
+	LD	(EL3_LAST_TICKS),HL
 	LD	(EL3_LAST_STATUS),HL
 	LD	HL,MSG_BANNER
 	CALL	@CONSOLE.LINE
@@ -148,7 +148,7 @@ MSG_E2		DB "[E2] IDS MAC CHECKSUMS VALID",0
 MSG_HELP	DB "Usage: EL3EEP [-s 0|1] [-p #100..#1F0]",0
 MSG_ERROR	DB "ERROR stage=",0
 MSG_CODE	DB " code=",0
-MSG_TICKS	DB " ticks=",0
+MSG_TICKS	DB " waitq=",0
 MSG_SLOT	DB " slot=",0
 MSG_ERROR_IDPORT DB " idport=",0
 MSG_STATUS	DB " status=",0
@@ -161,4 +161,6 @@ FAIL_CODE	DB 0
 	INCLUDE "cli.asm"
 	INCLUDE "console.asm"
 	INCLUDE "isa.asm"
+	INCLUDE "el3_io.asm"
+	INCLUDE "el3_regs.asm"
 	INCLUDE "el3.asm"

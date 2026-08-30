@@ -42,7 +42,8 @@ for my $name (@apps) {
 
 my @sources = qw(
     src/apps/el3info.asm src/apps/el3eep.asm src/apps/isaprobe.asm
-    src/lib/el3.asm src/lib/isa.asm src/include/el3.inc
+    src/lib/el3.asm src/lib/el3_regs.asm src/lib/el3_io.asm src/lib/isa.asm
+    src/include/el3.inc
     src/include/sprinter.inc
 );
 my $source = '';
@@ -58,16 +59,14 @@ die "IRQ callback/routing is forbidden\n"
 die "ID EEPROM READ command is missing\n"
     unless $source =~ /EL3_ID_EEPROM_READ\s+EQU\s+0x80/i;
 die "finite timer error is missing\n"
-    unless $source =~ /EL3_ERR_TIMER/ && $source =~ /WAIT_FRAME_TRANSITIONS/;
-die "Stage 3 must not use the Spectrum FRAMES variable as a DSS clock\n"
-    if $source =~ /\(\s*FRAMES\s*\)/i;
-die "read-only DSS CTC timer is missing\n"
-    unless $source =~ /CTC_CHANNEL0\s+EQU\s+0x10/i
-        && $source =~ /IN\s+A,\(CTC_CHANNEL0\)/i;
-die "Stage 3 must not reprogram DSS CTC channel 0\n"
-    if $source =~ /OUT\s+\(CTC_CHANNEL0\)/i;
+    unless $source =~ /EL3_ERR_TIMER/ && $source =~ /WAIT_QUANTUM/;
+die "standalone EL3 code must not depend on CTC, FRAMES or RTC\n"
+    if $source =~ /CTC|FRAMES|RTC|SysTime/i;
+die "CYCLES21 loop contract is missing\n"
+    unless $source =~ /EL3_CYCLE_COUNT\s+EQU\s+808/i
+        && $source =~ /DEC\s+BC\s*\n\s*LD\s+A,B\s*\n\s*OR\s+C\s*\n\s*JR\s+NZ,/i;
 
-open my $el3, '<', "$root/src/lib/el3.asm" or die $!;
+open my $el3, '<', "$root/src/lib/el3_io.asm" or die $!;
 my $el3_text = do { local $/; <$el3> };
 close $el3;
 die "READ16 is not low-byte then immediately high-byte\n"
@@ -91,4 +90,4 @@ die "ISAPROBE help-only guard is missing\n"
 die "ISAPROBE contains an ISA-window write\n"
     if $probe_text =~ /LD\s+\(HL\),/i;
 
-print "Stage 3 source contract: read-only EEPROM, polling timeout, ISA8 ordering, no IRQ passed\n";
+print "Stage 3 source contract: read-only EEPROM, CYCLES21 timeout, ISA8 ordering, no IRQ passed\n";

@@ -20,6 +20,11 @@ fi
 z88dk-ticks -l 16384 -pc 4000 -end "$end_addr" \
   -output "$tmp_dir/stage3.ram" "$tmp_dir/stage3.bin" >/dev/null
 result="$(od -An -tu1 -j 49152 -N 1 "$tmp_dir/stage3.ram" | tr -d ' ')"
+complete="$(od -An -tu1 -j 49154 -N 1 "$tmp_dir/stage3.ram" | tr -d ' ')"
+if [ "$complete" != 165 ]; then
+  echo "Error: Stage 3 ASM vector did not reach TEST_DONE" >&2
+  exit 1
+fi
 if [ "$result" != 0 ]; then
   echo "Error: Stage 3 ASM vector failed at case $result" >&2
   exit 1

@@ -27,4 +27,5 @@ build_app()
 build_app hello HELLO
 build_app el3info EL3INFO
 build_app el3eep EL3EEP
+build_app el3reg EL3REG
 build_app isaprobe ISAPROBE

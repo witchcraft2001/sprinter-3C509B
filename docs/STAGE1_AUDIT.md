@@ -378,13 +378,17 @@ WAIT_CIP_CLEAR(base, deadline):
     repeat:
         status = READ16(base, STATUS)
         if CIP is clear: return OK
-        observe the DSS-owned CTC0 down-counter with ISA closed
+        run one CYCLES21 quantum with ISA closed
     until deadline expired
     return ERR_CIP_TIMEOUT
 ```
 
 No public routine spins forever. Timeout result includes a stable status code
 and diagnostic stage code.
+The CYCLES21 backend uses 21,023 T-states per quantum and supports CPUs up to
+21 MHz. A 100-quantum deadline therefore spans about 100--601 ms over the
+supported 21--3.5 MHz range. It never reads or changes CTC, RTC, FRAMES, turbo,
+or other system settings.
 
 ### 6.2. ID sequence and EEPROM
 

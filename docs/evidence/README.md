@@ -76,6 +76,32 @@ before Stage 3 can close. The reproducible procedure and report template are
 [documented separately](../STAGE3_TESTING_RU.md); their presence is not test
 evidence. Individual completed MAME cases are recorded below.
 
+## Stage 4: local register-core and mock regressions
+
+- Date: 2026-08-30.
+- Version: 0.0.1 (unchanged).
+- Reproduction: `make clean && make test-host package image`.
+
+Observed local results:
+
+```text
+Stage 4 host contract: provider split, cycle timeout, polling INIT/DONE, snapshot and EL3REG passed
+Stage 4 ASM mock: ISA8 order, ABI, commands/windows, CIP/recovery, INIT/DONE x100, snapshot v1/60 and CLI bounds passed
+```
+
+The executable mock verifies low/high ISA8 ordering, command encoding, windows
+0–6, the exact INIT/DONE trace and MAC order, immediate/delayed/permanent CIP,
+100 complete cycles, snapshot v1/60 and `-n` bounds 0/1/100/101. Static host
+checks reject CTC/FRAMES/RTC dependencies, EEPROM writes, IRQ routing and DSS
+calls from the register/provider path. This is reproducible local evidence only.
+
+No MAME or physical-card Stage 4 pass is claimed. The earlier `FAIL code=10`
+was identified as a driver-side threshold readback expectation: command value
+`07FF` is represented in Window 5 with DWORD granularity as `07FC`. The required
+matrix and physical procedure are in
+[STAGE4_TESTING_RU.md](../STAGE4_TESTING_RU.md), with
+[STAGE4_TEST_TEMPLATE.md](STAGE4_TEST_TEMPLATE.md) for evidence capture.
+
 ## Stage 3: MAME timer failure (superseded build)
 
 - Date: 2026-08-30.
@@ -92,9 +118,9 @@ RESULT FAIL code=4
 
 Result: FAIL. The run proved that the first Stage 3 implementation incorrectly
 used the Spectrum-compatible `FRAMES` location, which DSS does not advance.
-The code now observes the DSS-owned CTC0 down-counter without writing it. This
-record is retained as regression evidence; it is not a MAME pass, and the fixed
-binary still requires the complete MAME matrix above.
+A later diagnostic build observed CTC0 without writing it; the current build
+supersedes that too and uses the independent CYCLES21 quantum. This record is
+retained as historical regression evidence and is not a current MAME pass.
 
 ## Stage 3 M02: MAME slot 1, EEPROM base
 
