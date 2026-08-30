@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# Single source of truth for Stage 0 IMG and ZIP contents.
+# Single source of truth for the Stage 3 bootstrap IMG and ZIP contents.
 # Record format: kind|repository source|flat 8.3 destination.
 
 DIST_NAME="sprinter-3c509b"
@@ -8,15 +8,21 @@ ARTIFACT_MTIME="202608290000"
 
 IMG_ARTIFACTS=(
   "binary|build/HELLO.EXE|HELLO.EXE"
-  "text|README.md|README.TXT"
-  "text|docs/QUICKSTART_RU.md|READMERU.TXT"
+  "binary|build/EL3INFO.EXE|EL3INFO.EXE"
+  "binary|build/EL3EEP.EXE|EL3EEP.EXE"
+  "binary|build/ISAPROBE.EXE|ISAPROBE.EXE"
+  "text|docs/runtime/README_EN.txt|README.TXT"
+  "text|docs/runtime/README_RU.txt|READMERU.TXT"
+  "text|docs/EL3INFO.md|EL3INFO.TXT"
   "text|config/NETSMPL.CFG|NETSMPL.CFG"
   "text|LICENSE|LICENSE.TXT"
 )
 
 ZIP_ARTIFACTS=(
-  "text|README.md|README.TXT"
-  "text|docs/QUICKSTART_RU.md|READMERU.TXT"
+  "binary|build/EL3INFO.EXE|EL3INFO.EXE"
+  "text|docs/runtime/README_EN.txt|README.TXT"
+  "text|docs/runtime/README_RU.txt|READMERU.TXT"
+  "text|docs/EL3INFO.md|EL3INFO.TXT"
   "text|config/NETSMPL.CFG|NETSMPL.CFG"
   "text|LICENSE|LICENSE.TXT"
 )

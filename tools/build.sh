@@ -11,10 +11,20 @@ fi
 
 mkdir -p "$repo_root/build"
 
-sjasmplus --nologo --fullpath \
-  -I "$repo_root/src/include" \
-  --lst="$repo_root/build/HELLO.lst" \
-  --raw="$repo_root/build/HELLO.EXE" \
-  "$repo_root/src/apps/hello.asm"
+build_app()
+{
+  source_name="$1"
+  artifact_name="$2"
+  sjasmplus --nologo --fullpath \
+    -I "$repo_root/src/include" \
+    -I "$repo_root/src/lib" \
+    --lst="$repo_root/build/$artifact_name.lst" \
+    --raw="$repo_root/build/$artifact_name.EXE" \
+    "$repo_root/src/apps/$source_name.asm"
+  echo "Built build/$artifact_name.EXE"
+}
 
-echo "Built build/HELLO.EXE"
+build_app hello HELLO
+build_app el3info EL3INFO
+build_app el3eep EL3EEP
+build_app isaprobe ISAPROBE

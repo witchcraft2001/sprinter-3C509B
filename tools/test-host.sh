@@ -6,7 +6,7 @@ repo_root="$(cd "$script_dir/.." && pwd)"
 
 source "$script_dir/artifacts.sh"
 
-required_tools=(sjasmplus mformat mcopy mdir zip unzip iconv perl)
+required_tools=(sjasmplus z88dk-ticks mformat mcopy mdir zip unzip iconv perl)
 for tool in "${required_tools[@]}"; do
   if ! command -v "$tool" >/dev/null 2>&1; then
     echo "Error: required tool not found in PATH: $tool" >&2
@@ -17,16 +17,35 @@ done
 sjasmplus --version 2>&1 | head -n 1
 
 bash -n "$script_dir/artifacts.sh" "$script_dir/build.sh" \
-  "$script_dir/image.sh" "$script_dir/package.sh" "$script_dir/test-host.sh"
+  "$script_dir/image.sh" "$script_dir/package.sh" "$script_dir/test-host.sh" \
+  "$script_dir/test-stage3-asm.sh"
+sh -n "$script_dir/3com.sh"
+input_profile="$repo_root/config/mame/sprinter.cfg"
+ui_profile="$repo_root/config/mame/default.cfg"
+grep -Fq '<keyboard tag=":" enabled="0" />' "$input_profile"
+grep -Fq '<keyboard tag=":kbd:ms_naturl" enabled="1" />' "$input_profile"
+grep -Fq 'view="Screen 0 Standard (4:3)"' "$input_profile"
+grep -Fq 'KEYCODE_LCONTROL KEYCODE_DEL' "$ui_profile"
+grep -Fq 'keyboardprovider sdl' "$script_dir/3com.sh"
+grep -Fq -- '-kbd ms_naturl' "$script_dir/3com.sh"
+grep -Fq '"$CFG_DIR/default.cfg"' "$script_dir/3com.sh"
+if grep -Eq -- '-mouse(provider)?([[:space:]]|$)|-background_input' \
+  "$script_dir/3com.sh"; then
+  echo "Error: MAME launcher must not force mouse capture" >&2
+  exit 1
+fi
 perl -c "$script_dir/markdown_to_text.pl" >/dev/null
 perl -c "$script_dir/check-hello.pl" >/dev/null
 perl -c "$script_dir/check-text.pl" >/dev/null
 perl -c "$script_dir/check-stage1-audit.pl" >/dev/null
+perl -c "$script_dir/check-stage3.pl" >/dev/null
 
 "$script_dir/build.sh"
 perl "$script_dir/check-hello.pl" \
   "$repo_root/build/HELLO.EXE" "$repo_root/src/apps/hello.asm"
 perl "$script_dir/check-stage1-audit.pl" "$repo_root/docs/STAGE1_AUDIT.md"
+perl "$script_dir/check-stage3.pl" "$repo_root" EL3INFO EL3EEP ISAPROBE
+"$script_dir/test-stage3-asm.sh"
 
 artifact_validate_manifest IMG
 artifact_validate_manifest ZIP
@@ -38,16 +57,18 @@ text_copy="$(mktemp "${TMPDIR:-/tmp}/sprinter-509b-text.XXXXXX")"
 binary_copy="$(mktemp "${TMPDIR:-/tmp}/sprinter-509b-binary.XXXXXX")"
 trap 'rm -f "$expected_img" "$expected_zip" "$actual_names" "$text_copy" "$binary_copy"' EXIT
 
-printf '%s\n' HELLO.EXE LICENSE.TXT NETSMPL.CFG README.TXT READMERU.TXT \
+printf '%s\n' EL3EEP.EXE EL3INFO.EXE EL3INFO.TXT HELLO.EXE ISAPROBE.EXE \
+  LICENSE.TXT NETSMPL.CFG README.TXT READMERU.TXT \
   | LC_ALL=C sort > "$expected_img"
 artifact_names IMG | LC_ALL=C sort > "$actual_names"
 diff -u "$expected_img" "$actual_names"
 
-printf '%s\n' LICENSE.TXT NETSMPL.CFG README.TXT READMERU.TXT \
+printf '%s\n' EL3INFO.EXE EL3INFO.TXT LICENSE.TXT NETSMPL.CFG README.TXT \
+  READMERU.TXT \
   | LC_ALL=C sort > "$expected_zip"
 artifact_names ZIP | LC_ALL=C sort > "$actual_names"
 diff -u "$expected_zip" "$actual_names"
-if artifact_names ZIP | grep -Eq '(^|/)(HELLO|.*TEST).*\.(EXE|COM)$'; then
+if artifact_names ZIP | grep -Eq '^(HELLO|EL3EEP|ISAPROBE|.*TEST).*\.(EXE|COM)$'; then
   echo "Error: test program found in ZIP manifest" >&2
   exit 1
 fi
@@ -60,17 +81,34 @@ while IFS= read -r record; do
   fi
 done < <(artifact_records IMG)
 
-artifact_copy text "$repo_root/docs/QUICKSTART_RU.md" "$text_copy" "$script_dir"
+artifact_copy text "$repo_root/docs/runtime/README_RU.txt" "$text_copy" "$script_dir"
 perl "$script_dir/check-text.pl" "$text_copy"
-iconv -f CP866 -t UTF-8 "$text_copy" >/dev/null
+if iconv -f CP866 -t UTF-8 "$text_copy" | grep -Eqi \
+  '(^|[^[:alpha:]])make([^[:alpha:]]|$)|MAME|структур[аы] репозитория|host[- ]|tools/'; then
+  echo "Error: runtime README contains host/developer instructions" >&2
+  exit 1
+fi
 
-artifact_copy binary "$repo_root/build/HELLO.EXE" "$binary_copy" "$script_dir"
-cmp "$repo_root/build/HELLO.EXE" "$binary_copy"
+for binary in HELLO EL3INFO EL3EEP ISAPROBE; do
+  artifact_copy binary "$repo_root/build/$binary.EXE" "$binary_copy" "$script_dir"
+  cmp "$repo_root/build/$binary.EXE" "$binary_copy"
+done
 
 version="$(tr -d '\r\n' < "$repo_root/VERSION")"
 if [ "$version" != "0.0.1" ] || ! grep -q 'PACKAGE_VERSION.*"0.0.1"' \
   "$repo_root/src/include/version.inc"; then
   echo "Error: package version declarations disagree" >&2
+  exit 1
+fi
+for binary in EL3INFO EL3EEP ISAPROBE; do
+  if ! grep -a -q "v0.0.1" "$repo_root/build/$binary.EXE"; then
+    echo "Error: $binary banner is not version 0.0.1" >&2
+    exit 1
+  fi
+done
+
+if [ "$(readlink "$repo_root/CLAUDE.md")" != "./AGENTS.md" ]; then
+  echo "Error: CLAUDE.md symlink changed" >&2
   exit 1
 fi
 

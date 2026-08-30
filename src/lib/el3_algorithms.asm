@@ -1,0 +1,275 @@
+; Pure 3C509B Stage 3 algorithms, shared with z88dk-ticks regressions.
+; SPDX-License-Identifier: BSD-3-Clause
+
+	IFNDEF	_EL3_ALGORITHMS_ASM
+	DEFINE	_EL3_ALGORITHMS_ASM
+
+	INCLUDE "el3.inc"
+	INCLUDE "memory.inc"
+
+	MODULE EL3ALG
+
+; LFSR_NEXT
+; In: A = current activation byte. Out: A = next byte.
+; Preserves BC, DE, HL, IX and IY.
+LFSR_NEXT
+	ADD	A,A
+	RET	NC
+	XOR	EL3_LFSR_POLY
+	RET
+
+; BASE_DECODE
+; In: A = base index 00..1E. Out: HL = 0200..03E0, CF=0.
+; Invalid index returns EL3_ERR_BASE and CF=1.
+; Preserves BC, DE, IX and IY.
+BASE_DECODE
+	CP	EL3_BASE_COUNT
+	JR	NC,.BAD
+	LD	L,A
+	LD	H,0
+	ADD	HL,HL
+	ADD	HL,HL
+	ADD	HL,HL
+	ADD	HL,HL
+	LD	DE,EL3_BASE_MIN
+	ADD	HL,DE
+	OR	A
+	RET
+.BAD
+	LD	A,EL3_ERR_BASE
+	SCF
+	RET
+
+; BASE_ENCODE
+; In: HL = 0200..03E0 aligned to 10h. Out: A = index 00..1E, CF=0.
+; Preserves BC, DE, HL, IX and IY.
+BASE_ENCODE
+	PUSH	HL
+	LD	A,L
+	AND	0x0F
+	JR	NZ,.BAD_POP
+	OR	A
+	LD	DE,EL3_BASE_MIN
+	SBC	HL,DE
+	JR	C,.BAD_POP
+	LD	DE,EL3_BASE_MAX-EL3_BASE_MIN
+	EX	DE,HL
+	OR	A
+	SBC	HL,DE
+	JR	C,.BAD_POP
+.RANGE_OK
+	EX	DE,HL
+	LD	A,L
+	RRCA
+	RRCA
+	RRCA
+	RRCA
+	AND	0x0F
+	LD	B,A
+	LD	A,H
+	RLCA
+	RLCA
+	RLCA
+	RLCA
+	AND	0x10
+	OR	B
+	POP	HL
+	OR	A
+	RET
+.BAD_POP
+	POP	HL
+	LD	A,EL3_ERR_BASE
+	SCF
+	RET
+
+; COPY_MAC
+; Copies factory station bytes in EEPROM word order to EL3_MAC.
+; In the 3Com layout each word low byte is Address(2n), high is Address(2n+1).
+; Preserves AF, BC, DE, HL, IX and IY.
+COPY_MAC
+	PUSH	AF,BC,DE,HL,IX,IY
+	LD	HL,EEPROM_BUFFER
+	LD	DE,EL3_MAC
+	LD	BC,6
+	LDIR
+	POP	IY,IX,HL,DE,BC,AF
+	RET
+
+; VALIDATE
+; Validates exact IDs, unicast MAC, and both documented checksum lanes.
+; Out: A=EL3_OK/CF=0 or stable error/CF=1.
+; Preserves BC, DE, HL, IX and IY.
+VALIDATE
+	PUSH	BC,DE,HL,IX,IY
+	LD	HL,(EEPROM_BUFFER + 0x03*2)
+	LD	DE,EL3_PRODUCT_3C509B_TPO
+	OR	A
+	SBC	HL,DE
+	JR	NZ,.NOT_FOUND
+	LD	HL,(EEPROM_BUFFER + 0x07*2)
+	LD	DE,EL3_MFG_3COM
+	OR	A
+	SBC	HL,DE
+	JR	NZ,.NOT_FOUND
+	CALL	VALIDATE_MAC
+	JR	C,.RETURN
+	CALL	VALIDATE_PRIMARY
+	JR	C,.RETURN
+	CALL	VALIDATE_SECONDARY
+	JR	C,.RETURN
+	CALL	COPY_MAC
+	XOR	A
+.RETURN
+	POP	IY,IX,HL,DE,BC
+	RET
+.NOT_FOUND
+	LD	A,EL3_ERR_NOT_FOUND
+	SCF
+	JR	.RETURN
+
+; VALIDATE_MAC
+; Out: EL3_OK or EL3_ERR_NOT_FOUND. Preserves BC, DE, HL, IX and IY.
+VALIDATE_MAC
+	PUSH	BC,DE,HL,IX,IY
+	LD	HL,EEPROM_BUFFER
+	BIT	0,(HL)
+	JR	NZ,.BAD
+	LD	B,6
+	LD	C,0
+	LD	D,0xFF
+.LOOP
+	LD	A,(HL)
+	LD	E,A
+	OR	C
+	LD	C,A
+	LD	A,E
+	AND	D
+	LD	D,A
+	INC	HL
+	DJNZ	.LOOP
+	LD	A,C
+	OR	A
+	JR	Z,.BAD
+	LD	A,D
+	CP	0xFF
+	JR	Z,.BAD
+	XOR	A
+	POP	IY,IX,HL,DE,BC
+	RET
+.BAD
+	LD	A,EL3_ERR_NOT_FOUND
+	SCF
+	POP	IY,IX,HL,DE,BC
+	RET
+
+; VALIDATE_PRIMARY
+; Checksum word 0F high lane covers 00..0E except 08/09/0D; low lane covers
+; only 08/09/0D. Both bytes of each selected word are XORed.
+VALIDATE_PRIMARY
+	PUSH	BC,DE,HL,IX,IY
+	LD	HL,EEPROM_BUFFER
+	LD	B,15
+	LD	C,0
+	LD	D,0
+	LD	E,0
+.LOOP
+	LD	A,C
+	CP	0x08
+	JR	Z,.CONFIG
+	CP	0x09
+	JR	Z,.CONFIG
+	CP	0x0D
+	JR	Z,.CONFIG
+	LD	A,(HL)
+	XOR	D
+	LD	D,A
+	INC	HL
+	LD	A,(HL)
+	XOR	D
+	LD	D,A
+	JR	.NEXT
+.CONFIG
+	LD	A,(HL)
+	XOR	E
+	LD	E,A
+	INC	HL
+	LD	A,(HL)
+	XOR	E
+	LD	E,A
+.NEXT
+	INC	HL
+	INC	C
+	DJNZ	.LOOP
+	LD	A,(EEPROM_BUFFER + 0x0F*2 + 1)
+	CP	D
+	JR	NZ,.BAD
+	LD	A,(EEPROM_BUFFER + 0x0F*2)
+	CP	E
+	JR	NZ,.BAD
+	XOR	A
+	POP	IY,IX,HL,DE,BC
+	RET
+.BAD
+	LD	A,EL3_ERR_CHECKSUM
+	SCF
+	POP	IY,IX,HL,DE,BC
+	RET
+
+; VALIDATE_SECONDARY
+; Word 17 high lane covers 10..12 and 20..3F; low lane covers 13..16.
+VALIDATE_SECONDARY
+	PUSH	BC,DE,HL,IX,IY
+	LD	D,0
+	LD	E,0
+	LD	HL,EEPROM_BUFFER + 0x10*2
+	LD	B,3
+	CALL	XOR_WORD_BYTES_D
+	LD	HL,EEPROM_BUFFER + 0x20*2
+	LD	B,32
+	CALL	XOR_WORD_BYTES_D
+	LD	HL,EEPROM_BUFFER + 0x13*2
+	LD	B,4
+	CALL	XOR_WORD_BYTES_E
+	LD	A,(EEPROM_BUFFER + 0x17*2 + 1)
+	CP	D
+	JR	NZ,.BAD
+	LD	A,(EEPROM_BUFFER + 0x17*2)
+	CP	E
+	JR	NZ,.BAD
+	XOR	A
+	POP	IY,IX,HL,DE,BC
+	RET
+.BAD
+	LD	A,EL3_ERR_CHECKSUM
+	SCF
+	POP	IY,IX,HL,DE,BC
+	RET
+
+XOR_WORD_BYTES_D
+.LOOP
+	LD	A,(HL)
+	XOR	D
+	LD	D,A
+	INC	HL
+	LD	A,(HL)
+	XOR	D
+	LD	D,A
+	INC	HL
+	DJNZ	.LOOP
+	RET
+
+XOR_WORD_BYTES_E
+.LOOP
+	LD	A,(HL)
+	XOR	E
+	LD	E,A
+	INC	HL
+	LD	A,(HL)
+	XOR	E
+	LD	E,A
+	INC	HL
+	DJNZ	.LOOP
+	RET
+
+	ENDMODULE
+	ENDIF

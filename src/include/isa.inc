@@ -1,0 +1,16 @@
+; Sprinter ISA8 window constants and status values.
+; SPDX-License-Identifier: BSD-3-Clause
+
+	IFNDEF	_ISA_INC
+	DEFINE	_ISA_INC
+
+ISA_WINDOW	EQU 0xC000
+ISA_PORT_MAX	EQU 0x3FFF
+
+ISA_SLOT_0	EQU 0
+ISA_SLOT_1	EQU 1
+
+ISA_OK		EQU 0
+ISA_ERR_STATE	EQU 8
+
+	ENDIF

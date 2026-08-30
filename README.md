@@ -3,11 +3,11 @@
 This repository develops a polling-only network kit for the Sprinter DSS and a
 3Com EtherLink III 3C509B-TPO in an ISA8 slot.
 
-Version 0.0.1 is the Stage 0 bootstrap. It contains only `HELLO.EXE`, build and
-host-side validation, a FAT12 developer image, and a release-pipeline ZIP. It
-does not detect, configure, read, or write the network card. Network commands
-and `UNET509B.DLL` will appear in later stages after their required MAME and
-real-hardware evidence exists.
+Version 0.0.1 is now the Stage 3 bootstrap. It adds polling-only, read-only
+classic-ISA discovery (`EL3INFO`), a complete EEPROM diagnostic (`EL3EEP`), and
+an explicit-range read-only bus diagnostic (`ISAPROBE`). Network commands and
+`UNET509B.DLL` will appear only after the required MAME and real-hardware
+evidence exists. No EEPROM write or Sprinter IRQ route is implemented.
 
 ## Build
 
@@ -23,11 +23,12 @@ make image
 
 Generated files are placed under `build/` and `distr/`:
 
-- `build/HELLO.EXE` is the minimal DSS smoke test.
+- `build/HELLO.EXE`, `EL3INFO.EXE`, `EL3EEP.EXE`, and `ISAPROBE.EXE` are the
+  current DSS programs.
 - `distr/sprinter-3c509b.img` is a 1.44 MB FAT12 developer image containing
-  `HELLO.EXE` and the Stage 0 documents/configuration.
-- `distr/sprinter-3c509b.zip` exercises the user-package pipeline but excludes
-  the test-only `HELLO.EXE`.
+  all four programs and the runtime documents/configuration.
+- `distr/sprinter-3c509b.zip` contains the safe user diagnostic `EL3INFO` and
+  excludes `HELLO`, `EL3EEP`, and `ISAPROBE`.
 
 The text files inside IMG and ZIP are flat, strict 8.3 names encoded as CP866
 with CRLF line endings. Binary artifacts are copied byte for byte. See
@@ -36,10 +37,10 @@ with CRLF line endings. Binary artifacts are copied byte for byte. See
 
 ## Scope and safety
 
-`specs.md` is the authoritative specification and acceptance log. Sprinter ISA
-interrupt routing is intentionally absent. All future controller access must be
-polling-based with finite timeouts, and EEPROM writes are outside the project
-scope.
+`specs.md` is the authoritative specification and acceptance log. Stages 2 and
+3 remain formally open: the feature request does not replace emulator evidence,
+and the physical card has not yet been tested. Sprinter ISA interrupt routing
+is intentionally absent; every wait is bounded and EEPROM is read-only.
 
 ## License
 

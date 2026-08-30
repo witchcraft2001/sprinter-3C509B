@@ -1,0 +1,129 @@
+; Console formatting helpers. Call only while the ISA window is closed.
+; SPDX-License-Identifier: BSD-3-Clause
+
+	IFNDEF	_CONSOLE_ASM
+	DEFINE	_CONSOLE_ASM
+
+	INCLUDE "dss.inc"
+
+	MODULE CONSOLE
+
+; STRING: HL -> ASCIIZ. Preserves IX and IY.
+STRING
+	PUSH	IX,IY
+	LD	C,DSS_PCHARS
+	RST	DSS
+	POP	IY,IX
+	RET
+
+; LINE: HL -> ASCIIZ, followed by CRLF. Preserves IX and IY.
+LINE
+	PUSH	IX,IY
+	CALL	STRING
+	LD	HL,CRLF
+	CALL	STRING
+	POP	IY,IX
+	RET
+
+; CHAR: A = character. Preserves AF, BC, DE, HL, IX and IY.
+CHAR
+	PUSH	AF,BC,DE,HL,IX,IY
+	LD	C,DSS_PUTCHAR
+	RST	DSS
+	POP	IY,IX,HL,DE,BC,AF
+	RET
+
+; HEX8: A = byte. Preserves AF, BC, DE, HL, IX and IY.
+HEX8
+	PUSH	AF,BC,DE,HL,IX,IY
+	LD	B,A
+	RRCA
+	RRCA
+	RRCA
+	RRCA
+	CALL	HEX_NIBBLE
+	LD	A,B
+	CALL	HEX_NIBBLE
+	POP	IY,IX,HL,DE,BC,AF
+	RET
+
+HEX_NIBBLE
+	AND	0x0F
+	ADD	A,'0'
+	CP	'9'+1
+	JR	C,.PUT
+	ADD	A,'A'-'9'-1
+.PUT
+	CALL	CHAR
+	RET
+
+; HEX16: HL = word. Preserves AF, BC, DE, HL, IX and IY.
+HEX16
+	PUSH	AF,BC,DE,HL,IX,IY
+	LD	A,H
+	CALL	HEX8
+	LD	A,L
+	CALL	HEX8
+	POP	IY,IX,HL,DE,BC,AF
+	RET
+
+; DEC8: A = unsigned byte. Preserves AF, BC, DE, HL, IX and IY.
+DEC8
+	PUSH	AF,BC,DE,HL,IX,IY
+	LD	B,0
+.HUNDREDS
+	CP	100
+	JR	C,.TENS_START
+	SUB	100
+	INC	B
+	JR	.HUNDREDS
+.TENS_START
+	LD	C,0
+.TENS
+	CP	10
+	JR	C,.DIGITS
+	SUB	10
+	INC	C
+	JR	.TENS
+.DIGITS
+	LD	D,A
+	LD	A,B
+	OR	A
+	JR	Z,.NO_HUNDREDS
+	ADD	A,'0'
+	CALL	CHAR
+.NO_HUNDREDS
+	LD	A,B
+	OR	C
+	JR	Z,.NO_TENS
+	LD	A,C
+	ADD	A,'0'
+	CALL	CHAR
+.NO_TENS
+	LD	A,D
+	ADD	A,'0'
+	CALL	CHAR
+	POP	IY,IX,HL,DE,BC,AF
+	RET
+
+; MAC: HL -> six bytes in network order. Preserves all registers.
+MAC
+	PUSH	AF,BC,DE,HL,IX,IY
+	LD	B,6
+.LOOP
+	LD	A,(HL)
+	CALL	HEX8
+	INC	HL
+	DEC	B
+	JR	Z,.DONE
+	LD	A,':'
+	CALL	CHAR
+	JR	.LOOP
+.DONE
+	POP	IY,IX,HL,DE,BC,AF
+	RET
+
+CRLF	DB 13,10,0
+
+	ENDMODULE
+	ENDIF

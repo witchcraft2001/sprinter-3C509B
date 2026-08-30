@@ -4,3 +4,6 @@
 *.bak
 *.swp
 *~
+.mame-cfg/
+/cfg/
+/nvram/

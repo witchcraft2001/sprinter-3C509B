@@ -378,7 +378,7 @@ WAIT_CIP_CLEAR(base, deadline):
     repeat:
         status = READ16(base, STATUS)
         if CIP is clear: return OK
-        yield/advance DSS ticks with ISA closed
+        observe the DSS-owned CTC0 down-counter with ISA closed
     until deadline expired
     return ERR_CIP_TIMEOUT
 ```
