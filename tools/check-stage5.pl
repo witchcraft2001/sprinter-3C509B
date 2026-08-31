@@ -8,7 +8,7 @@ die "usage: $0 ROOT\n" unless defined $root;
 my @relative = qw(
     src/apps/el3lb.asm src/apps/el3reg.asm src/lib/el3_fifo.asm src/lib/el3_regs.asm
     src/lib/el3_io.asm src/lib/isa.asm src/lib/cli.asm
-    src/include/el3.inc src/include/memory.inc src/include/dss.inc
+    src/include/el3.inc src/include/memory.inc
     tools/stage5_vectors.asm tools/test-stage5-asm.sh
 );
 my $source = '';

@@ -40,3 +40,6 @@ build_app el3lb EL3LB
 build_app el3tx EL3TX
 build_app el3rx EL3RX
 build_app isaprobe ISAPROBE
+build_app netcfg NETCFG
+build_app ifup IFUP
+build_app arp ARP

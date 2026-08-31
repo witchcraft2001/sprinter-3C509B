@@ -6,18 +6,23 @@ Available DSS commands:
   EL3INFO -v           Show additional read-only EEPROM fields.
   EL3EEP               Dump all 64 EEPROM words (developer diagnostic).
   ISAPROBE             Show help only.
+  NETCFG               Show the published NET_* environment.
+  NETCFG -i -v         Validate NET.CFG/card and publish it.
+  IFUP                 Check static setup or acquire a fresh DHCP lease.
+  ARP [-v] target      Bounded ARP diagnostic (developer image only).
 
-EL3EEP and ISAPROBE are present only on the developer disk image.
+EL3EEP, ISAPROBE, and ARP are present only on the developer disk image.
 ISAPROBE reads ISA bytes only when slot, base, and count are all explicit:
 
   ISAPROBE -s 1 -b #0300 -n #0010
 
-EL3INFO.TXT describes options and result codes. NETSMPL.CFG is the future
-network configuration example. LICENSE.TXT contains the license. README.TXT
-and READMERU.TXT contain the English and Russian on-computer instructions.
+Copy NETSMPL.CFG to NET.CFG beside NETCFG.EXE and edit it before NETCFG -i.
+NETCFG.TXT, IFUP.TXT, USAGE.TXT, and HOWTO.TXT describe the network setup.
+LICENSE.TXT contains the license.
 
 WARNING: EEPROM access is read-only. None of these commands saves card
 settings. ISAPROBE never writes ISA data, but reads of unknown hardware can
 have side effects; use only a range you identified beforehand.
 
-There are no network commands in this bootstrap version.
+The Stage 7 IFUP supports static setup and initial DHCP acquire. It does not
+implement lease renewal or release.

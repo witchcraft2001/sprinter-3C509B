@@ -11,6 +11,98 @@ const u16 = (buf, off) => buf[off] | (buf[off + 1] << 8);
 const hex = (bytes) => Buffer.from(bytes).toString('hex');
 const equal = (a, b) => a.length === b.length && a.every((v, i) => v === b[i]);
 
+function checksum(bytes) {
+  let sum = 0;
+  for (let i = 0; i < bytes.length; i += 2) {
+    sum += (bytes[i] << 8) | (bytes[i + 1] || 0);
+    sum = (sum & 0xffff) + (sum >>> 16);
+  }
+  return (~sum) & 0xffff;
+}
+
+function dhcpMessageType(frame) {
+  if (frame.length < 286 || frame[12] !== 8 || frame[13] !== 0) return 0;
+  for (let i = 282; i < frame.length;) {
+    const code = frame[i++];
+    if (code === 255) break;
+    if (code === 0) continue;
+    if (i >= frame.length) break;
+    const length = frame[i++];
+    if (code === 53 && length === 1 && i < frame.length) return frame[i];
+    i += length;
+  }
+  return 0;
+}
+
+function buildDhcpReply(request, type, options = {}) {
+  const serverMac = options.serverMac || [0x02, 0, 0, 0, 0, 1];
+  const serverIp = options.serverIp || [192, 168, 7, 1];
+  const offeredIp = options.offeredIp || [192, 168, 7, 100];
+  const mask = options.mask || [255, 255, 255, 0];
+  const router = options.router || serverIp;
+  const dns = options.dns || [[1, 1, 1, 1], [8, 8, 8, 8]];
+  const lease = options.lease || 3600;
+  const destination = options.foreignDestination ? [2, 9, 9, 9, 9, 9] : Array(6).fill(0xff);
+  const frame = [...destination, ...serverMac, 8, 0];
+  const ip = [0x45, 0, 0, 0, 0x12, 0x34, 0x40, 0, 64, 17, 0, 0, ...serverIp, 255, 255, 255, 255];
+  const udp = [0, 67, 0, 68, 0, 0, 0, 0];
+  const bootp = Array(240).fill(0);
+  bootp[0] = 2; bootp[1] = 1; bootp[2] = 6;
+  bootp.splice(4, 4, ...request.slice(46, 50));
+  if (type !== 6 && !options.zeroYiaddr) bootp.splice(16, 4, ...offeredIp);
+  bootp.splice(28, 6, ...request.slice(70, 76));
+  bootp.splice(236, 4, 0x63, 0x82, 0x53, 0x63);
+  const opts = [53, 1, type];
+  if (!options.missingServer) opts.push(54, 4, ...serverIp);
+  if (type !== 6) {
+    const maskData = options.badMaskLength ? [...mask, 0] : mask;
+    const routerData = options.badRouterLength ? [...router, 0] : router;
+    const dnsData = options.badDnsLength ? [...dns.flat(), 0] : dns.flat();
+    opts.push(1, maskData.length, ...maskData, 3, routerData.length, ...routerData,
+      6, dnsData.length, ...dnsData);
+    if (!options.missingLease) {
+      const leaseData = [(lease >>> 24) & 255, (lease >>> 16) & 255, (lease >>> 8) & 255, lease & 255];
+      if (options.badLeaseLength) leaseData.push(0);
+      opts.push(51, leaseData.length, ...leaseData);
+    }
+  }
+  opts.push(255);
+  const udpLength = udp.length + bootp.length + opts.length;
+  udp[4] = udpLength >> 8; udp[5] = udpLength & 255;
+  const ipLength = ip.length + udpLength;
+  ip[2] = ipLength >> 8; ip[3] = ipLength & 255;
+  const ipSum = checksum(ip); ip[10] = ipSum >> 8; ip[11] = ipSum & 255;
+  frame.push(...ip, ...udp, ...bootp, ...opts);
+  if (options.badXid) frame[46] ^= 1;
+  if (options.badChaddr) frame[70] ^= 1;
+  if (options.badCookie) frame[278] ^= 1;
+  if (options.badOptions) frame[frame.length - 1] = 54;
+  const pseudo = [...serverIp, 255, 255, 255, 255, 0, 17,
+    udpLength >> 8, udpLength & 255, ...frame.slice(34)];
+  const udpSum = checksum(pseudo); frame[40] = udpSum >> 8; frame[41] = udpSum & 255;
+  if (options.badUdpChecksum) frame[40] ^= 1;
+  return frame;
+}
+
+function buildArpReply(request, options = {}) {
+  const senderMac = options.mac || [0x02, 0, 0, 0, 0, 1];
+  const senderIp = options.ip || request.slice(38, 42);
+  const targetMac = request.slice(22, 28), targetIp = request.slice(28, 32);
+  const reply = [...targetMac, ...senderMac, 8, 6, 0, 1, 8, 0, 6, 4, 0, 2,
+    ...senderMac, ...senderIp, ...targetMac, ...targetIp, ...Array(18).fill(0)];
+  if (options.badEtherSource) reply[6] ^= 1;
+  if (options.foreignDestination) { reply.splice(0, 6, 2, 9, 9, 9, 9, 9); reply.splice(32, 6, 2, 9, 9, 9, 9, 9); }
+  if (options.badOpcodeHigh) reply[20] = 1;
+  return reply;
+}
+
+function buildArpRequest(targetMac, targetIp, options = {}) {
+  const senderMac = options.requesterMac || [0x02, 0, 0, 0, 0, 2];
+  const senderIp = options.requesterIp || [192, 168, 7, 2];
+  return [...Array(6).fill(0xff), ...senderMac, 8, 6, 0, 1, 8, 0, 6, 4, 0, 1,
+    ...senderMac, ...senderIp, ...Array(6).fill(0), ...targetIp, ...Array(18).fill(0)];
+}
+
 function eepromWords(mac, base) {
   const words = new Uint16Array(64);
   words[0] = mac[0] | (mac[1] << 8);
@@ -40,6 +132,7 @@ function eepromWords(mac, base) {
 
 class EtherLinkIII {
   constructor(scenario) {
+    this.scenario = scenario;
     this.present = scenario.cardPresent !== false;
     this.slot = scenario.slot === 0 ? 0 : 1;
     this.base = scenario.base || 0x300;
@@ -70,6 +163,9 @@ class EtherLinkIII {
     this.tagged = false; this.serialBits = [];
     this.wordWriteLow = new Map();
     this.wordReadHigh = new Map();
+    this.dhcpDiscoverCount = 0; this.dhcpRequestCount = 0;
+    this.arpRequestCount = 0;
+    this.generated = [];
   }
 
   resetRuntime() {
@@ -191,7 +287,37 @@ class EtherLinkIII {
       this.txRecords.push({preamble, dwordPad, frame});
       this.txStatus.push(0xc0);
       if (this.netDiag & 0xf000) this.rxQueue.push({frame: frame.slice(), cursor: 0});
+      this.respond(frame);
       this.txFifo = []; this.txExpected = 0;
+    }
+  }
+
+  respond(frame) {
+    const dhcp = this.scenario.dhcp;
+    const type = dhcpMessageType(frame);
+    if (dhcp && (type === 1 || type === 3)) {
+      const isDiscover = type === 1;
+      const countKey = isDiscover ? 'dhcpDiscoverCount' : 'dhcpRequestCount';
+      const dropKey = isDiscover ? 'dropDiscover' : 'dropRequest';
+      this[countKey]++;
+      if ((dhcp[dropKey] || 0) >= this[countKey] || dhcp.mode === 'drop') return;
+      const replyType = isDiscover ? 2 : (dhcp.mode === 'nak' ? 6 : 5);
+      const reply = buildDhcpReply(frame, replyType, dhcp);
+      this.generated.push(reply);
+      if (this.accepts(reply)) this.rxQueue.push({frame: reply, cursor: 0});
+    }
+    const arp = this.scenario.arp;
+    if (arp && frame.length >= 42 && frame[12] === 8 && frame[13] === 6 && frame[20] === 0 && frame[21] === 1) {
+      this.arpRequestCount++;
+      if ((arp.drop || 0) >= this.arpRequestCount || arp.mode === 'drop') return;
+      if (arp.requestBeforeReply && this.arpRequestCount === 1) {
+        const incoming = buildArpRequest(frame.slice(22, 28), frame.slice(28, 32), arp);
+        this.generated.push(incoming);
+        if (this.accepts(incoming)) this.rxQueue.push({frame: incoming, cursor: 0});
+      }
+      const reply = buildArpReply(frame, arp);
+      this.generated.push(reply);
+      if (this.accepts(reply)) this.rxQueue.push({frame: reply, cursor: 0});
     }
   }
 
@@ -309,7 +435,16 @@ function runExe(exePath, args = '', inputScenario = {}) {
   let win1 = null, nextBlock = 16;
   const pages = new Map(), allocations = new Map();
   const allocated = (id) => pages.has(id);
+  const environment = scenario.environment || {};
+  const envKey = (name) => name.toUpperCase();
+  const files = new Map(Object.entries(scenario.files || {}).map(([name, data]) => [
+    name.replace(/\//g, '\\').toUpperCase(), Buffer.isBuffer(data) ? data : Buffer.from(data, 'utf8'),
+  ]));
+  const openFiles = new Map();
+  let nextHandle = 4, envSetCount = 0, clockSecond = scenario.clockSecond || 0, scanCount = 0;
+  const dssEvents = [];
   let stdout = '', exitCode = null, steps = 0;
+  const pcTrace = [];
 
   const cardPort = (address) => address & 0x3fff;
   const assertCardSlot = () => selectedSlot === card.slot && card.present;
@@ -390,10 +525,56 @@ function runExe(exePath, args = '', inputScenario = {}) {
     for (let guard = 0; guard < 0x4000; guard++) { const value = rd(address++); if (!value) return result; result += String.fromCharCode(value); }
     throw new Error('unterminated DSS string');
   };
+  const writeCstr = (address, value) => {
+    const bytes = Buffer.from(value, 'ascii');
+    for (let i = 0; i < bytes.length; i++) wr(address + i, bytes[i]);
+    wr(address + bytes.length, 0);
+  };
   const dss = () => {
     if (isaOpen) throw new Error('DSS call while ISA window is open');
     const s = cpu.getState(), fn = s.c, count = s.b || 1;
     switch (fn) {
+      case 0x11: {
+        const name = cstr((s.h << 8) | s.l).replace(/\//g, '\\').toUpperCase();
+        const data = files.get(name);
+        if (scenario.traceDss) dssEvents.push(`OPEN ${name} ${data ? data.length : 'missing'}`);
+        if (!data || s.a !== 1) { setCarry(s, true); s.a = 3; return ret(s); }
+        const handle = nextHandle++;
+        openFiles.set(handle, {name, data, offset: 0});
+        s.a = handle; setCarry(s, false); return ret(s);
+      }
+      case 0x12: {
+        if (!openFiles.delete(s.a)) throw new Error(`CLOSE_FILE of unknown handle ${s.a}`);
+        setCarry(s, false); return ret(s);
+      }
+      case 0x13: {
+        const file = openFiles.get(s.a);
+        if (!file) throw new Error(`READ_FILE of unknown handle ${s.a}`);
+        const requested = (s.d << 8) | s.e;
+        const chunk = file.data.subarray(file.offset, file.offset + requested);
+        const destination = (s.h << 8) | s.l;
+        for (let i = 0; i < chunk.length; i++) wr(destination + i, chunk[i]);
+        file.offset += chunk.length;
+        if (scenario.traceDss) dssEvents.push(`READ ${file.name} ${chunk.length}/${requested}`);
+        s.d = chunk.length >> 8; s.e = chunk.length & 0xff;
+        setCarry(s, false); return ret(s);
+      }
+      case 0x21: {
+        const now = clockSecond % 86400;
+        s.h = Math.floor(now / 3600); s.l = Math.floor(now / 60) % 60; s.b = now % 60;
+        clockSecond = (clockSecond + (scenario.timeStepSeconds ?? 1)) % 86400;
+        setCarry(s, false); return ret(s);
+      }
+      case 0x31: {
+        scanCount++;
+        if (scenario.key && scanCount === (scenario.keyAtScan || 1)) {
+          if (scenario.key === 'escape') { s.b = 0; s.d = 1; s.e = 0x1b; }
+          else if (scenario.key === 'ctrl-c') { s.b = 1; s.d = 0x2e; s.e = 3; }
+          else throw new Error(`unknown simulated key ${scenario.key}`);
+          s.a = 1; s.flags.Z = 0; setCarry(s, false); return ret(s);
+        }
+        s.a = 0; s.b = 0; s.d = 0; s.e = 0; s.flags.Z = 1; setCarry(s, false); return ret(s);
+      }
       case 0x5b: stdout += String.fromCharCode(s.a); setCarry(s, false); return ret(s);
       case 0x5c: stdout += cstr((s.h << 8) | s.l); setCarry(s, false); return ret(s);
       case 0x3d: {
@@ -414,10 +595,39 @@ function runExe(exePath, args = '', inputScenario = {}) {
         allocations.delete(s.a); if (!allocated(win1)) win1 = null;
         setCarry(s, false); return ret(s);
       }
+      case 0x46: {
+        if (s.b === 1) {
+          const name = envKey(cstr((s.h << 8) | s.l));
+          if (!Object.prototype.hasOwnProperty.call(environment, name)) {
+            s.a = 0; setCarry(s, false); return ret(s);
+          }
+          writeCstr((s.d << 8) | s.e, String(environment[name]));
+          s.a = 0xff; setCarry(s, false); return ret(s);
+        }
+        if (s.b === 2) {
+          envSetCount++;
+          if (scenario.envFailAt && envSetCount === scenario.envFailAt) {
+            s.a = 1; setCarry(s, true); return ret(s);
+          }
+          const assignment = cstr((s.h << 8) | s.l);
+          const split = assignment.indexOf('=');
+          if (split < 1) throw new Error(`invalid ENV_SET '${assignment}'`);
+          const name = envKey(assignment.slice(0, split)), value = assignment.slice(split + 1);
+          if (value === '') delete environment[name]; else environment[name] = value;
+          s.a = 0; setCarry(s, false); return ret(s);
+        }
+        throw new Error(`unknown ENVIRON subfunction ${s.b}`);
+      }
+      case 0x47: {
+        if (s.b === 1) { writeCstr((s.h << 8) | s.l, scenario.appDir || 'C:\\NET'); setCarry(s, false); return ret(s); }
+        if (s.b === 0) { writeCstr((s.h << 8) | s.l, args); setCarry(s, false); return ret(s); }
+        throw new Error(`unknown APPINFO subfunction ${s.b}`);
+      }
       case 0x41:
         exitCode = s.b;
         if (isaOpen) throw new Error('EXIT with ISA window open');
         if (allocations.size) throw new Error('EXIT with unreleased DSS pages');
+        if (openFiles.size) throw new Error('EXIT with unclosed files');
         cpu.setState(s);
         throw {dssExit: true};
       default: throw new Error(`unknown DSS call ${fn.toString(16)}`);
@@ -427,8 +637,24 @@ function runExe(exePath, args = '', inputScenario = {}) {
   try {
     const limit = scenario.stepLimit || 200_000_000;
     for (;;) {
+      if (scenario.stopPc !== undefined && cpu.getState().pc === scenario.stopPc)
+        throw new Error(`stop PC=${cpu.getState().pc.toString(16)} SP=${cpu.getState().sp.toString(16)} A=${cpu.getState().a.toString(16)} F=${JSON.stringify(cpu.getState().flags)} trace=${pcTrace.map((v) => v.toString(16)).join(',')}`);
+      if (scenario.strictPc && cpu.getState().pc !== 0x0010 && cpu.getState().pc < 0x8080)
+        throw new Error(`PC escaped image: PC=${cpu.getState().pc.toString(16)} SP=${cpu.getState().sp.toString(16)} trace=${pcTrace.map((v) => v.toString(16)).join(',')}`);
+      if (scenario.traceCpu) { pcTrace.push(cpu.getState().pc); if (pcTrace.length > 32) pcTrace.shift(); }
+      // Production polling yields use this exact bounded BC loop. Collapse all
+      // but its final iteration so multi-second actual-EXE timeout tests retain
+      // their logical tick count without interpreting ~2400 Z80 instructions
+      // per millisecond. No ISA/DSS operation occurs inside this pattern.
+      const delay = cpu.getState();
+      if (scenario.fastDelayLoops !== false &&
+          rd(delay.pc) === 0x0b && rd(delay.pc + 1) === 0x78 &&
+          rd(delay.pc + 2) === 0xb1 && rd(delay.pc + 3) === 0x20 &&
+          rd(delay.pc + 4) === 0xfb && ((delay.b << 8) | delay.c) > 1) {
+        delay.b = 0; delay.c = 1; cpu.setState(delay);
+      }
       if (cpu.getState().pc === 0x0010) dss(); else cpu.run_instruction();
-      if (++steps > limit) throw new Error(`step limit at PC=${cpu.getState().pc.toString(16)}`);
+      if (++steps > limit) throw new Error(`step limit at PC=${cpu.getState().pc.toString(16)} SP=${cpu.getState().sp.toString(16)} trace=${pcTrace.map((v) => v.toString(16)).join(',')}`);
     }
   } catch (error) {
     if (!error || !error.dssExit) throw error;
@@ -439,13 +665,19 @@ function runExe(exePath, args = '', inputScenario = {}) {
     transmittedFrames: card.transmitted.map(hex),
     txRecords: card.txRecords.map((r) => ({preamble: hex(r.preamble), frame: hex(r.frame), dwordPad: hex(r.dwordPad)})),
     rejectedFrames: card.rejected.map(hex),
+    generatedFrames: card.generated.map(hex),
     rxRemaining: card.rxQueue.length,
     cleanup: {
       isaClosed: !isaOpen,
       pagesFreed: allocations.size === 0,
       done: !card.rxEnabled && !card.txEnabled && card.window === 0,
     },
-    card: {slot: card.slot, base: card.base, mac: hex(card.mac), active: card.active},
+    card: {slot: card.slot, base: card.base, mac: hex(card.mac), station: hex(card.station), active: card.active},
+    environment: {...environment},
+    ...(scenario.traceDss ? {dssEvents} : {}),
+    ...(scenario.dumpMemory ? {memory: Object.fromEntries(scenario.dumpMemory.map(([start, length]) => [
+      start.toString(16), hex(Array.from({length}, (_, i) => ram[(start + i) & 0xffff])),
+    ]))} : {}),
     steps,
   };
 }

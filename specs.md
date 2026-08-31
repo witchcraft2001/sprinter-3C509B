@@ -3,19 +3,25 @@
 ## Статус документа
 
 - Версия ТЗ: 1.0
-- Дата: 2026-08-30
+- Дата: 2026-08-31
 - Целевая платформа: Sprinter DSS
 - Сетевая карта: 3Com EtherLink III 3C509B-TPO
 - Режим шины: ISA8
-- Состояние проекта: локальная кодовая часть этапов 0–6 реализована; MAME-матрица
-  этапа 4 пройдена на `CYCLES21`; этапы 0–4 остаются открыты до обязательных
-  проверок на реальном Sprinter и появления file-backed hardware evidence;
-  MAME и аппаратная матрицы этапов 5/6 ещё не выполнены
+- Состояние проекта: локальная кодовая часть этапов 0–7 реализована; MAME-матрица
+  этапа 4 пройдена на `CYCLES21`; Stage 5/6 имеет частичные MAME pcap, но полная
+  матрица остаётся открытой; автоматическая и ручная MAME-приёмка Stage 7
+  пройдены, все проверки на реальном Sprinter ещё открыты
 
 Этот документ одновременно является техническим заданием, дорожной картой и
 журналом приёмки. Все этапы выполняются последовательно. Этап считается закрытым
 только после установки всех обязательных флажков и добавления ссылки на лог,
 дамп, pcap или иной воспроизводимый результат проверки.
+
+Отсутствие доступного реального Sprinter не блокирует переход к следующему
+этапу: аппаратные флажки при этом остаются открытыми и этап не считается
+закрытым. Перед началом Stage 8 обязательны успешные автоматические тесты Stage
+7 и ручная MAME-приёмка из `docs/STAGE7_TESTING_RU.md`; host harness не заменяет
+этот MAME gate.
 
 ## Сводная таблица прогресса
 
@@ -28,7 +34,7 @@
 | 4 | Регистровый слой и инициализация | [x] | [x] | [ ] | [x] | [ ] |
 | 5 | FIFO и внутренний loopback | [x] | [ ] | [ ] | [x] | [ ] |
 | 6 | Физические TX и RX | [x] | [ ] | [ ] | [x] | [ ] |
-| 7 | NETDRV, конфигурация и ARP | [ ] | [ ] | [ ] | [ ] | [ ] |
+| 7 | NETDRV, конфигурация, ARP и DHCP acquire | [x] | [x] | [ ] | [x] | [ ] |
 | 8 | IPv4, ICMP и PING | [ ] | [ ] | [ ] | [ ] | [ ] |
 | 9 | UDP и TFTP | [ ] | [ ] | [ ] | [ ] | [ ] |
 | 10 | DHCP, DNS и NTP | [ ] | [ ] | [ ] | [ ] | [ ] |
@@ -374,7 +380,7 @@ timeout, RX error, TX error, dropped и received/transmitted frames.
 
 Комплект не устанавливает TSR и не оставляет резидентный сетевой драйвер.
 Каждая утилита самостоятельно выполняет `EL3/NETDRV.INIT`, использует сеть и
-вызывает `DONE`. `IFUP` получает/обновляет DHCP lease и публикует окружение, но
+вызывает `DONE`. Stage 7 `IFUP` каждый раз получает новый DHCP lease и публикует окружение, но
 после выхода не обслуживает ARP или RX. Поэтому запуск очередной программы не
 может зависеть от сохранённого аппаратного состояния предыдущей.
 
@@ -437,6 +443,8 @@ NET_DNS1
 NET_DNS2
 NET_NTP
 NET_TZ
+NET_DHCP_SRV
+NET_LEASE_SEC
 ```
 
 `NET_HW`, `NET_IDPORT` и `NET_MAC` являются нормализованными значениями
@@ -463,11 +471,12 @@ NETCFG               показать опубликованные NET_* зна�
 NETCFG -i            прочитать NET.CFG и опубликовать окружение
 NETCFG -c            проверить синтаксис без изменения окружения
 NETCFG -d            удалить опубликованные NET_* значения
-NETCFG -v            показать исходные строки и предупреждения
+NETCFG -v            подробно проверить файл и карту без публикации
 IFUP                 static init либо DHCP acquire
-IFUP -r              DHCP release и повторный acquire
-IFUP -d              DHCP release и перевод интерфейса в down
 ```
+
+`NETCFG -v` также допустим как модификатор `NETCFG -i -v` и `NETCFG -c -v`.
+Renewal, RELEASE, `IFUP -r`, `IFUP -d` и `NET_STATE` не входят в Stage 7.
 
 Обязательные формы пользовательских сетевых программ:
 
@@ -568,6 +577,15 @@ RX/TX status, счётчики и целевой IP/MAC/port, если он ес
   DSS-страницах.
 - RX-кадр сначала полностью вычитывается из аппаратного FIFO, после чего верхние
   уровни могут работать с ним без открытого ISA-окна.
+- Stage 7 EXE выделяют одну DSS-страницу и приватно отображают её в WIN1: TX
+  начинается с `#4000`, RX — с `#4800`; compile-time assertions запрещают
+  пересечение и выход за `#C000`. Эти адреса не входят в NETDRV ABI.
+- NETDRV принимает caller-owned pointer/length и проверяет начало, конец,
+  16-битный overflow и границу `#C000`. Для будущей DLL буфер также обязан быть
+  целиком вне окна загрузки DLL.
+- Общий UNET contract разрешает загрузку DLL только в WIN1 или WIN2; WIN3
+  `#C000..#FFFF` зарезервирован для ISA. Остаётся не менее 256 байт свободного
+  стека, библиотека нерентерабельна. Stage 7 DLL ещё не реализует.
 
 ## 7. MAME: объём работ и критерии достоверности
 
@@ -745,8 +763,9 @@ MAME запускается с картой в ISA-слоте и pcap backend. �
 Согласованное исключение порядка 5→6: ручная Stage 5 до реализации Stage 6 не
 требуется. Сначала реализуются actual-EXE harness и Stage 6 и собирается
 финальный IMG, затем Stage 5 и Stage 6 проверяются одним ручным MAME-сеансом.
-Это исключение не закрывает ни один этап без evidence и не разрешает начинать
-Stage 7 до проверки Stage 5/6 на реальной 3C509B-TPO.
+Это исключение не закрывает ни один этап без evidence. По общему правилу
+недоступность реального оборудования больше не блокирует последующую разработку;
+hardware evidence остаётся открытым.
 
 ### Этап 6. Физические TX и RX
 
@@ -805,22 +824,40 @@ Stage 7 до проверки Stage 5/6 на реальной 3C509B-TPO.
   EL3TX `d2690e6a7fc42b009da49241b92ff3d25d04b086bb46889153e5e055ee180481`,
   EL3RX `a4b0f975e76c853a34f31248e5edf4a00aecb2e976761e46ccab663308151d14`.
 
-### Этап 7. NETDRV, конфигурация и ARP
+### Этап 7. NETDRV, конфигурация, ARP и DHCP acquire
 
-Результат: независимый link-layer API и статическая IPv4-конфигурация.
+Результат: независимый link-layer API, транзакционная конфигурация, ARP и
+начальное получение DHCP lease. Renewal/RELEASE и `NET_STATE` отложены.
 
-- [ ] Реализовать `NETDRV` поверх `EL3`.
-- [ ] Перенести Ethernet II, checksum и ARP из RTL-проекта.
-- [ ] Устранить все прямые зависимости верхних уровней от `RTL.*`.
-- [ ] Реализовать `NETCFG.EXE` и публикацию переменных окружения.
-- [ ] Реализовать static mode `IFUP.EXE`.
-- [ ] Реализовать ARP cache с конечным lifetime.
-- [ ] Создать тестовый `ARP.EXE`.
-- [ ] Проверить ARP request/reply, cache hit/expiry и gateway selection.
-- [ ] Проверить broadcast и неизвестный MAC.
-- [ ] Выполнить тесты в MAME и на реальной сети.
-- [ ] Добавить логи/pcap: ____________________
-- [ ] Критерий этапа: Sprinter разрешает MAC соседа и шлюза без ручных записей.
+- [x] Реализовать `NETDRV` поверх `EL3`: INIT/DONE, TX/RX/discard, snapshot,
+  link state и bounded link wait; caller buffers не используют фиксированный ABI.
+- [x] Адаптировать Ethernet II, Internet/UDP checksum, ARP и конфигурационный
+  код из BSD RTL-проекта с attribution, без `RTL.*`, старой карты памяти и
+  прямого ISA-доступа.
+- [x] Реализовать versioned AUTO/explicit slot/base, ID-port и MAC override.
+- [x] Реализовать `NETCFG.EXE`, APPINFO-only `NET.CFG`, LF/CRLF/comments,
+  warnings для unknown/duplicate и транзакционную публикацию/rollback.
+- [x] Реализовать static mode `IFUP.EXE`.
+- [x] Реализовать свежий DHCP DISCOVER/OFFER/REQUEST/ACK, NAK/timeout,
+  интервалы 4/8/16/16 и атомарную публикацию lease без static fallback.
+- [x] Реализовать узкий IPv4/UDP transport для DHCP без публичного Stage 8/9 API.
+- [x] Реализовать четыре ARP cache entries, lifetime 60 секунд и oldest eviction.
+- [x] Создать developer-only `ARP.EXE`.
+- [x] Автоматически проверить ARP request/reply, malformed consume,
+  cache hit/expiry/eviction, gateway/broadcast/unknown и DHCP wire/checksums.
+- [x] Расширить actual-EXE harness виртуальными файлами/environment/time и
+  реактивными ARP/DHCP ACK/NAK/drop сценариями.
+- [x] Добавить host responder для macOS BPF/Linux AF_PACKET, classic pcap и
+  единый runbook `docs/STAGE7_TESTING_RU.md`.
+- [x] Проверить общий `unet.inc` побайтно относительно ESP и RTL sibling ABI.
+- [x] Выполнить полный Stage 7 MAME gate перед Stage 8.
+- [ ] Выполнить проверки на реальном Sprinter/3C509B-TPO (не блокирует переход,
+  но остаётся обязательным открытым evidence).
+- [x] Добавить MAME логи/screenshots/pcap:
+  `docs/evidence/STAGE7_MAME_2026-08-31.md`.
+- [ ] Добавить hardware логи/pcap: ____________________
+- [x] Критерий этапа: MAME разрешает MAC соседа/шлюза и получает DHCP lease;
+  hardware-критерий остаётся открыт до появления карты.
 
 ### Этап 8. IPv4, ICMP и PING
 
@@ -857,13 +894,14 @@ Stage 7 до проверки Stage 5/6 на реальной 3C509B-TPO.
 - [ ] Добавить логи/pcap: ____________________
 - [ ] Критерий этапа: GET/PUT побайтно сохраняют файл при нормальной сети и потерях.
 
-### Этап 10. DHCP, DNS и NTP
+### Этап 10. DHCP renewal, DNS и NTP
 
 Результат: автоматическая конфигурация сети и базовые сервисы.
 
-- [ ] Реализовать DHCP DISCOVER/OFFER/REQUEST/ACK.
-- [ ] Реализовать DHCP NAK, timeout и static fallback.
-- [ ] Публиковать полученные IP, mask, gateway, DNS и lease metadata.
+- [ ] Реализовать DHCP renewal и RELEASE поверх Stage 7 acquire.
+- [ ] Добавить `IFUP -r`, `IFUP -d` и согласованное состояние lease; static
+  fallback не выполняется автоматически.
+- [x] Публиковать при acquire IP, mask, gateway, DNS, server и lease metadata.
 - [ ] Реализовать DNS A query с compression pointer parsing.
 - [ ] Создать `NSLOOKUP.EXE`.
 - [ ] Обрабатывать NXDOMAIN, malformed reply и timeout.

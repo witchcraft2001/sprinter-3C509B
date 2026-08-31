@@ -174,9 +174,68 @@ software/wire padding, RX consuming discard, individual+broadcast filtering,
 foreign-unicast rejection, CRC32, delayed/down link, adjacent 16-bit register
 cycles, common DSS exit mapping and cleanup.
 
-This is host evidence only. No Stage 5/6 MAME pcap or real-card PASS is claimed.
-The combined manual session remains open in
+This local run is host evidence. Partial Stage 5/6 MAME pcaps are imported
+below, but no complete MAME matrix or real-card PASS is claimed. The combined
+manual session remains open in
 [STAGE6_TEST_TEMPLATE.md](STAGE6_TEST_TEMPLATE.md).
+
+## Stage 5/6: imported partial MAME evidence
+
+The already captured files under `evidence/stage56/` are retained as evidence
+rather than rerunning their cases. `sha256.txt` identifies the Stage 6 IMG and
+three EXEs; `mame-listnetwork.txt` records the named `feth0`/`feth1`
+interfaces; `mame-slot1.log` records a 425-second MAME run at 100% speed.
+
+The four classic pcaps each contain one Ethernet frame with caplen=wirelen=60,
+so no FCS is present. `tx-14.pcap` and `tx-14-filtered.pcap` contain destination
+`66:65:74:68:00:01`, source `02:60:8C:88:87:D8`, EtherType `88B5`, and zero
+software padding. `rx-60.pcap` and `rx-60-retry.pcap` contain the reverse test
+direction with an incrementing payload through byte `2D`.
+
+These files prove those byte-exact single-frame TX/RX cases only. The workspace
+contains no corresponding Stage 5/6 console screenshots, and the remaining
+slot/base/burst/filter/link matrix is not represented. Therefore neither the
+full MAME matrix nor real-card acceptance is marked complete.
+
+## Stage 7: local protocol and actual-EXE regressions
+
+- Date: 2026-08-31.
+- Version: 0.0.1 (unchanged).
+- Reproduction: syntax/unit checks, `git diff --check`, `make clean`, then
+  `make test-host package image`.
+
+Observed automated results:
+
+    Stage 7 ASM: checksum, ARP framing/routing/cache and DHCP/config vectors passed
+    NETDRV ASM: ABI preservation and NONE/WIN1/WIN2 buffer boundaries passed
+    Stage 7 host contract: NETDRV ABI, memory, protocols, EXEs, UNET sync and artifacts passed
+    Stage 7 actual EXE: 67 NETCFG/IFUP/DHCP/ARP, rollback, ABI boundary and cleanup checks passed
+    Stage 7 responder: exact ARP and DHCP framing/checksums passed
+
+Final deterministic artifacts:
+
+- `sprinter-3c509b.img`:
+  `bcf32187b3666abcba7f7d991499b785cfed740a7c63cfd3e03f6932557092bd`.
+- `sprinter-3c509b.zip`:
+  `03dc88cbfde4e0b77bacbcb34d3a50df64bf5c6c5d5f58291480596c6caba3d8`.
+- `NETCFG.EXE`:
+  `ec32cd363eeadbc2fd53e44ae0767a8d454858eeb61316002e20e61d94b1edc5`.
+- `IFUP.EXE`:
+  `02a64ceb377c178d487173d101bd37293467a1da07f9d8a1f02ec6ea985f0594`.
+- `ARP.EXE`:
+  `f22f4eae1e86b6433f1ff5cc432cc63f2bb36cd6f6c9fef70fd07a6919704b8f`.
+
+The exact IMG binaries cover every NETCFG mode, LF/CRLF, missing/invalid/
+oversized input, AUTO and explicit hardware, MAC override, ENV rollback,
+static/link failure, DHCP ACK/retry/NAK/drop and malformed XID/chaddr/cookie/
+options/checksum/L2 destination, plus ARP neighbor/gateway/broadcast/unknown/
+malformed paths, strict ENV bounds, timeout diagnostics and Esc/Ctrl-C cancel.
+The harness rejects leaked files, pages, ISA windows, and unknown DSS calls.
+
+The mandatory MAME gate was subsequently completed with named `feth0/feth1`
+interfaces, screenshots and classic pcaps. See
+[`STAGE7_MAME_2026-08-31.md`](STAGE7_MAME_2026-08-31.md). Real-card evidence
+remains open without blocking Stage 8.
 
 ## Stage 3: MAME timer failure (superseded build)
 
