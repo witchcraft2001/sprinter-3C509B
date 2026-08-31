@@ -1,0 +1,26 @@
+Available network interfaces:
+    utun0
+    ap1
+    en0
+    utun1
+    awdl0
+    llw0
+    utun2
+    utun3
+    utun4
+    utun5
+    feth0
+    feth1
+    lo0
+    anpi0
+    anpi1
+    anpi2
+    en4
+    en5
+    en6
+    en1
+    en2
+    en3
+    bridge0
+    gif0
+    stf0

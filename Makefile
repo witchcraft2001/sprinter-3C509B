@@ -1,4 +1,4 @@
-.PHONY: all build test-host package image clean
+.PHONY: all build test-host test-exe-stress package image clean
 
 all: build
 
@@ -7,6 +7,9 @@ build:
 
 test-host:
 	tools/test-host.sh
+
+test-exe-stress: build
+	node tools/test-exe-stress.js
 
 package:
 	tools/package.sh

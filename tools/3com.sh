@@ -51,6 +51,29 @@ mkdir -p "$CFG_DIR"
 cp "$CFG_TEMPLATE" "$CFG_DIR/sprinter.cfg"
 cp "$DEFAULT_CFG_TEMPLATE" "$CFG_DIR/default.cfg"
 
+if [ -n "${MAME_NETWORK_INTERFACE:-}" ]; then
+  network_provider=${MAME_NETWORK_PROVIDER:-pcap}
+  network_list=$("$MAME_BIN" -networkprovider "$network_provider" -listnetwork 2>&1)
+  network_index=$(printf '%s\n' "$network_list" | awk -v wanted="$MAME_NETWORK_INTERFACE" '
+    /^Available network interfaces:/ { listed=1; ordinal=0; next }
+    listed && NF {
+      name=$0
+      sub(/^[[:space:]]+/, "", name)
+      sub(/[[:space:]]+$/, "", name)
+      if (name == wanted) { print ordinal; found=1; exit }
+      ordinal++
+    }
+    END { if (!found) exit 1 }
+  ') || {
+    echo "3com.sh: MAME_NETWORK_INTERFACE is not present in mame -listnetwork: $MAME_NETWORK_INTERFACE" >&2
+    exit 2
+  }
+  network_tag=":isa${TEST_SLOT}:3c509b"
+  perl "$SCRIPT_DIR/set-mame-network.pl" "$CFG_DIR/sprinter.cfg" \
+    "$network_tag" "$network_index"
+  MAME_NETWORK_PROVIDER=$network_provider
+fi
+
 set -- sprinter \
   -rompath "$RELEASE_DIR/roms" \
   -cfg_directory "$CFG_DIR" \

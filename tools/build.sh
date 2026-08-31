@@ -13,14 +13,22 @@ mkdir -p "$repo_root/build"
 
 build_app()
 {
-  source_name="$1"
-  artifact_name="$2"
-  sjasmplus --nologo --fullpath \
+  local source_name="$1"
+  local artifact_name="$2"
+  local assembly_log
+  assembly_log="$(mktemp "${TMPDIR:-/tmp}/sprinter-509b-build.XXXXXX")"
+  sjasmplus --nologo --fullpath --cleanonerror \
     -I "$repo_root/src/include" \
     -I "$repo_root/src/lib" \
     --lst="$repo_root/build/$artifact_name.lst" \
     --raw="$repo_root/build/$artifact_name.EXE" \
-    "$repo_root/src/apps/$source_name.asm"
+    "$repo_root/src/apps/$source_name.asm" >"$assembly_log"
+  cat "$assembly_log"
+  if grep -Eq 'Errors: [1-9]|error:' "$assembly_log"; then
+    rm -f "$assembly_log"
+    return 1
+  fi
+  rm -f "$assembly_log"
   echo "Built build/$artifact_name.EXE"
 }
 
@@ -28,4 +36,7 @@ build_app hello HELLO
 build_app el3info EL3INFO
 build_app el3eep EL3EEP
 build_app el3reg EL3REG
+build_app el3lb EL3LB
+build_app el3tx EL3TX
+build_app el3rx EL3RX
 build_app isaprobe ISAPROBE

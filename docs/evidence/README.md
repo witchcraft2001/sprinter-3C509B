@@ -47,7 +47,7 @@ before applying power. Physical link/TX/RX testing cannot pass without a sound
 
 ## Stage 3: local code and host regressions
 
-- Date: 2026-08-30.
+- Date: 2026-08-31.
 - Version: 0.0.1 (unchanged).
 - Assembler: sjasmplus 1.22.0.
 - Z80 runner: `z88dk-ticks` from the local z88dk installation.
@@ -101,6 +101,82 @@ was identified as a driver-side threshold readback expectation: command value
 matrix and physical procedure are in
 [STAGE4_TESTING_RU.md](../STAGE4_TESTING_RU.md), with
 [STAGE4_TEST_TEMPLATE.md](STAGE4_TEST_TEMPLATE.md) for evidence capture.
+
+## Stage 5: local FIFO/controller-loopback regressions
+
+- Date: 2026-08-30.
+- Version: 0.0.1 (unchanged).
+- Reproduction: make clean, then make test-host package image.
+
+Observed local results:
+
+    Stage 5 host contract: FIFO provider/core, bounded polling/recovery, loopback, EL3LB and memory/artifacts passed
+    Stage 5 ASM mock: FIFO layout/timeouts, TX recovery gating, RX consume/distinct queues, loopback verify, counters, ABI and CLI passed
+
+Final local artifacts after the clean run:
+
+- `sprinter-3c509b.img`: `08d40cb8fea37b544f7b9ffb781e0d7b569a8a496b032136b7ec9cdd031d0951`.
+- `sprinter-3c509b.zip`: `66b974c312d78d29ffc59684b3a1540382ca1fc2300b473b0a969cbc5fd63f96`.
+- `EL3LB.EXE`: `4e2bed9f20ee8cc99f92331fc326b848f66e845c80656685fed1151b50e3328b` (6732 bytes).
+
+The executable mock covers FIFO sizes 64/68/1520, exact preamble and padding,
+immediate/delayed/1000-waitq TX, read-peek/write-pop, bounded
+jabber/underrun/collision recovery and failed-recovery retransmit blocking,
+RX error/size/pad/discard, distinct queues of 2 and 10 packets, positive and
+negative controller-loopback bit #2000 verification, counters, snapshot v1/60,
+CLI bounds and IX/IY preservation. Static checks reject FIFO high-byte offsets,
+direct ISA access from the core, masked DSS release errors, DSS calls in
+low-level paths, IRQ routing, EEPROM writes and packet BSS in EL3LB.EXE.
+
+This is reproducible local evidence only. No Stage 5 MAME or physical-card PASS
+is claimed. MAME fault injection for underrun/jabber/bad RX is unavailable in
+the selected repository scope and remains an open blocker. Use
+[STAGE5_TESTING_RU.md](../STAGE5_TESTING_RU.md) and
+[STAGE5_TEST_TEMPLATE.md](STAGE5_TEST_TEMPLATE.md) for those runs.
+
+The Stage 5 hashes above predate the Stage 6 actual-EXE harness. That harness
+found that production `OPEN_FIFO` did not preserve the caller's byte count;
+the current final Stage 5/6 artifact hashes supersede them below.
+
+## Stage 6: local actual-EXE and host network regressions
+
+- Date: 2026-08-31.
+- Version: 0.0.1 (unchanged).
+- Reproduction: `make clean`, then `make test-host package image`.
+- Optional separate stress: `make test-exe-stress`.
+
+Observed automated results:
+
+    Stage 6 ASM: CRC32, DSS exit mapping and EL3TX/EL3RX CLI defaults/boundaries passed
+    Stage 6 host contract: API, CLI, lifecycle, CRC32, actual-EXE harness, network helper and artifacts passed
+    Actual DSS EXE harness: 119 header, EL3LB, TX/RX vector, CLI, link, filter, CRC32 and cleanup checks passed
+    Ethernet helper: classic-pcap lengths, patterns, padding, burst order and no-FCS checks passed
+    MAME launcher: named interface validation and slot-specific pcap cfg passed
+    EL3LB actual-EXE stress: 100 runs, 5200 exact loopback frames passed
+
+Final local artifacts:
+
+- `sprinter-3c509b.img`:
+  `939deaf7ebc9e9c5b46fa7220175954d09d79f1703454c3ac46a9ec7792f7f77`.
+- `sprinter-3c509b.zip`:
+  `97e3d2951851ca80457a4af7b764738681b495f07d309250f40672cd1bb9512d`.
+- `EL3LB.EXE`:
+  `1941276a3bf0cebf57c5d8aa8644d4d035eeefb2963200764bfe5f83a94fefaa`.
+- `EL3TX.EXE`:
+  `d2690e6a7fc42b009da49241b92ff3d25d04b086bb46889153e5e055ee180481`.
+- `EL3RX.EXE`:
+  `a4b0f975e76c853a34f31248e5edf4a00aecb2e976761e46ccab663308151d14`.
+
+The final IMG contains EL3TX/EL3RX and their CP866/CRLF help. The ZIP remains
+unchanged in scope and contains neither diagnostic. Actual-EXE tests exercise
+the exact IMG binaries, including 52-frame `EL3LB -n 1`, exact TX preamble,
+software/wire padding, RX consuming discard, individual+broadcast filtering,
+foreign-unicast rejection, CRC32, delayed/down link, adjacent 16-bit register
+cycles, common DSS exit mapping and cleanup.
+
+This is host evidence only. No Stage 5/6 MAME pcap or real-card PASS is claimed.
+The combined manual session remains open in
+[STAGE6_TEST_TEMPLATE.md](STAGE6_TEST_TEMPLATE.md).
 
 ## Stage 3: MAME timer failure (superseded build)
 

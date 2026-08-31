@@ -7,9 +7,10 @@
 - Целевая платформа: Sprinter DSS
 - Сетевая карта: 3Com EtherLink III 3C509B-TPO
 - Режим шины: ISA8
-- Состояние проекта: локальная кодовая часть этапов 0–4 реализована; MAME-матрица
+- Состояние проекта: локальная кодовая часть этапов 0–6 реализована; MAME-матрица
   этапа 4 пройдена на `CYCLES21`; этапы 0–4 остаются открыты до обязательных
-  проверок на реальном Sprinter и появления file-backed hardware evidence
+  проверок на реальном Sprinter и появления file-backed hardware evidence;
+  MAME и аппаратная матрицы этапов 5/6 ещё не выполнены
 
 Этот документ одновременно является техническим заданием, дорожной картой и
 журналом приёмки. Все этапы выполняются последовательно. Этап считается закрытым
@@ -25,8 +26,8 @@
 | 2 | Исправление и проверка модели MAME | [x] | [ ] | N/A | [x] | [ ] |
 | 3 | ID-последовательность и EEPROM | [x] | [ ] | [ ] | [x] | [ ] |
 | 4 | Регистровый слой и инициализация | [x] | [x] | [ ] | [x] | [ ] |
-| 5 | FIFO и внутренний loopback | [ ] | [ ] | [ ] | [ ] | [ ] |
-| 6 | Физические TX и RX | [ ] | [ ] | [ ] | [ ] | [ ] |
+| 5 | FIFO и внутренний loopback | [x] | [ ] | [ ] | [x] | [ ] |
+| 6 | Физические TX и RX | [x] | [ ] | [ ] | [x] | [ ] |
 | 7 | NETDRV, конфигурация и ARP | [ ] | [ ] | [ ] | [ ] | [ ] |
 | 8 | IPv4, ICMP и PING | [ ] | [ ] | [ ] | [ ] | [ ] |
 | 9 | UDP и TFTP | [ ] | [ ] | [ ] | [ ] | [ ] |
@@ -510,15 +511,20 @@ PING по умолчанию отправляет четыре пакета с 3
 
 ### 6.3. Начальные тайм-ауты и повторы
 
-Тайм-ауты измеряются DSS ticks/монотонным временем, а не некалиброванным числом
-Z80-итераций. Значения уточняются измерениями, но не могут быть удалены:
+Низкоуровневые операции EL3 этапов 3–6 измеряются квантом `CYCLES21`: не менее
+21023 T-state, то есть не менее 1 мс при 21 МГц и около 6 мс при 3,5 МГц.
+`Command-In-Progress` и EEPROM используют 100 waitq, FIFO/TX/RX — 1000 waitq;
+реальное время поэтому находится в диапазоне 1×–6× от номинала. Будущие
+сетевые и интерактивные ожидания используют DSS ticks/монотонное время. Ни один
+из этих тайм-аутов не является неограниченным числом Z80-итераций.
 
 ```text
-Global/RX/TX reset        100 ms
-Command-In-Progress       100 ms
-EEPROM command/busy       100 ms
-TX FIFO/complete          1000 ms
-EL3RX interactive wait    10000 ms
+Global/RX/TX reset        100 CYCLES21 waitq
+Command-In-Progress       100 CYCLES21 waitq
+EEPROM command/busy       100 CYCLES21 waitq
+TX FIFO/complete          1000 CYCLES21 waitq
+RX FIFO/discard           1000/100 CYCLES21 waitq
+EL3TX/EL3RX link/RX wait  10000 CYCLES21 waitq (примерно 10–60 с)
 ARP                       2000 ms, 3 попытки
 UDP/DNS/NTP reply         5000 ms, 3 попытки
 TFTP block                5000 ms, 6 попыток
@@ -712,30 +718,42 @@ MAME запускается с картой в ISA-слоте и pcap backend. �
 
 ### Этап 5. FIFO и внутренний loopback
 
-Результат: байтовая TX/RX-передача работает без ошибок выравнивания.
+Результат локальной реализации: байтовая TX/RX-передача и выравнивание
+подтверждены executable mock; MAME- и аппаратная приёмка остаются открытыми.
 
-- [ ] Реализовать вычисление TX required bytes.
-- [ ] Реализовать preamble и DWORD padding.
-- [ ] Проверить software padding входных кадров 14, 42 и 59 байт до 60 байт.
-- [ ] Реализовать polling TX completion и очистку TX Status.
-- [ ] Реализовать чтение RX Status и длины.
-- [ ] Реализовать перенос RX в обычный буфер.
-- [ ] Реализовать ровно один `RX_DISCARD` на пакет.
-- [ ] Создать `EL3LB.EXE`.
-- [ ] Проверить кадры 60, 61, 62, 63 и 1514 байт.
-- [ ] Проверить шаблоны `00`, `FF`, `55`, `AA` и возрастающий счётчик.
-- [ ] Проверить два и более пакета подряд.
-- [ ] Проверить underrun, jabber, bad RX status и recovery.
+- [x] Реализовать вычисление TX required bytes.
+- [x] Реализовать preamble и DWORD padding.
+- [x] Проверить software padding входных кадров 14, 42 и 59 байт до 60 байт.
+- [x] Реализовать polling TX completion и очистку TX Status.
+- [x] Реализовать чтение RX Status и длины.
+- [x] Реализовать перенос RX в обычный буфер.
+- [x] Реализовать ровно один `RX_DISCARD` на пакет.
+- [x] Создать `EL3LB.EXE`.
+- [x] Проверить кадры 60, 61, 62, 63 и 1514 байт в executable mock.
+- [x] Проверить шаблоны `00`, `FF`, `55`, `AA` и возрастающий счётчик
+  в коде диагностической матрицы.
+- [x] Проверить очереди из 2 и 10 различимых пакетов в executable mock и
+  диагностике, чтобы потеря, дублирование или перестановка не маскировались.
+- [x] Проверить underrun, jabber, bad RX status и recovery в executable mock;
+  MAME fault injection отсутствует и остаётся открытым blocker.
 - [ ] Выполнить одинаковую матрицу в MAME и на реальной карте.
-- [ ] Добавить логи/дампы: ____________________
+- [x] Добавить процедуру и шаблон evidence:
+  `docs/STAGE5_TESTING_RU.md`, `docs/evidence/STAGE5_TEST_TEMPLATE.md`.
+- [ ] Добавить MAME/аппаратные логи/дампы: ____________________
 - [ ] Критерий этапа: все длины и шаблоны проходят без потери следующего пакета.
+
+Согласованное исключение порядка 5→6: ручная Stage 5 до реализации Stage 6 не
+требуется. Сначала реализуются actual-EXE harness и Stage 6 и собирается
+финальный IMG, затем Stage 5 и Stage 6 проверяются одним ручным MAME-сеансом.
+Это исключение не закрывает ни один этап без evidence и не разрешает начинать
+Stage 7 до проверки Stage 5/6 на реальной 3C509B-TPO.
 
 ### Этап 6. Физические TX и RX
 
 Результат: обмен Ethernet II кадрами с внешним компьютером.
 
-- [ ] Создать `EL3TX.EXE` для заданного MAC, EtherType, длины и шаблона.
-- [ ] Создать `EL3RX.EXE` с кратким и hex-dump режимами.
+- [x] Создать `EL3TX.EXE` для заданного MAC, EtherType, длины и шаблона.
+- [x] Создать `EL3RX.EXE` с кратким и hex-dump режимами.
 - [ ] Отправить unicast и broadcast из Sprinter и записать pcap.
 - [ ] Отправить unicast и broadcast в Sprinter.
 - [ ] Проверить отбрасывание чужого unicast.
@@ -746,6 +764,46 @@ MAME запускается с картой в ISA-слоте и pcap backend. �
 - [ ] Убедиться, что CRC не передаётся верхнему уровню.
 - [ ] Добавить pcap MAME/оборудования: ____________________
 - [ ] Критерий этапа: кадры в обе стороны побайтно совпадают с ожидаемыми.
+
+Локальная реализация и host evidence от 2026-08-31:
+
+- `EL3TX [-v] [-s 0|1] [-p #100..#1F0] [-b AUTO|#200..#3E0] -d MAC
+  [-t #0600..#FFFF] [-l 14..1514] [-f 00|FF|55|AA|INC] [-n 1..100]
+  [-w 1..10000]`;
+- `EL3RX [-v] [-x] [-s 0|1] [-p #100..#1F0] [-b AUTO|#200..#3E0]
+  [-n 1..100] [-w 1..10000]`;
+- defaults: EtherType `#88B5`, length 60, pattern `INC`, count 1, timeout
+  10000. `-w` измеряется квантами `CYCLES21` (примерно 1–6 мс каждый), а не
+  точными миллисекундами;
+- `EL3_ERR_LINK_TIMEOUT=20`, `LINK_STATE` и bounded `WAIT_LINK_UP` реализованы;
+  публичные функции сохраняют IX/IY, а provider закрывает ISA на каждом
+  возврате;
+- TX использует factory MAC как source, network-order EtherType, software
+  padding до 60 и меняет фазу `INC` номером burst-кадра;
+- RX оставляет individual+broadcast filter и печатает MAC/type/length и
+  software IEEE CRC32 данных без FCS; `-x` печатает полный hex/ASCII dump;
+- обе EXE используют одну DSS-страницу (`TX=#4000`, `RX=#4800`), всегда
+  пытаются выполнить `DONE` и `FREEMEM`, сохраняя первичную ошибку;
+- actual-EXE harness на MIT Z80 core выполняет те же бинарники, которые входят
+  в IMG. Пройдено 119 проверок: `EL3LB -n 1` (52 кадра), slot/base/no-card/CLI,
+  все Stage 6 длины/шаблоны и точные preamble/data/padding, TX/RX burst 2/10,
+  RX discard, individual/broadcast/foreign unicast, immediate/delayed/down
+  link, CRC32, EXE header/boundary и cleanup;
+- подробные EL3 status сохраняются в `RESULT FAIL`, а DSS exit code
+  нормализуется в общий диапазон 0–7 из раздела 6.2;
+- production harness обнаружил и позволил исправить затирание FIFO byte count
+  в `OPEN_FIFO`; независимые Stage 5 ASM mock-тесты сохранены;
+- `EL3LB -n 100` намеренно не входит в обычную host-регрессию: отдельная цель
+  `make test-exe-stress` прошла 5200 actual-EXE кадров; это не заменяет
+  обязательную ручную MAME-проверку;
+- manual MAME и real-card пункты выше остаются открытыми. Процедура:
+  `docs/STAGE6_TESTING_RU.md`, шаблон:
+  `docs/evidence/STAGE6_TEST_TEMPLATE.md`.
+- финальные SHA-256 локальной сборки: IMG
+  `939deaf7ebc9e9c5b46fa7220175954d09d79f1703454c3ac46a9ec7792f7f77`,
+  EL3LB `1941276a3bf0cebf57c5d8aa8644d4d035eeefb2963200764bfe5f83a94fefaa`,
+  EL3TX `d2690e6a7fc42b009da49241b92ff3d25d04b086bb46889153e5e055ee180481`,
+  EL3RX `a4b0f975e76c853a34f31248e5edf4a00aecb2e976761e46ccab663308151d14`.
 
 ### Этап 7. NETDRV, конфигурация и ARP
 
@@ -1113,6 +1171,22 @@ FTP, TCP fault injection, Telnet и throughput. Адреса стенда зад
 Если доступен Z80 runner (`z88dk-ticks` или эквивалент), тестируются собранные
 ASM-функции, а не их повторная реализация на host-языке. Отдельная копия
 алгоритма допустима только как генератор golden vector.
+
+Для этапов 5/6 дополнительно используется `tools/exe-harness/`: неизменённый
+MIT Z80 core Molly Howell исполняет настоящий 128-байтовый DSS EXE, загруженный
+по адресам его header. Модель предоставляет обычную/страничную память,
+GETMEM/SETWIN1/FREEMEM/console/EXIT, оба ISA slot, полный 16-битный port space,
+ID sequence, read-only EEPROM, activation и минимальный register/FIFO datapath
+3C509B. Неизвестный DSS call, EEPROM write/erase, неверный FIFO offset, DSS при
+открытом ISA и выход с открытым ISA/неосвобождённой страницей являются ошибкой
+harness. Результат сценария содержит exit code, console, TX frames и cleanup.
+
+Host network helper `tools/host/ethernet_helper.py` использует BPF на macOS и
+AF_PACKET на Linux для raw send и строго проверяет classic pcap: MAC, EtherType,
+input/wire length, pattern, zero padding, burst count/order и отсутствие FCS.
+MAME launcher принимает `MAME_NETWORK_INTERFACE`, сверяет имя с
+`mame -listnetwork` и не содержит зашитого `feth0`; текущий стенд использует
+MAME=`feth0`, helper/tcpdump=`feth1`.
 
 ## 12. Проверка сборки и выпуска
 

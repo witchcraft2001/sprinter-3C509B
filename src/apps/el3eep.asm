@@ -131,7 +131,7 @@ FAIL
 	LD	HL,@CONSOLE.CRLF
 	CALL	@CONSOLE.STRING
 	LD	A,(FAIL_CODE)
-	LD	B,A
+	CALL	@EL3ALG.TO_DSS_EXIT
 	LD	C,DSS_EXIT
 	RST	DSS
 
@@ -162,5 +162,6 @@ FAIL_CODE	DB 0
 	INCLUDE "console.asm"
 	INCLUDE "isa.asm"
 	INCLUDE "el3_io.asm"
+	INCLUDE "el3_fifo.asm"
 	INCLUDE "el3_regs.asm"
 	INCLUDE "el3.asm"

@@ -808,6 +808,11 @@ WRITE_WORD	DW 0
 
 	MODULE EL3
 SLOT	DB 1
+; Stage 4 isolates the register core. Stage 5 vectors exercise the real
+; loopback RMW used by INIT and DONE.
+LOOPBACK_DISABLE
+	XOR	A
+	RET
 	ENDMODULE
 
 MOCK_WINDOW	DB 0
