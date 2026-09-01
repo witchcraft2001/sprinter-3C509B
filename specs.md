@@ -7,10 +7,11 @@
 - Целевая платформа: Sprinter DSS
 - Сетевая карта: 3Com EtherLink III 3C509B-TPO
 - Режим шины: ISA8
-- Состояние проекта: локальная кодовая часть этапов 0–8 реализована; MAME-матрица
+- Состояние проекта: локальная кодовая часть этапов 0–9 реализована; MAME-матрица
   этапа 4 пройдена на `CYCLES21`; Stage 5/6 имеет частичные MAME pcap, но полная
   матрица остаётся открытой; автоматическая и ручная MAME-приёмка Stage 7
-  пройдены; автоматическая и ручная MAME-приёмка Stage 8 пройдены, все
+  пройдены; автоматическая и ручная MAME-приёмка Stage 8 пройдены;
+  автоматическая Stage 9-приёмка пройдена, а её ручной MAME gate и все
   проверки на реальном Sprinter ещё открыты
 
 Этот документ одновременно является техническим заданием, дорожной картой и
@@ -37,7 +38,7 @@
 | 6 | Физические TX и RX | [x] | [ ] | [ ] | [x] | [ ] |
 | 7 | NETDRV, конфигурация, ARP и DHCP acquire | [x] | [x] | [ ] | [x] | [ ] |
 | 8 | IPv4, ICMP и PING | [x] | [x] | [ ] | [x] | [ ] |
-| 9 | UDP и TFTP | [ ] | [ ] | [ ] | [ ] | [ ] |
+| 9 | UDP и TFTP | [x] | [ ] | [ ] | [x] | [ ] |
 | 10 | DHCP, DNS и NTP | [ ] | [ ] | [ ] | [ ] | [ ] |
 | 11 | TCP | [ ] | [ ] | [ ] | [ ] | [ ] |
 | 12 | WGET | [ ] | [ ] | [ ] | [ ] | [ ] |
@@ -903,17 +904,29 @@ hardware evidence остаётся открытым.
 
 Результат: UDP API и передача файлов по TFTP.
 
-- [ ] Перенести UDP build/parse/checksum.
-- [ ] Создать `UDPTEST.EXE` с echo и генератором пакетов.
-- [ ] Реализовать TFTP GET и PUT.
-- [ ] Реализовать retry, timeout, duplicate block и unknown transfer ID.
-- [ ] Реализовать пользовательский host:port.
-- [ ] Реализовать RFC 2348 `blksize` с безопасным пределом памяти.
-- [ ] Добавить overwrite/отказ от перезаписи.
-- [ ] Проверить пустой, короткий, кратный блоку и большой файл.
-- [ ] Проверить потерю, повтор и перестановку UDP-пакетов.
-- [ ] Проверить MAME и реальную карту.
-- [ ] Добавить логи/pcap: ____________________
+- [x] Перенести UDP build/parse/checksum.
+- [x] Создать `UDPTEST.EXE` с echo и генератором пакетов.
+- [x] Реализовать TFTP GET и PUT.
+- [x] Реализовать retry, timeout, duplicate block и unknown transfer ID.
+- [x] Реализовать пользовательский host:port.
+- [x] Реализовать RFC 2348 `blksize` с безопасным пределом памяти.
+- [x] Добавить overwrite/отказ от перезаписи.
+- [x] Автоматически проверить пустой, короткий, кратный блоку и файл
+  `256 KiB + 123` в обоих направлениях actual-EXE harness.
+- [x] Автоматически проверить потерю, повтор и перестановку UDP-пакетов.
+- [x] Добавить raw BPF/AF_PACKET responder, отдельный MAME image workflow,
+  byte-exact verify и classic-pcap checker без FCS.
+- [x] Выполнить чистую автоматическую приёмку `make test-host package image`:
+  90 actual-EXE UDP/TFTP сценариев, ASM codecs, writable DSS filesystem,
+  responder/pcap vectors, strict IMG/ZIP и отсутствие EXE BSS. SHA-256
+  2026-09-01: IMG `f6eaaf4424092d112c28436f6fb3acc09a5a1cfa2494c407fe5f8a7a899ca06c`,
+  ZIP `9f428a5cf1e7a2981066f9ab70740ec39016b5e52fdd41412f06cd03f26b2239`,
+  UDPTEST `4f3ecc3948e02c9bcefc4e51650f9e8ab1eef89c1634adb62f519817da8a7d4c`,
+  TFTP `6051051370321e68ea06e30fc72922a1420ac41b6bb3066877a87bea7de5d9bb`.
+- [ ] Выполнить единый MAME gate из `docs/STAGE9_TESTING_RU.md` и добавить
+  screenshots, responder log и byte-exact pcap: ____________________
+- [ ] Выполнить проверки на реальном Sprinter/3C509B-TPO.
+- [ ] Добавить hardware логи/pcap: ____________________
 - [ ] Критерий этапа: GET/PUT побайтно сохраняют файл при нормальной сети и потерях.
 
 ### Этап 10. DHCP renewal, DNS и NTP

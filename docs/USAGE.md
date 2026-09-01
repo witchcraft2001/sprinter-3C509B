@@ -21,3 +21,22 @@ PING [-t] [-n count] [-l size] [-i ttl] [-w milliseconds] target
 Defaults are `-n 4 -l 32 -i 64 -w 1000`. See `PING.TXT` for ranges, exit
 codes and timeout behavior. The IMG also contains `ARP.EXE` and `PINGALT.EXE`
 for bounded developer diagnostics; they are not included in the user ZIP.
+
+Test a UDP echo service from the developer IMG:
+
+```text
+UDPTEST [-n count] [-l size] [-w milliseconds] target port
+```
+
+Defaults are `1`, `16`, and `5000`; the maximum payload is 1472 bytes. See
+`UDPTEST.TXT` for exact ranges and reply matching.
+
+Transfer a file in TFTP octet mode:
+
+```text
+TFTP host[:port] GET remote [-o local] [-y|-f]
+TFTP host[:port] PUT local [-o remote]
+```
+
+The default request port is 69. GET prompts before overwriting an existing
+file unless `-y` or `-f` is present. `host` must be dotted IPv4 until Stage 10.

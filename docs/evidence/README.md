@@ -1,5 +1,26 @@
 # Verification evidence
 
+## Stage 9: local UDP/TFTP regressions
+
+- Date: 2026-09-01.
+- Version: 0.0.1 (unchanged).
+- Reproduction: `git diff --check`, `make clean`, then
+  `make test-host package image`.
+
+The clean run passed executable UDP checksum/bounds and TFTP framing vectors,
+90 actual-EXE scenarios, writable DSS file/error injection, deterministic
+loss/duplicate/reorder/unknown-TID behavior, and raw responder/pcap unit tests.
+The final artifacts are:
+
+- IMG: `f6eaaf4424092d112c28436f6fb3acc09a5a1cfa2494c407fe5f8a7a899ca06c`.
+- ZIP: `9f428a5cf1e7a2981066f9ab70740ec39016b5e52fdd41412f06cd03f26b2239`.
+- UDPTEST.EXE: `4f3ecc3948e02c9bcefc4e51650f9e8ab1eef89c1634adb62f519817da8a7d4c`.
+- TFTP.EXE: `6051051370321e68ea06e30fc72922a1420ac41b6bb3066877a87bea7de5d9bb`.
+
+This is local automated evidence only. No Stage 9 MAME or physical-card PASS
+is claimed. Use [STAGE9_TEST_TEMPLATE.md](STAGE9_TEST_TEMPLATE.md) and the
+single-session runbook before checking either gate.
+
 ## Stage 0: MAME HELLO
 
 - Date: 2026-08-29.

@@ -13,5 +13,11 @@ After `IFUP` reports success, verify IPv4 routing with `PING 192.168.7.1` or
 another dotted address. DNS names are deferred; use an address until the DNS
 stage is installed. `PING -t target` runs until Esc or Ctrl-C.
 
+For TFTP, use `TFTP address GET remote` or `TFTP address PUT local`. Add
+`:port` for a nonstandard request port and `-o name` to select the other file
+name. GET asks before replacing an existing local file; `-y` or `-f` permits
+replacement without the prompt. Interrupted or failed GET files are retained
+as partial data so they can be inspected.
+
 If a timeout or unexpected status occurs, stop. The program closes the ISA
 window, releases its DSS page, prints `RESULT FAIL`, and returns control to DSS.

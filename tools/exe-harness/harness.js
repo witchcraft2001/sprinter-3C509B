@@ -109,6 +109,52 @@ function icmpEchoRequest(frame) {
   return frame[14] >> 4 === 4 && ihl === 20 && frame[23] === 1 && frame[14 + ihl] === 8;
 }
 
+function udpDatagram(frame) {
+  if (frame.length < 42 || frame[12] !== 8 || frame[13] !== 0) return null;
+  const ip = frame.slice(14);
+  if (ip[0] !== 0x45 || ip[9] !== 17 || checksum(ip.slice(0, 20))) return null;
+  const total = (ip[2] << 8) | ip[3];
+  if (total < 28 || total > 1500 || total > ip.length || (ip[6] & 0xbf) || ip[7]) return null;
+  const udp = ip.slice(20, total), udpLength = (udp[4] << 8) | udp[5];
+  if (udpLength !== udp.length || udpLength < 8) return null;
+  if (udp[6] || udp[7]) {
+    const pseudo = [...ip.slice(12, 20), 0, 17, udpLength >> 8, udpLength & 255, ...udp];
+    if (checksum(pseudo)) return null;
+  }
+  return {
+    etherSource: frame.slice(6, 12), source: ip.slice(12, 16), destination: ip.slice(16, 20),
+    sourcePort: (udp[0] << 8) | udp[1], destinationPort: (udp[2] << 8) | udp[3],
+    payload: udp.slice(8), ip: ip.slice(0, total),
+  };
+}
+
+function buildUdpReply(request, options = {}) {
+  const sourceMac = options.mac || request.etherSource.map((_, i) => i === 5 ? 44 : (i === 0 ? 2 : 0));
+  const sourceIp = options.ip || request.destination;
+  const destinationIp = request.source.slice();
+  const payload = options.payload ? Array.from(options.payload) : request.payload.slice();
+  if (options.corruptPayload && payload.length) payload[0] ^= 1;
+  const sourcePort = options.sourcePort ?? request.destinationPort;
+  const destinationPort = options.destinationPort ?? request.sourcePort;
+  const udpLength = 8 + payload.length;
+  const udp = [sourcePort >> 8, sourcePort & 255, destinationPort >> 8, destinationPort & 255,
+    udpLength >> 8, udpLength & 255, 0, 0, ...payload];
+  let udpSum = checksum([...sourceIp, ...destinationIp, 0, 17, udpLength >> 8, udpLength & 255, ...udp]);
+  if (!udpSum) udpSum = 0xffff;
+  udp[6] = udpSum >> 8; udp[7] = udpSum & 255;
+  const total = 20 + udpLength;
+  const ip = [0x45, 0, total >> 8, total & 255, 0x63, 0x21, 0x40, 0, options.ttl || 61,
+    17, 0, 0, ...sourceIp, ...destinationIp];
+  putChecksum(ip, 0, 20, 10);
+  const reply = [...request.etherSource, ...sourceMac, 8, 0, ...ip, ...udp];
+  if (options.foreignSource) { reply[26] ^= 1; putChecksum(reply, 14, 20, 24); }
+  if (options.foreignDestination) { reply[30] ^= 1; putChecksum(reply, 14, 20, 24); }
+  if (options.badIpChecksum) reply[24] ^= 1;
+  if (options.badUdpChecksum) reply[40] ^= 1;
+  while (reply.length < 60) reply.push(0);
+  return reply;
+}
+
 function putChecksum(bytes, offset, length, field) {
   bytes[field] = 0; bytes[field + 1] = 0;
   const value = checksum(bytes.slice(offset, offset + length));
@@ -238,6 +284,9 @@ class EtherLinkIII {
     this.dhcpDiscoverCount = 0; this.dhcpRequestCount = 0;
     this.arpRequestCount = 0;
     this.icmpRequestCount = 0;
+    this.udpRequestCount = 0;
+    this.tftpResponseCount = 0;
+    this.tftpSession = null;
     this.delayed = [];
     this.generated = [];
   }
@@ -432,6 +481,156 @@ class EtherLinkIII {
         else this.rxQueue.push({frame: reply, cursor: 0});
       }
     }
+    const datagram = udpDatagram(frame);
+    const tftp = this.scenario.tftp;
+    if (tftp && datagram) this.respondTftp(datagram, tftp);
+    const udpScenario = this.scenario.udp;
+    if (udpScenario && datagram &&
+        (!udpScenario.port || datagram.destinationPort === udpScenario.port)) {
+      this.udpRequestCount++;
+      if ((udpScenario.drop || 0) >= this.udpRequestCount || udpScenario.mode === 'drop') return;
+      const replies = [];
+      if (udpScenario.unrelatedBeforeReply)
+        replies.push(buildUdpReply(datagram, {sourcePort: ((datagram.destinationPort + 1) & 0xffff) || 1}));
+      if (udpScenario.foreignSourceBeforeReply)
+        replies.push(buildUdpReply(datagram, {foreignSource: true}));
+      if (udpScenario.foreignDestinationBeforeReply)
+        replies.push(buildUdpReply(datagram, {foreignDestination: true}));
+      if (udpScenario.badIpBeforeReply)
+        replies.push(buildUdpReply(datagram, {badIpChecksum: true}));
+      if (udpScenario.badUdpBeforeReply)
+        replies.push(buildUdpReply(datagram, {badUdpChecksum: true}));
+      if (udpScenario.corruptBeforeReply)
+        replies.push(buildUdpReply(datagram, {corruptPayload: true}));
+      if (udpScenario.requestBeforeReply) {
+        const incoming = buildIncomingEchoRequest(frame, udpScenario);
+        this.generated.push(incoming);
+        if (this.accepts(incoming)) this.rxQueue.push({frame: incoming, cursor: 0});
+      }
+      if (udpScenario.arpBeforeReply) {
+        const incoming = buildArpRequest(frame.slice(6, 12), frame.slice(26, 30), udpScenario);
+        this.generated.push(incoming);
+        if (this.accepts(incoming)) this.rxQueue.push({frame: incoming, cursor: 0});
+      }
+      if (udpScenario.mode === 'unreachable') {
+        const unreachable = buildIcmpUnreachable(frame, udpScenario);
+        if (udpScenario.unrelatedUnreachable) {
+          unreachable[65] ^= 1;
+          putChecksum(unreachable, 34, unreachable.length - 34, 36);
+        }
+        replies.push(unreachable);
+      } else {
+        replies.push(buildUdpReply(datagram, udpScenario));
+      }
+      if (udpScenario.duplicate) replies.push(replies[replies.length - 1].slice());
+      for (const reply of replies) {
+        this.generated.push(reply);
+        if (!this.accepts(reply)) continue;
+        if (udpScenario.delayPolls) this.delayed.push({polls: udpScenario.delayPolls, frame: reply});
+        else this.rxQueue.push({frame: reply, cursor: 0});
+      }
+    }
+  }
+
+  respondTftp(datagram, tftp) {
+    const payload = datagram.payload, opcode = payload.length >= 2 ? (payload[0] << 8) | payload[1] : 0;
+    const requestPorts = new Set([tftp.port || 69, ...(tftp.extraPorts || [6969])]);
+    const serverTid = tftp.serverTid ?? 0xbeef;
+    const isTftpPacket = requestPorts.has(datagram.destinationPort) ||
+      datagram.destinationPort === serverTid;
+    if (!isTftpPacket) return;
+    this.tftpPacketCount = (this.tftpPacketCount || 0) + 1;
+    if ((tftp.dropPackets || 0) >= this.tftpPacketCount ||
+        (tftp.dropPacketNumbers || []).includes(this.tftpPacketCount)) return;
+    const remoteFiles = tftp.files || {};
+    const findFile = (name) => {
+      const key = Object.keys(remoteFiles).find((candidate) => candidate.toUpperCase() === name.toUpperCase());
+      return key === undefined ? null : (Buffer.isBuffer(remoteFiles[key]) ? remoteFiles[key] : Buffer.from(remoteFiles[key]));
+    };
+    const packet = (port, body) => buildUdpReply(datagram, {sourcePort: port, payload: body,
+      mac: tftp.mac || [2,0,0,0,0,44], ip: tftp.ip || datagram.destination});
+    const queue = (body, port = serverTid, options = {}) => {
+      const reply = packet(port, body);
+      if (options.badChecksum) reply[40] ^= 1;
+      this.generated.push(reply);
+      if (this.accepts(reply)) this.rxQueue.push({frame: reply, cursor: 0});
+    };
+    const emit = (body, port = serverTid) => {
+      this.tftpResponseCount++;
+      if ((tftp.dropResponses || 0) >= this.tftpResponseCount ||
+          (tftp.dropResponseNumbers || []).includes(this.tftpResponseCount)) return;
+      if (tftp.badChecksum && this.tftpResponseCount === 1)
+        queue(body, port, {badChecksum: true});
+      if (tftp.unknownTidMalformed && this.tftpResponseCount ===
+          (tftp.unknownTidMalformedAt ?? 2))
+        queue([0], ((serverTid + 1) & 0xffff) || 1);
+      else if (tftp.unknownTid && this.tftpResponseCount === 2)
+        queue(body, ((serverTid + 1) & 0xffff) || 1);
+      queue(body, port);
+      if (tftp.duplicate) queue(body, port);
+    };
+    const parseRequest = () => {
+      let end = payload.indexOf(0, 2);
+      if (end < 0) return null;
+      return Buffer.from(payload.slice(2, end)).toString('ascii');
+    };
+    const dataPacket = (session, block) => {
+      const start = (block - 1) * session.blockSize;
+      const data = start <= session.file.length ? session.file.subarray(start, start + session.blockSize) : Buffer.alloc(0);
+      if (data.length < session.blockSize) session.finalBlock = block;
+      return [0, 3, (block >> 8) & 255, block & 255, ...data];
+    };
+    if ((opcode === 1 || opcode === 2) && requestPorts.has(datagram.destinationPort)) {
+      const name = parseRequest();
+      if (!name) return;
+      if (tftp.error) {
+        const message = Buffer.from(tftp.error.message || 'Remote error', 'ascii');
+        emit([0,5,0,tftp.error.code || 1,...message,0]);
+        return;
+      }
+      const blockSize = tftp.fallback ? 512 : (tftp.blockSize || 1428);
+      if (opcode === 1) {
+        const file = findFile(name);
+        if (file === null) { emit([0,5,0,1,...Buffer.from('File not found'),0]); return; }
+        this.tftpSession = {mode: 'get', name, file, blockSize, clientPort: datagram.sourcePort};
+        if (tftp.oversizedOack) emit([0,6,...Buffer.from('blksize'),0,...Buffer.from('1429'),0]);
+        else if (!tftp.fallback) emit([0,6,...Buffer.from('blksize'),0,...Buffer.from(String(blockSize)),0]);
+        else emit(dataPacket(this.tftpSession, 1));
+      } else {
+        this.tftpSession = {mode: 'put', name, chunks: [], expected: 1, blockSize,
+          clientPort: datagram.sourcePort};
+        if (tftp.oversizedOack) emit([0,6,...Buffer.from('blksize'),0,...Buffer.from('1429'),0]);
+        else if (!tftp.fallback) emit([0,6,...Buffer.from('blksize'),0,...Buffer.from(String(blockSize)),0]);
+        else emit([0,4,0,0]);
+      }
+      return;
+    }
+    const session = this.tftpSession;
+    if (!session || datagram.destinationPort !== serverTid) return;
+    if (opcode === 4 && session.mode === 'get' && payload.length === 4) {
+      const ack = (payload[2] << 8) | payload[3];
+      if (session.finalBlock === ack) {
+        if (tftp.unknownTidDally) queue([0], ((serverTid + 1) & 0xffff) || 1);
+        return;
+      }
+      if (tftp.reorder && !session.reordered) {
+        session.reordered = true;
+        queue(dataPacket(session, (ack + 2) & 0xffff));
+      }
+      emit(dataPacket(session, (ack + 1) & 0xffff));
+      return;
+    }
+    if (opcode === 3 && session.mode === 'put' && payload.length >= 4) {
+      const block = (payload[2] << 8) | payload[3], data = Buffer.from(payload.slice(4));
+      if (block === session.expected) {
+        session.chunks.push(data); session.expected = (session.expected + 1) & 0xffff;
+        if (data.length < session.blockSize) {
+          if (!tftp.uploads) tftp.uploads = {};
+          tftp.uploads[session.name] = Buffer.concat(session.chunks);
+        }
+      }
+      emit([0,4,payload[2],payload[3]]);
+    }
   }
 
   advanceDelayed() {
@@ -563,14 +762,21 @@ function runExe(exePath, args = '', inputScenario = {}) {
   const allocated = (id) => pages.has(id);
   const environment = scenario.environment || {};
   const envKey = (name) => name.toUpperCase();
+  let currentDir = (scenario.currentDir || 'C:\\NET').replace(/\//g, '\\').toUpperCase();
+  const canonicalName = (name) => {
+    const normalized = name.replace(/\//g, '\\').toUpperCase();
+    if (/^[A-Z]:\\/.test(normalized) || normalized.startsWith('\\')) return normalized;
+    return `${currentDir}${currentDir.endsWith('\\') ? '' : '\\'}${normalized}`;
+  };
   const files = new Map(Object.entries(scenario.files || {}).map(([name, data]) => [
-    name.replace(/\//g, '\\').toUpperCase(), Buffer.isBuffer(data) ? data : Buffer.from(data, 'utf8'),
+    canonicalName(name), Buffer.isBuffer(data) ? Buffer.from(data) : Buffer.from(data, 'utf8'),
   ]));
   const openFiles = new Map();
   let nextHandle = 4, envSetCount = 0, clockSecond = scenario.clockSecond || 0;
+  let fileReadCalls = 0, fileWriteCalls = 0, totalWritten = 0;
   let clockReads = 0, scanCount = 0;
   const dssEvents = [];
-  let stdout = '', exitCode = null, steps = 0;
+  let stdout = '', exitCode = null, steps = 0, minimumSp = stack;
   const pcTrace = [];
 
   const cardPort = (address) => address & 0x3fff;
@@ -662,10 +868,10 @@ function runExe(exePath, args = '', inputScenario = {}) {
     const s = cpu.getState(), fn = s.c, count = s.b || 1;
     switch (fn) {
       case 0x11: {
-        const name = cstr((s.h << 8) | s.l).replace(/\//g, '\\').toUpperCase();
+        const name = canonicalName(cstr((s.h << 8) | s.l));
         const data = files.get(name);
         if (scenario.traceDss) dssEvents.push(`OPEN ${name} ${data ? data.length : 'missing'}`);
-        if (!data || s.a !== 1) { setCarry(s, true); s.a = 3; return ret(s); }
+        if (!data || ![0, 1, 2].includes(s.a)) { setCarry(s, true); s.a = 3; return ret(s); }
         const handle = nextHandle++;
         openFiles.set(handle, {name, data, offset: 0});
         s.a = handle; setCarry(s, false); return ret(s);
@@ -677,7 +883,10 @@ function runExe(exePath, args = '', inputScenario = {}) {
       case 0x13: {
         const file = openFiles.get(s.a);
         if (!file) throw new Error(`READ_FILE of unknown handle ${s.a}`);
-        const requested = (s.d << 8) | s.e;
+        fileReadCalls++;
+        if (scenario.fileReadFailAt === fileReadCalls) { s.a = 1; setCarry(s, true); return ret(s); }
+        let requested = (s.d << 8) | s.e;
+        if (scenario.fileReadMax) requested = Math.min(requested, scenario.fileReadMax);
         const chunk = file.data.subarray(file.offset, file.offset + requested);
         const destination = (s.h << 8) | s.l;
         for (let i = 0; i < chunk.length; i++) wr(destination + i, chunk[i]);
@@ -685,6 +894,54 @@ function runExe(exePath, args = '', inputScenario = {}) {
         if (scenario.traceDss) dssEvents.push(`READ ${file.name} ${chunk.length}/${requested}`);
         s.d = chunk.length >> 8; s.e = chunk.length & 0xff;
         setCarry(s, false); return ret(s);
+      }
+      case 0x0a:
+      case 0x0b: {
+        const name = canonicalName(cstr((s.h << 8) | s.l));
+        if (fn === 0x0b && files.has(name)) { s.a = 7; setCarry(s, true); return ret(s); }
+        const data = Buffer.alloc(0); files.set(name, data);
+        const handle = nextHandle++; openFiles.set(handle, {name, data, offset: 0});
+        if (scenario.traceDss) dssEvents.push(`CREATE ${name}`);
+        s.a = handle; setCarry(s, false); return ret(s);
+      }
+      case 0x0e: {
+        const name = canonicalName(cstr((s.h << 8) | s.l));
+        if (!files.delete(name)) { s.a = 3; setCarry(s, true); return ret(s); }
+        if (scenario.traceDss) dssEvents.push(`DELETE ${name}`);
+        setCarry(s, false); return ret(s);
+      }
+      case 0x14: {
+        const file = openFiles.get(s.a);
+        if (!file) throw new Error(`WRITE of unknown handle ${s.a}`);
+        fileWriteCalls++;
+        const requested = (s.d << 8) | s.e;
+        if (scenario.fileWriteFailAt === fileWriteCalls ||
+            (scenario.diskFullAfter !== undefined && totalWritten + requested > scenario.diskFullAfter)) {
+          s.a = 1; setCarry(s, true); return ret(s);
+        }
+        const source = (s.h << 8) | s.l;
+        const end = file.offset + requested;
+        const data = Buffer.alloc(Math.max(file.data.length, end));
+        file.data.copy(data); for (let i = 0; i < requested; i++) data[file.offset + i] = rd(source + i);
+        file.data = data; file.offset = end; files.set(file.name, data); totalWritten += requested;
+        if (scenario.traceDss) dssEvents.push(`WRITE ${file.name} ${requested}`);
+        setCarry(s, false); return ret(s);
+      }
+      case 0x1e:
+        writeCstr((s.h << 8) | s.l, currentDir); setCarry(s, false); return ret(s);
+      case 0x1d: {
+        const requested = cstr((s.h << 8) | s.l).replace(/\//g, '\\').toUpperCase();
+        if ((scenario.missingDirs || []).map((v) => v.toUpperCase()).includes(requested)) {
+          s.a = 3; setCarry(s, true); return ret(s);
+        }
+        currentDir = /^[A-Z]:\\/.test(requested) || requested.startsWith('\\') ? requested : canonicalName(requested);
+        if (scenario.traceDss) dssEvents.push(`CHDIR ${currentDir}`);
+        setCarry(s, false); return ret(s);
+      }
+      case 0x35: {
+        if (s.b !== 0x30) throw new Error(`unknown K_CLEAR subfunction ${s.b}`);
+        const key = scenario.promptKey || 'n';
+        s.a = key === 'escape' ? 0x1b : key.charCodeAt(0); setCarry(s, false); return ret(s);
       }
       case 0x21: {
         const now = Math.floor(clockSecond) % 86400;
@@ -769,6 +1026,7 @@ function runExe(exePath, args = '', inputScenario = {}) {
   try {
     const limit = scenario.stepLimit || 200_000_000;
     for (;;) {
+      minimumSp = Math.min(minimumSp, cpu.getState().sp);
       if (scenario.stopPc !== undefined && cpu.getState().pc === scenario.stopPc)
         throw new Error(`stop PC=${cpu.getState().pc.toString(16)} SP=${cpu.getState().sp.toString(16)} A=${cpu.getState().a.toString(16)} F=${JSON.stringify(cpu.getState().flags)} trace=${pcTrace.map((v) => v.toString(16)).join(',')}`);
       if (scenario.strictPc && cpu.getState().pc !== 0x0010 && cpu.getState().pc < 0x8080)
@@ -806,11 +1064,15 @@ function runExe(exePath, args = '', inputScenario = {}) {
     },
     card: {slot: card.slot, base: card.base, mac: hex(card.mac), station: hex(card.station), active: card.active},
     environment: {...environment},
+    currentDir,
+    files: Object.fromEntries([...files].map(([name, data]) => [name, Buffer.from(data)])),
+    tftpUploads: scenario.tftp && scenario.tftp.uploads ? {...scenario.tftp.uploads} : {},
     ...(scenario.traceDss ? {dssEvents} : {}),
     ...(scenario.dumpMemory ? {memory: Object.fromEntries(scenario.dumpMemory.map(([start, length]) => [
       start.toString(16), hex(Array.from({length}, (_, i) => ram[(start + i) & 0xffff])),
     ]))} : {}),
     steps,
+    minimumSp,
   };
 }
 
