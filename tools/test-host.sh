@@ -20,7 +20,8 @@ bash -n "$script_dir/artifacts.sh" "$script_dir/build.sh" \
   "$script_dir/image.sh" "$script_dir/package.sh" "$script_dir/test-host.sh" \
   "$script_dir/test-stage3-asm.sh" "$script_dir/test-stage4-asm.sh" \
   "$script_dir/test-stage5-asm.sh" "$script_dir/test-stage6-asm.sh" \
-  "$script_dir/test-stage7-asm.sh"
+  "$script_dir/test-stage7-asm.sh" "$script_dir/test-stage8-asm.sh" \
+  "$script_dir/stage8-mame.sh"
 sh -n "$script_dir/test-fixtures/fake-mame.sh"
 node --check "$script_dir/exe-harness/Z80core.js"
 node --check "$script_dir/exe-harness/harness.js"
@@ -28,9 +29,12 @@ node --check "$script_dir/exe-harness/run.js"
 node --check "$script_dir/test-exe-harness.js"
 node --check "$script_dir/test-exe-stress.js"
 node --check "$script_dir/test-stage7-exe.js"
+node --check "$script_dir/test-stage8-exe.js"
 python3 -c 'import ast,sys; [ast.parse(open(p, encoding="utf-8").read(), filename=p) for p in sys.argv[1:]]' \
   "$script_dir/host/ethernet_helper.py" "$script_dir/host/test_ethernet_helper.py" \
   "$script_dir/host/stage7_responder.py" "$script_dir/host/test_stage7_responder.py"
+python3 -c 'import ast,sys; [ast.parse(open(p, encoding="utf-8").read(), filename=p) for p in sys.argv[1:]]' \
+  "$script_dir/host/stage8_responder.py" "$script_dir/host/test_stage8_responder.py"
 sh -n "$script_dir/3com.sh"
 input_profile="$repo_root/config/mame/sprinter.cfg"
 ui_profile="$repo_root/config/mame/default.cfg"
@@ -55,6 +59,7 @@ perl -c "$script_dir/check-stage4.pl" >/dev/null
 perl -c "$script_dir/check-stage5.pl" >/dev/null
 perl -c "$script_dir/check-stage6.pl" >/dev/null
 perl -c "$script_dir/check-stage7.pl" >/dev/null
+perl -c "$script_dir/check-stage8.pl" >/dev/null
 perl -c "$script_dir/set-mame-network.pl" >/dev/null
 "$script_dir/test-mame-network.sh"
 
@@ -72,12 +77,17 @@ perl "$script_dir/check-stage5.pl" "$repo_root"
 perl "$script_dir/check-stage6.pl" "$repo_root"
 "$script_dir/test-stage7-asm.sh"
 perl "$script_dir/check-stage7.pl" "$repo_root"
+"$script_dir/test-stage8-asm.sh"
+perl "$script_dir/check-stage8.pl" "$repo_root"
 node "$script_dir/test-exe-harness.js"
 node "$script_dir/test-stage7-exe.js"
+node "$script_dir/test-stage8-exe.js"
 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$script_dir/host" \
   python3 "$script_dir/host/test_ethernet_helper.py"
 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$script_dir/host" \
   python3 "$script_dir/host/test_stage7_responder.py"
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$script_dir/host" \
+  python3 "$script_dir/host/test_stage8_responder.py"
 
 artifact_validate_manifest IMG
 artifact_validate_manifest ZIP
@@ -90,12 +100,12 @@ binary_copy="$(mktemp "${TMPDIR:-/tmp}/sprinter-509b-binary.XXXXXX")"
 trap 'rm -f "$expected_img" "$expected_zip" "$actual_names" "$text_copy" "$binary_copy"' EXIT
 
 printf '%s\n' ARP.EXE ARP.TXT CONNECT.BAT EL3EEP.EXE EL3INFO.EXE EL3INFO.TXT EL3LB.EXE EL3LB.TXT EL3REG.EXE EL3REG.TXT EL3RX.EXE EL3RX.TXT EL3TX.EXE EL3TX.TXT HELLO.EXE HOWTO.TXT IFUP.EXE IFUP.TXT ISAPROBE.EXE \
-  LICENSE.TXT NETCFG.EXE NETCFG.TXT NETSMPL.CFG README.TXT READMERU.TXT USAGE.TXT \
+  LICENSE.TXT NETCFG.EXE NETCFG.TXT NETSMPL.CFG PING.EXE PING.TXT PINGALT.EXE README.TXT READMERU.TXT TESTING.TXT USAGE.TXT \
   | LC_ALL=C sort > "$expected_img"
 artifact_names IMG | LC_ALL=C sort > "$actual_names"
 diff -u "$expected_img" "$actual_names"
 
-printf '%s\n' CONNECT.BAT EL3INFO.EXE EL3INFO.TXT HOWTO.TXT IFUP.EXE IFUP.TXT LICENSE.TXT NETCFG.EXE NETCFG.TXT NETSMPL.CFG README.TXT \
+printf '%s\n' CONNECT.BAT EL3INFO.EXE EL3INFO.TXT HOWTO.TXT IFUP.EXE IFUP.TXT LICENSE.TXT NETCFG.EXE NETCFG.TXT NETSMPL.CFG PING.EXE PING.TXT README.TXT \
   READMERU.TXT USAGE.TXT \
   | LC_ALL=C sort > "$expected_zip"
 artifact_names ZIP | LC_ALL=C sort > "$actual_names"
@@ -110,6 +120,10 @@ if artifact_names ZIP | grep -Eq '^EL3(LB|REG|TX|RX)\.'; then
 fi
 if artifact_names ZIP | grep -Eq '^ARP\.'; then
   echo "Error: developer ARP diagnostic found in ZIP manifest" >&2
+  exit 1
+fi
+if artifact_names ZIP | grep -Eq '^(PINGALT|TESTING)\.'; then
+  echo "Error: Stage 8 developer diagnostic found in ZIP manifest" >&2
   exit 1
 fi
 
@@ -129,7 +143,7 @@ if iconv -f CP866 -t UTF-8 "$text_copy" | grep -Eqi \
   exit 1
 fi
 
-for binary in HELLO EL3INFO EL3EEP EL3REG EL3LB EL3TX EL3RX ISAPROBE NETCFG IFUP ARP; do
+for binary in HELLO EL3INFO EL3EEP EL3REG EL3LB EL3TX EL3RX ISAPROBE NETCFG IFUP ARP PING PINGALT; do
   artifact_copy binary "$repo_root/build/$binary.EXE" "$binary_copy" "$script_dir"
   cmp "$repo_root/build/$binary.EXE" "$binary_copy"
 done
@@ -140,7 +154,7 @@ if [ "$version" != "0.0.1" ] || ! grep -q 'PACKAGE_VERSION.*"0.0.1"' \
   echo "Error: package version declarations disagree" >&2
   exit 1
 fi
-for binary in EL3INFO EL3EEP EL3REG EL3LB EL3TX EL3RX ISAPROBE NETCFG IFUP ARP; do
+for binary in EL3INFO EL3EEP EL3REG EL3LB EL3TX EL3RX ISAPROBE NETCFG IFUP ARP PING PINGALT; do
   if ! grep -a -q "v0.0.1" "$repo_root/build/$binary.EXE"; then
     echo "Error: $binary banner is not version 0.0.1" >&2
     exit 1

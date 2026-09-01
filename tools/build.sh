@@ -43,3 +43,5 @@ build_app isaprobe ISAPROBE
 build_app netcfg NETCFG
 build_app ifup IFUP
 build_app arp ARP
+build_app ping PING
+build_app pingalt PINGALT

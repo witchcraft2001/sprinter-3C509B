@@ -2,6 +2,7 @@
 ; SPDX-License-Identifier: BSD-3-Clause
 
 EXE_VERSION	EQU 1
+SCAN_C		EQU 0xAC		; DSS positional scancode for C with bit 7 set
 
 	DEVICE NOSLOT64K
 	INCLUDE "version.inc"
@@ -155,10 +156,10 @@ WAIT_ARP
 	CP	0x1B
 	JR	Z,.CANCEL
 	LD	A,B
-	AND	3
+	AND	KB_CTRL | KB_L_CTRL | KB_R_CTRL
 	JR	Z,.TIME
 	LD	A,D
-	CP	0x2E
+	CP	SCAN_C
 	JR	Z,.CANCEL
 .TIME
 	CALL	@S7APP.SECONDS

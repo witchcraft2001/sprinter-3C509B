@@ -103,6 +103,78 @@ function buildArpRequest(targetMac, targetIp, options = {}) {
     ...senderMac, ...senderIp, ...Array(6).fill(0), ...targetIp, ...Array(18).fill(0)];
 }
 
+function icmpEchoRequest(frame) {
+  if (frame.length < 42 || frame[12] !== 8 || frame[13] !== 0) return false;
+  const ihl = (frame[14] & 15) * 4;
+  return frame[14] >> 4 === 4 && ihl === 20 && frame[23] === 1 && frame[14 + ihl] === 8;
+}
+
+function putChecksum(bytes, offset, length, field) {
+  bytes[field] = 0; bytes[field + 1] = 0;
+  const value = checksum(bytes.slice(offset, offset + length));
+  bytes[field] = value >> 8; bytes[field + 1] = value & 255;
+}
+
+function buildIcmpReply(request, options = {}) {
+  const ipLength = (request[16] << 8) | request[17];
+  const icmpLength = ipLength - 20;
+  const peerMac = options.mac || request.slice(0, 6);
+  const peerIp = options.ip || request.slice(30, 34);
+  const localMac = request.slice(6, 12), localIp = request.slice(26, 30);
+  const icmp = request.slice(34, 34 + icmpLength);
+  icmp[0] = 0;
+  putChecksum(icmp, 0, icmp.length, 2);
+  const ip = [0x45, 0, ipLength >> 8, ipLength & 255, 0x43, 0x21, 0x40, 0,
+    options.ttl || 63, 1, 0, 0, ...peerIp, ...localIp];
+  putChecksum(ip, 0, 20, 10);
+  const frame = [...localMac, ...peerMac, 8, 0, ...ip, ...icmp];
+  if (options.unrelated) frame[38] ^= 1;
+  if (options.corruptPayload && icmpLength > 8) frame[42] ^= 1;
+  if (options.unrelated || (options.corruptPayload && icmpLength > 8))
+    putChecksum(frame, 34, icmpLength, 36);
+  if (options.foreignSource) { frame[26] ^= 1; putChecksum(frame, 14, 20, 24); }
+  if (options.foreignDestination) { frame[30] ^= 1; putChecksum(frame, 14, 20, 24); }
+  if (options.badIcmpChecksum) frame[36] ^= 1;
+  if (options.badIpChecksum) frame[24] ^= 1;
+  while (frame.length < 60) frame.push(0);
+  return frame;
+}
+
+function buildIcmpUnreachable(request, options = {}) {
+  const routerMac = options.mac || request.slice(0, 6);
+  const routerIp = options.routerIp || [192, 168, 7, 1];
+  const localMac = request.slice(6, 12), localIp = request.slice(26, 30);
+  const quote = request.slice(14, 42);
+  const icmp = [3, options.code || 1, 0, 0, 0, 0, 0, 0, ...quote];
+  putChecksum(icmp, 0, icmp.length, 2);
+  const total = 20 + icmp.length;
+  const ip = [0x45, 0, total >> 8, total & 255, 0x22, 0x22, 0x40, 0,
+    64, 1, 0, 0, ...routerIp, ...localIp];
+  putChecksum(ip, 0, 20, 10);
+  const frame = [...localMac, ...routerMac, 8, 0, ...ip, ...icmp];
+  if (options.unrelated) {
+    frame[69] ^= 1; // low byte of the quoted Echo sequence
+    putChecksum(frame, 34, icmp.length, 36);
+  }
+  return frame;
+}
+
+function buildIncomingEchoRequest(outgoing, options = {}) {
+  const localMac = outgoing.slice(6, 12), peerMac = options.requesterMac || [2, 0, 0, 0, 0, 77];
+  const localIp = outgoing.slice(26, 30), peerIp = options.requesterIp || [192, 168, 7, 77];
+  const payload = [0xa5, 0x5a, 1];
+  const icmp = [8, 0, 0, 0, 0x77, 0x77, 0, 1, ...payload];
+  putChecksum(icmp, 0, icmp.length, 2);
+  const total = 20 + icmp.length;
+  const ip = [0x45, 0, total >> 8, total & 255, 0x11, 0x11, 0x40, 0,
+    32, 1, 0, 0, ...peerIp, ...localIp];
+  putChecksum(ip, 0, 20, 10);
+  const frame = [...localMac, ...peerMac, 8, 0, ...ip, ...icmp];
+  if (options.badIcmpChecksum) frame[36] ^= 1;
+  while (frame.length < 60) frame.push(0);
+  return frame;
+}
+
 function eepromWords(mac, base) {
   const words = new Uint16Array(64);
   words[0] = mac[0] | (mac[1] << 8);
@@ -165,6 +237,8 @@ class EtherLinkIII {
     this.wordReadHigh = new Map();
     this.dhcpDiscoverCount = 0; this.dhcpRequestCount = 0;
     this.arpRequestCount = 0;
+    this.icmpRequestCount = 0;
+    this.delayed = [];
     this.generated = [];
   }
 
@@ -319,6 +393,54 @@ class EtherLinkIII {
       this.generated.push(reply);
       if (this.accepts(reply)) this.rxQueue.push({frame: reply, cursor: 0});
     }
+    const icmp = this.scenario.icmp;
+    if (icmp && icmpEchoRequest(frame)) {
+      this.icmpRequestCount++;
+      if ((icmp.drop || 0) >= this.icmpRequestCount || icmp.mode === 'drop') return;
+      if (icmp.badRequestBeforeReply && this.icmpRequestCount === 1) {
+        const incoming = buildIncomingEchoRequest(frame, {...icmp, badIcmpChecksum: true});
+        this.generated.push(incoming);
+        if (this.accepts(incoming)) this.rxQueue.push({frame: incoming, cursor: 0});
+      }
+      if (icmp.requestBeforeReply && this.icmpRequestCount === 1) {
+        const incoming = buildIncomingEchoRequest(frame, icmp);
+        this.generated.push(incoming);
+        if (this.accepts(incoming)) this.rxQueue.push({frame: incoming, cursor: 0});
+      }
+      const replies = [];
+      if (icmp.unrelatedBeforeReply) replies.push(buildIcmpReply(frame, {...icmp, unrelated: true}));
+      if (icmp.foreignSourceBeforeReply) replies.push(buildIcmpReply(frame, {...icmp, foreignSource: true}));
+      if (icmp.foreignDestinationBeforeReply) replies.push(buildIcmpReply(frame, {...icmp, foreignDestination: true}));
+      if (icmp.badIpBeforeReply) replies.push(buildIcmpReply(frame, {...icmp, badIpChecksum: true}));
+      if (icmp.badIcmpBeforeReply) replies.push(buildIcmpReply(frame, {...icmp, badIcmpChecksum: true}));
+      if (icmp.corruptBeforeReply) replies.push(buildIcmpReply(frame, {...icmp, corruptPayload: true}));
+      if (icmp.unrelatedUnreachableBeforeReply || icmp.onlyUnrelatedUnreachable)
+        replies.push(buildIcmpUnreachable(frame, {...icmp, unrelated: true}));
+      if (!icmp.onlyUnrelatedUnreachable) {
+        if (icmp.mode === 'unreachable') replies.push(buildIcmpUnreachable(frame, icmp));
+        else replies.push(buildIcmpReply(frame, icmp));
+      }
+      if (icmp.rxStatusBeforeReply) {
+        const damaged = buildIcmpReply(frame, icmp);
+        this.generated.push(damaged);
+        if (this.accepts(damaged)) this.rxQueue.push({frame: damaged, cursor: 0, statusError: true});
+      }
+      for (const reply of replies) {
+        this.generated.push(reply);
+        if (!this.accepts(reply)) continue;
+        if (icmp.delayPolls) this.delayed.push({polls: icmp.delayPolls, frame: reply});
+        else this.rxQueue.push({frame: reply, cursor: 0});
+      }
+    }
+  }
+
+  advanceDelayed() {
+    const ready = [];
+    for (const item of this.delayed) {
+      if (--item.polls <= 0) ready.push(item);
+    }
+    this.delayed = this.delayed.filter((item) => item.polls > 0);
+    for (const item of ready) this.rxQueue.push({frame: item.frame, cursor: 0});
   }
 
   rxByte() {
@@ -340,7 +462,11 @@ class EtherLinkIII {
         if (offset === 0x0c) return 0;
         break;
       case 1:
-        if (offset === 0x08) return this.rxQueue.length ? this.rxQueue[0].frame.length : 0;
+        if (offset === 0x08) {
+          this.advanceDelayed();
+          return this.rxQueue.length ? this.rxQueue[0].frame.length |
+            (this.rxQueue[0].statusError ? 0x4000 : 0) : 0;
+        }
         if (offset === 0x0c) return 0x2000;
         break;
       case 2:
@@ -441,7 +567,8 @@ function runExe(exePath, args = '', inputScenario = {}) {
     name.replace(/\//g, '\\').toUpperCase(), Buffer.isBuffer(data) ? data : Buffer.from(data, 'utf8'),
   ]));
   const openFiles = new Map();
-  let nextHandle = 4, envSetCount = 0, clockSecond = scenario.clockSecond || 0, scanCount = 0;
+  let nextHandle = 4, envSetCount = 0, clockSecond = scenario.clockSecond || 0;
+  let clockReads = 0, scanCount = 0;
   const dssEvents = [];
   let stdout = '', exitCode = null, steps = 0;
   const pcTrace = [];
@@ -560,16 +687,21 @@ function runExe(exePath, args = '', inputScenario = {}) {
         setCarry(s, false); return ret(s);
       }
       case 0x21: {
-        const now = clockSecond % 86400;
+        const now = Math.floor(clockSecond) % 86400;
         s.h = Math.floor(now / 3600); s.l = Math.floor(now / 60) % 60; s.b = now % 60;
-        clockSecond = (clockSecond + (scenario.timeStepSeconds ?? 1)) % 86400;
+        const frozen = scenario.clockFreezeAfterReads !== undefined &&
+          clockReads >= scenario.clockFreezeAfterReads;
+        clockSecond = (clockSecond + (frozen ? 0 : (scenario.timeStepSeconds ?? 1))) % 86400;
+        clockReads++;
         setCarry(s, false); return ret(s);
       }
       case 0x31: {
         scanCount++;
         if (scenario.key && scanCount === (scenario.keyAtScan || 1)) {
           if (scenario.key === 'escape') { s.b = 0; s.d = 1; s.e = 0x1b; }
-          else if (scenario.key === 'ctrl-c') { s.b = 1; s.d = 0x2e; s.e = 3; }
+          // DSS represents Ctrl+letter as a positional scancode with bit 7
+          // set and the X_CTRL modifier; it does not return ASCII 0x03.
+          else if (scenario.key === 'ctrl-c') { s.b = 0x20; s.d = 0xac; s.e = 0; }
           else throw new Error(`unknown simulated key ${scenario.key}`);
           s.a = 1; s.flags.Z = 0; setCarry(s, false); return ret(s);
         }

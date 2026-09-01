@@ -9,5 +9,9 @@ Place `NET.CFG` beside `NETCFG.EXE`. For DHCP use `IP=DHCP`; for static mode set
 `NETCFG -i -v`, then `IFUP`. `CONNECT.BAT` performs the non-verbose two-command
 sequence after the configuration has been reviewed.
 
+After `IFUP` reports success, verify IPv4 routing with `PING 192.168.7.1` or
+another dotted address. DNS names are deferred; use an address until the DNS
+stage is installed. `PING -t target` runs until Esc or Ctrl-C.
+
 If a timeout or unexpected status occurs, stop. The program closes the ISA
 window, releases its DSS page, prints `RESULT FAIL`, and returns control to DSS.
