@@ -9,10 +9,20 @@ IFUP
 
 `NETCFG` without arguments displays the current environment. `NETCFG -c`
 checks syntax without publishing; `NETCFG -d` removes it. DHCP acquisition is
-performed by each `IFUP` run. To switch to static addressing, edit `NET.CFG`,
+performed by each plain `IFUP` run. `IFUP -r` renews the active lease and
+`IFUP -d` sends best-effort RELEASE and clears it. To switch to static addressing, edit `NET.CFG`,
 run `NETCFG -i`, then run `IFUP` again.
 
-Ping a dotted IPv4 address after `IFUP`:
+Resolve a name or set the clock after `IFUP`:
+
+```text
+NSLOOKUP name [dns-server]
+NTP [server]
+```
+
+`NTP` without a server uses `NET_NTP` and the quarter-hour `NET_TZ` offset.
+
+Ping an IPv4 address or hostname after `IFUP`:
 
 ```text
 PING [-t] [-n count] [-l size] [-i ttl] [-w milliseconds] target
@@ -38,5 +48,5 @@ TFTP host[:port] GET remote [-o local] [-y|-f]
 TFTP host[:port] PUT local [-o remote]
 ```
 
-The default request port is 69. GET prompts before overwriting an existing
-file unless `-y` or `-f` is present. `host` must be dotted IPv4 until Stage 10.
+The default request port is 69. `host` may be IPv4 or a hostname. GET prompts
+before overwriting an existing file unless `-y` or `-f` is present.

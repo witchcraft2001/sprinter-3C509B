@@ -76,8 +76,7 @@ die "DHCP reply validation is incomplete\n"
         && $dhcp =~ /DHCP_CLIENT_PORT/
         && $dhcp =~ /DHCP_SERVER_PORT/ && $dhcp =~ /PARSE_OPTIONS/
         && $dhcp =~ /\@ETHERNET\.VERIFY_CHECKSUM/;
-die "Stage 7 accidentally exposes renewal/release/state\n"
-    if $ifup =~ /NET_STATE|DHCP_RELEASE|RENEW/;
+die "Stage 10 introduced forbidden NET_STATE\n" if $ifup =~ /NET_STATE/;
 
 my $arp = slurp('src/lib/arp.asm', 0);
 my $arp_app = slurp('src/apps/arp.asm', 0);
@@ -96,7 +95,7 @@ for my $name (qw(NETCFG IFUP ARP)) {
         unless substr($image, 0, 4) eq "EXE\x01"
             && unpack('v', substr($image, 4, 2)) == 0x0080
             && unpack('v', substr($image, 16, 2)) == 0x8100
-            && unpack('v', substr($image, 20, 2)) == 0xBFF0;
+            && unpack('v', substr($image, 20, 2)) == ($name eq 'IFUP' ? 0xBEF0 : 0xBFF0);
     die "$name crosses 0xC000\n" if 0x8080 + length($image) > 0xC000;
     die "$name banner/version is missing\n"
         unless index($image, "3C509B $name v0.0.1\0") >= 128;

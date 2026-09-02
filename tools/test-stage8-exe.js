@@ -48,7 +48,7 @@ for (const name of ['PING', 'PINGALT']) {
   assert.strictEqual(image.subarray(0, 4).toString('binary'), 'EXE\x01');
   assert.strictEqual(image.readUInt16LE(4), 128);
   assert.strictEqual(image.readUInt16LE(16), 0x8100);
-  assert.ok(0x8080 + image.length < 0xb500, `${name} overlaps resident state`);
+  assert.ok(0x8080 + image.length < 0xbef0, `${name} overlaps bootstrap state`);
   let longest = 0, current = 0;
   for (const byte of image.subarray(128)) { current = byte ? 0 : current + 1; longest = Math.max(longest, current); }
   assert.ok(longest < 128, `${name} contains a zero-filled runtime allocation`);
@@ -62,7 +62,7 @@ for (const name of ['PING', 'PINGALT']) {
     assert.strictEqual(result.exitCode, 0); assert.match(result.output, /Usage: PING/); checked(result);
   }
   for (const bad of [
-    '', 'host.example', '192.168.7.44 extra', '-n 0 192.168.7.44',
+    '', '192.168.7.44 extra', '-n 0 192.168.7.44',
     '-n 65536 192.168.7.44', '-l 1473 192.168.7.44', '-i 0 192.168.7.44',
     '-i 256 192.168.7.44', '-w 0 192.168.7.44', '-w 65536 192.168.7.44',
     '-n 1 /n 2 192.168.7.44', '-t -n 1 192.168.7.44', '-h 192.168.7.44',
@@ -144,7 +144,7 @@ result = run('PINGALT', '-n 1 -w 1 192.168.7.44', direct({
 }));
 assert.strictEqual(result.exitCode, 3); checked(result);
 
-// ARP resolution uses the calibrated monotonic deadline as well as the wall
+// ARP resolution uses the fixed-base monotonic deadline as well as the wall
 // watchdog, so a stopped DSS clock cannot leave either executable spinning.
 result = run('PING', '-n 1 192.168.7.44', direct({
   arp: {mode: 'drop'}, timeStepSeconds: 0.25, clockFreezeAfterReads: 9,

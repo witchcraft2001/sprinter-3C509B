@@ -149,7 +149,7 @@ assert.strictEqual(result.exitCode, 3);
 assert.match(result.output, /TIMEOUT stage=LINK elapsed_waitq=#[0-9A-F]{4} slot=1 base=#0300 status=#[0-9A-F]{4}/);
 cleanup(result);
 result = run('IFUP', '-r', {environment: baseStaticEnv()});
-assert.strictEqual(result.exitCode, 1); cleanup(result);
+assert.strictEqual(result.exitCode, 4); cleanup(result);
 result = run('IFUP', '', {environment: {...baseStaticEnv(), NET_MASK: ''}});
 assert.strictEqual(result.exitCode, 4); cleanup(result);
 result = run('IFUP', '', {environment: {...baseStaticEnv(), NET_IP_SRC: 'BOGUS'}});

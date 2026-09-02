@@ -42,9 +42,11 @@ function buildDhcpReply(request, type, options = {}) {
   const router = options.router || serverIp;
   const dns = options.dns || [[1, 1, 1, 1], [8, 8, 8, 8]];
   const lease = options.lease || 3600;
-  const destination = options.foreignDestination ? [2, 9, 9, 9, 9, 9] : Array(6).fill(0xff);
+  const destination = options.foreignDestination ? [2, 9, 9, 9, 9, 9] :
+    (options.unicastReply ? request.slice(6, 12) : Array(6).fill(0xff));
+  const destinationIp = options.unicastReply ? request.slice(26, 30) : [255, 255, 255, 255];
   const frame = [...destination, ...serverMac, 8, 0];
-  const ip = [0x45, 0, 0, 0, 0x12, 0x34, 0x40, 0, 64, 17, 0, 0, ...serverIp, 255, 255, 255, 255];
+  const ip = [0x45, 0, 0, 0, 0x12, 0x34, 0x40, 0, 64, 17, 0, 0, ...serverIp, ...destinationIp];
   const udp = [0, 67, 0, 68, 0, 0, 0, 0];
   const bootp = Array(240).fill(0);
   bootp[0] = 2; bootp[1] = 1; bootp[2] = 6;
@@ -58,8 +60,9 @@ function buildDhcpReply(request, type, options = {}) {
     const maskData = options.badMaskLength ? [...mask, 0] : mask;
     const routerData = options.badRouterLength ? [...router, 0] : router;
     const dnsData = options.badDnsLength ? [...dns.flat(), 0] : dns.flat();
-    opts.push(1, maskData.length, ...maskData, 3, routerData.length, ...routerData,
-      6, dnsData.length, ...dnsData);
+    if (!options.omitMask) opts.push(1, maskData.length, ...maskData);
+    if (!options.omitRouter) opts.push(3, routerData.length, ...routerData);
+    if (!options.omitDns) opts.push(6, dnsData.length, ...dnsData);
     if (!options.missingLease) {
       const leaseData = [(lease >>> 24) & 255, (lease >>> 16) & 255, (lease >>> 8) & 255, lease & 255];
       if (options.badLeaseLength) leaseData.push(0);
@@ -77,7 +80,7 @@ function buildDhcpReply(request, type, options = {}) {
   if (options.badChaddr) frame[70] ^= 1;
   if (options.badCookie) frame[278] ^= 1;
   if (options.badOptions) frame[frame.length - 1] = 54;
-  const pseudo = [...serverIp, 255, 255, 255, 255, 0, 17,
+  const pseudo = [...serverIp, ...destinationIp, 0, 17,
     udpLength >> 8, udpLength & 255, ...frame.slice(34)];
   const udpSum = checksum(pseudo); frame[40] = udpSum >> 8; frame[41] = udpSum & 255;
   if (options.badUdpChecksum) frame[40] ^= 1;
@@ -153,6 +156,73 @@ function buildUdpReply(request, options = {}) {
   if (options.badUdpChecksum) reply[40] ^= 1;
   while (reply.length < 60) reply.push(0);
   return reply;
+}
+
+function buildDnsReply(request, options = {}) {
+  const query = request.payload;
+  if (query.length < 17) return null;
+  let cursor = 12;
+  while (cursor < query.length && query[cursor]) {
+    const size = query[cursor++];
+    if (!size || size > 63 || cursor + size > query.length) return null;
+    cursor += size;
+  }
+  if (cursor + 5 > query.length) return null;
+  const question = query.slice(12, cursor + 5);
+  const id = ((query[0] << 8) | query[1]) ^ (options.staleId ? 1 : 0);
+  const rcode = options.nxdomain ? 3 : (options.rcode || 0);
+  const answers = rcode || options.noAnswer ? 0 : 1;
+  const payload = [id >> 8, id & 255, 0x81, 0x80 | rcode, 0, 1, 0, answers, 0, 0, 0, 0,
+    ...question];
+  if (answers) {
+    const address = options.address || [192, 168, 7, 44];
+    if (options.pointerLoop) {
+      const answerOffset = payload.length;
+      payload.push(0xc0 | ((answerOffset >> 8) & 0x3f), answerOffset & 255);
+    } else if (options.pointerOob) payload.push(0xff, 0xff);
+    else payload.push(0xc0, 0x0c);
+    payload.push(0, options.cnameOnly ? 5 : 1, 0, 1, 0, 0, 0, 60,
+      0, options.cnameOnly ? 2 : 4);
+    if (options.cnameOnly) payload.push(0xc0, 0x0c); else payload.push(...address);
+  }
+  if (options.truncated) payload.splice(Math.max(12, payload.length - 3));
+  return buildUdpReply(request, {
+    payload,
+    sourcePort: options.sourcePort ?? 53,
+    destinationPort: options.destinationPort ?? request.sourcePort,
+    badUdpChecksum: options.badChecksum,
+  });
+}
+
+function buildNtpReply(request, options = {}) {
+  if (request.payload.length !== 48) return null;
+  const payload = Array(48).fill(0);
+  const version = options.version ?? 4;
+  const mode = options.modeValue ?? 4;
+  const leap = options.leap ?? 0;
+  payload[0] = ((leap & 3) << 6) | ((version & 7) << 3) | (mode & 7);
+  payload[1] = options.stratum ?? 2;
+  payload[2] = 6;
+  payload[3] = 0xec;
+  const cookie = request.payload.slice(40, 48);
+  if (options.staleCookie) cookie[7] ^= 1;
+  payload.splice(24, 8, ...cookie);
+  const ntpSeconds = options.ntpSeconds ??
+    ((options.unixSeconds ?? 1_735_732_799) + 2_208_988_800);
+  if (!options.zeroTransmit) {
+    payload[40] = (ntpSeconds >>> 24) & 255;
+    payload[41] = (ntpSeconds >>> 16) & 255;
+    payload[42] = (ntpSeconds >>> 8) & 255;
+    payload[43] = ntpSeconds & 255;
+    payload[44] = 0x80;
+  }
+  if (options.truncated) payload.splice(Math.max(0, options.truncateAt ?? 44));
+  return buildUdpReply(request, {
+    payload,
+    sourcePort: options.sourcePort ?? 123,
+    destinationPort: options.destinationPort ?? request.sourcePort,
+    badUdpChecksum: options.badChecksum,
+  });
 }
 
 function putChecksum(bytes, offset, length, field) {
@@ -281,10 +351,12 @@ class EtherLinkIII {
     this.tagged = false; this.serialBits = [];
     this.wordWriteLow = new Map();
     this.wordReadHigh = new Map();
-    this.dhcpDiscoverCount = 0; this.dhcpRequestCount = 0;
+    this.dhcpDiscoverCount = 0; this.dhcpRequestCount = 0; this.dhcpReleaseCount = 0;
     this.arpRequestCount = 0;
     this.icmpRequestCount = 0;
     this.udpRequestCount = 0;
+    this.dnsRequestCount = 0;
+    this.ntpRequestCount = 0;
     this.tftpResponseCount = 0;
     this.tftpSession = null;
     this.delayed = [];
@@ -418,6 +490,9 @@ class EtherLinkIII {
   respond(frame) {
     const dhcp = this.scenario.dhcp;
     const type = dhcpMessageType(frame);
+    if (dhcp && type === 7) {
+      this.dhcpReleaseCount++;
+    }
     if (dhcp && (type === 1 || type === 3)) {
       const isDiscover = type === 1;
       const countKey = isDiscover ? 'dhcpDiscoverCount' : 'dhcpRequestCount';
@@ -482,6 +557,42 @@ class EtherLinkIII {
       }
     }
     const datagram = udpDatagram(frame);
+    const dnsScenario = this.scenario.dns;
+    if (dnsScenario && datagram && datagram.destinationPort === 53) {
+      this.dnsRequestCount = (this.dnsRequestCount || 0) + 1;
+      const destination = datagram.destination.join('.');
+      const dns = dnsScenario.servers && dnsScenario.servers[destination] ?
+        {...dnsScenario, ...dnsScenario.servers[destination], servers: undefined} : dnsScenario;
+      if ((dns.drop || 0) >= this.dnsRequestCount || dns.mode === 'drop') return;
+      const replies = [];
+      if (dns.staleBeforeReply) replies.push(buildDnsReply(datagram, {...dns, staleId: true}));
+      if (dns.foreignPortBeforeReply) replies.push(buildDnsReply(datagram, {...dns, sourcePort: 54}));
+      if (dns.badChecksumBeforeReply) replies.push(buildDnsReply(datagram, {...dns, badChecksum: true}));
+      if (dns.malformedBeforeReply) replies.push(buildDnsReply(datagram, {...dns, pointerLoop: true}));
+      replies.push(buildDnsReply(datagram, dns));
+      for (const reply of replies.filter(Boolean)) {
+        this.generated.push(reply);
+        if (this.accepts(reply)) this.rxQueue.push({frame: reply, cursor: 0});
+      }
+    }
+    const ntpScenario = this.scenario.ntp;
+    if (ntpScenario && datagram && datagram.destinationPort === 123) {
+      this.ntpRequestCount++;
+      if ((ntpScenario.drop || 0) < this.ntpRequestCount && ntpScenario.mode !== 'drop') {
+        const replies = [];
+        if (ntpScenario.staleBeforeReply)
+          replies.push(buildNtpReply(datagram, {...ntpScenario, staleCookie: true}));
+        if (ntpScenario.foreignPortBeforeReply)
+          replies.push(buildNtpReply(datagram, {...ntpScenario, sourcePort: 124}));
+        if (ntpScenario.badChecksumBeforeReply)
+          replies.push(buildNtpReply(datagram, {...ntpScenario, badChecksum: true}));
+        replies.push(buildNtpReply(datagram, ntpScenario));
+        for (const reply of replies.filter(Boolean)) {
+          this.generated.push(reply);
+          if (this.accepts(reply)) this.rxQueue.push({frame: reply, cursor: 0});
+        }
+      }
+    }
     const tftp = this.scenario.tftp;
     if (tftp && datagram) this.respondTftp(datagram, tftp);
     const udpScenario = this.scenario.udp;
@@ -777,6 +888,7 @@ function runExe(exePath, args = '', inputScenario = {}) {
   let clockReads = 0, scanCount = 0;
   const dssEvents = [];
   let stdout = '', exitCode = null, steps = 0, minimumSp = stack;
+  const setTimeCalls = [];
   const pcTrace = [];
 
   const cardPort = (address) => address & 0x3fff;
@@ -952,6 +1064,19 @@ function runExe(exePath, args = '', inputScenario = {}) {
         clockReads++;
         setCarry(s, false); return ret(s);
       }
+      case 0x22: {
+        setTimeCalls.push({day: s.d, month: s.e, year: s.ix,
+          hour: s.h, minute: s.l, second: s.b});
+        if (scenario.traceDss) {
+          const value = setTimeCalls[setTimeCalls.length - 1];
+          dssEvents.push(`SETTIME ${value.year}-${value.month}-${value.day} ` +
+            `${value.hour}:${value.minute}:${value.second}`);
+        }
+        if (scenario.setTimeFail) {
+          s.a = scenario.setTimeError || 1; setCarry(s, true); return ret(s);
+        }
+        s.a = 0; setCarry(s, false); return ret(s);
+      }
       case 0x31: {
         scanCount++;
         if (scenario.key && scanCount === (scenario.keyAtScan || 1)) {
@@ -1019,7 +1144,12 @@ function runExe(exePath, args = '', inputScenario = {}) {
         if (openFiles.size) throw new Error('EXIT with unclosed files');
         cpu.setState(s);
         throw {dssExit: true};
-      default: throw new Error(`unknown DSS call ${fn.toString(16)}`);
+      default: {
+        const state = cpu.getState();
+        throw new Error(`unknown DSS call ${fn.toString(16)} ` +
+          `SP=${state.sp.toString(16)} BC=${state.b.toString(16)}${state.c.toString(16)} ` +
+          `trace=${pcTrace.map((value) => value.toString(16)).join(',')}`);
+      }
     }
   };
 
@@ -1027,9 +1157,19 @@ function runExe(exePath, args = '', inputScenario = {}) {
     const limit = scenario.stepLimit || 200_000_000;
     for (;;) {
       minimumSp = Math.min(minimumSp, cpu.getState().sp);
-      if (scenario.stopPc !== undefined && cpu.getState().pc === scenario.stopPc)
-        throw new Error(`stop PC=${cpu.getState().pc.toString(16)} SP=${cpu.getState().sp.toString(16)} A=${cpu.getState().a.toString(16)} F=${JSON.stringify(cpu.getState().flags)} trace=${pcTrace.map((v) => v.toString(16)).join(',')}`);
-      if (scenario.strictPc && cpu.getState().pc !== 0x0010 && cpu.getState().pc < 0x8080)
+      if (scenario.stopPc !== undefined && cpu.getState().pc === scenario.stopPc) {
+        const stopped = cpu.getState();
+        throw new Error(`stop PC=${stopped.pc.toString(16)} SP=${stopped.sp.toString(16)} ` +
+          `AF=${stopped.a.toString(16)}/${JSON.stringify(stopped.flags)} ` +
+          `BC=${stopped.b.toString(16)}${stopped.c.toString(16)} ` +
+          `DE=${stopped.d.toString(16)}${stopped.e.toString(16)} ` +
+          `HL=${stopped.h.toString(16)}${stopped.l.toString(16)} ` +
+          `IX=${stopped.ix.toString(16)} IY=${stopped.iy.toString(16)} ` +
+          `stack=${Array.from({length: 8}, (_, offset) => rd((stopped.sp + offset) & 0xffff).toString(16).padStart(2, '0')).join('')} ` +
+          `trace=${pcTrace.map((v) => v.toString(16)).join(',')}`);
+      }
+      if (scenario.strictPc && cpu.getState().pc !== 0x0010 &&
+          (cpu.getState().pc < loadAddress || cpu.getState().pc >= loadAddress + exe.length))
         throw new Error(`PC escaped image: PC=${cpu.getState().pc.toString(16)} SP=${cpu.getState().sp.toString(16)} trace=${pcTrace.map((v) => v.toString(16)).join(',')}`);
       if (scenario.traceCpu) { pcTrace.push(cpu.getState().pc); if (pcTrace.length > 32) pcTrace.shift(); }
       // Production polling yields use this exact bounded BC loop. Collapse all
@@ -1067,6 +1207,13 @@ function runExe(exePath, args = '', inputScenario = {}) {
     currentDir,
     files: Object.fromEntries([...files].map(([name, data]) => [name, Buffer.from(data)])),
     tftpUploads: scenario.tftp && scenario.tftp.uploads ? {...scenario.tftp.uploads} : {},
+    requestCounts: {
+      dhcpDiscover: card.dhcpDiscoverCount, dhcpRequest: card.dhcpRequestCount,
+      dhcpRelease: card.dhcpReleaseCount,
+      arp: card.arpRequestCount, icmp: card.icmpRequestCount, dns: card.dnsRequestCount,
+      ntp: card.ntpRequestCount, udp: card.udpRequestCount,
+    },
+    setTimeCalls,
     ...(scenario.traceDss ? {dssEvents} : {}),
     ...(scenario.dumpMemory ? {memory: Object.fromEntries(scenario.dumpMemory.map(([start, length]) => [
       start.toString(16), hex(Array.from({length}, (_, i) => ram[(start + i) & 0xffff])),

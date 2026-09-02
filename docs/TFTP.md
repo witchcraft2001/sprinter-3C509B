@@ -8,8 +8,9 @@ TFTP host[:port] GET remote [-o local] [-y|-f]
 TFTP host[:port] PUT local [-o remote]
 ```
 
-`host` is a dotted IPv4 address. The request port defaults to 69 and may be
-`1..65535`; DNS names are deferred to Stage 10. A wire filename is limited to
+`host` is a dotted IPv4 address or ASCII hostname. The optional `:port` remains
+part of the TFTP syntax after hostname resolution. The request port defaults to
+69 and may be `1..65535`. A wire filename is limited to
 79 bytes. Without `-o`, GET uses the basename of `remote`, and PUT uses the
 basename of `local`.
 

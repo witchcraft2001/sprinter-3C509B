@@ -3,27 +3,28 @@
 ## Статус документа
 
 - Версия ТЗ: 1.0
-- Дата: 2026-09-01
+- Дата: 2026-09-02
 - Целевая платформа: Sprinter DSS
 - Сетевая карта: 3Com EtherLink III 3C509B-TPO
 - Режим шины: ISA8
-- Состояние проекта: локальная кодовая часть этапов 0–9 реализована; MAME-матрица
+- Состояние проекта: локальная кодовая часть этапов 0–10 реализована; MAME-матрица
   этапа 4 пройдена на `CYCLES21`; Stage 5/6 имеет частичные MAME pcap, но полная
   матрица остаётся открытой; автоматическая и ручная MAME-приёмка Stage 7
   пройдены; автоматическая и ручная MAME-приёмка Stage 8 пройдены;
-  автоматическая Stage 9-приёмка пройдена, а её ручной MAME gate и все
-  проверки на реальном Sprinter ещё открыты
+  автоматическая и ручная MAME-приёмка Stage 9 пройдены; автоматическая Stage
+  10-приёмка пройдена, а её ручной MAME gate и все проверки на реальном
+  Sprinter ещё открыты
 
 Этот документ одновременно является техническим заданием, дорожной картой и
 журналом приёмки. Все этапы выполняются последовательно. Этап считается закрытым
 только после установки всех обязательных флажков и добавления ссылки на лог,
 дамп, pcap или иной воспроизводимый результат проверки.
 
-Отсутствие доступного реального Sprinter не блокирует переход к следующему
-этапу: аппаратные флажки при этом остаются открытыми и этап не считается
-закрытым. Перед началом Stage 8 обязательны успешные автоматические тесты Stage
-7 и ручная MAME-приёмка из `docs/STAGE7_TESTING_RU.md`; host harness не заменяет
-этот MAME gate.
+Переход к следующему этапу разрешён после успешной автоматической и ручной
+MAME-приёмки текущего этапа. Отсутствие доступного реального Sprinter этот
+переход не блокирует: аппаратные флажки остаются открытыми до финальной
+приёмки проекта на реальном Sprinter/3C509B, и до неё этап не считается
+полностью закрытым. Host harness не заменяет MAME gate.
 
 ## Сводная таблица прогресса
 
@@ -38,8 +39,8 @@
 | 6 | Физические TX и RX | [x] | [ ] | [ ] | [x] | [ ] |
 | 7 | NETDRV, конфигурация, ARP и DHCP acquire | [x] | [x] | [ ] | [x] | [ ] |
 | 8 | IPv4, ICMP и PING | [x] | [x] | [ ] | [x] | [ ] |
-| 9 | UDP и TFTP | [x] | [ ] | [ ] | [x] | [ ] |
-| 10 | DHCP, DNS и NTP | [ ] | [ ] | [ ] | [ ] | [ ] |
+| 9 | UDP и TFTP | [x] | [x] | [ ] | [x] | [ ] |
+| 10 | DHCP, DNS и NTP | [x] | [ ] | [ ] | [x] | [ ] |
 | 11 | TCP | [ ] | [ ] | [ ] | [ ] | [ ] |
 | 12 | WGET | [ ] | [ ] | [ ] | [ ] | [ ] |
 | 13 | FTP | [ ] | [ ] | [ ] | [ ] | [ ] |
@@ -923,28 +924,69 @@ hardware evidence остаётся открытым.
   ZIP `9f428a5cf1e7a2981066f9ab70740ec39016b5e52fdd41412f06cd03f26b2239`,
   UDPTEST `4f3ecc3948e02c9bcefc4e51650f9e8ab1eef89c1634adb62f519817da8a7d4c`,
   TFTP `6051051370321e68ea06e30fc72922a1420ac41b6bb3066877a87bea7de5d9bb`.
-- [ ] Выполнить единый MAME gate из `docs/STAGE9_TESTING_RU.md` и добавить
-  screenshots, responder log и byte-exact pcap: ____________________
+- [x] Выполнить единый MAME gate из `docs/STAGE9_TESTING_RU.md` и добавить
+  screenshots, responder log и byte-exact pcap:
+  `docs/evidence/STAGE9_MAME_2026-09-01.md`.
 - [ ] Выполнить проверки на реальном Sprinter/3C509B-TPO.
 - [ ] Добавить hardware логи/pcap: ____________________
-- [ ] Критерий этапа: GET/PUT побайтно сохраняют файл при нормальной сети и потерях.
+- [x] Критерий этапа: GET/PUT побайтно сохраняют файл при нормальной сети и потерях.
 
 ### Этап 10. DHCP renewal, DNS и NTP
 
 Результат: автоматическая конфигурация сети и базовые сервисы.
 
-- [ ] Реализовать DHCP renewal и RELEASE поверх Stage 7 acquire.
-- [ ] Добавить `IFUP -r`, `IFUP -d` и согласованное состояние lease; static
-  fallback не выполняется автоматически.
+- [x] Реализовать DHCP renewal и RELEASE поверх Stage 7 acquire.
+- [x] Добавить взаимоисключающие `IFUP -r` и `IFUP -d` с разбором CLI до
+  ISA-доступа. Активный lease определяется по `NET_IP_SRC=DHCP`, `NET_IP`,
+  `NET_DHCP_SRV` и `NET_LEASE_SEC`; отдельный `NET_STATE` не добавляется.
+- [x] Renewal выполняет три DHCPREQUEST с `ciaddr` и тайм-аутом 5000 мс.
+  ACK атомарно публикует lease, наследует отсутствующие mask/gateway/DNS и IP
+  при нулевом `yiaddr`; NAK очищает динамические поля, а timeout, malformed и
+  cancel сохраняют старый lease.
+- [x] RELEASE выполняется best-effort по сохранённым данным, затем очищает
+  динамические поля; повторный `-d` без lease успешен без передачи. Static mode
+  отклоняется, automatic static fallback отсутствует.
 - [x] Публиковать при acquire IP, mask, gateway, DNS, server и lease metadata.
-- [ ] Реализовать DNS A query с compression pointer parsing.
-- [ ] Создать `NSLOOKUP.EXE`.
-- [ ] Обрабатывать NXDOMAIN, malformed reply и timeout.
-- [ ] Реализовать NTP UDP request/reply.
-- [ ] Создать `NTP.EXE` и установку DSS clock с `TZ`.
+- [x] Реализовать backend-neutral DNS A/IN codec и resolver: RD, отдельные
+  transaction ID/local UDP port, caller-owned buffers, bounded ASCII labels и
+  strict compression pointer/count/type/class/RCODE/A-record parsing.
+- [x] Реализовать три попытки по 5000 мс, непродлеваемый deadline для stale,
+  foreign и bad-checksum frames, DNS1→DNS2 fallback для временных ошибок и
+  финальный NXDOMAIN. Явный DNS-сервер используется без fallback.
+- [x] Создать `NSLOOKUP.EXE`; подключить IPv4-literal/hostname resolver к
+  `PING`, `UDPTEST`, `TFTP` и `NTP`, сохранив TFTP `host[:port]`.
+- [x] Реализовать polling-only NTPv4/SNTP framing, три попытки по 5000 мс и
+  проверку endpoint, checksum, version 3/4, mode, LI, stratum, originate cookie
+  и transmit timestamp.
+- [x] Создать `NTP.EXE`, Gregorian conversion для 1970–2036 и установку часов
+  через `DSS_SETTIME` только после закрытия ISA window.
+- [x] Добавить общий TZ parser для `NETCFG` и `NTP`: empty/часовая/`H:MM`
+  формы, четверть часа, диапазон `-12:00..+14:00`, signed minutes и переходы
+  суток/месяцев/лет. Вывод NTP нормализован как `UTC+05:45`.
+- [x] Перенести hostname/DNS/NTP/scratch state в DSS-страницу, сохранить
+  TX `#4000/#0800`, RX `#4800/#0800`, TFTP file `#5000/#2000` и добавить
+  compile-time bounds/stack/EXE assertions без zero-filled BSS.
+- [x] Расширить actual-EXE harness DHCP/DNS/NTP сценариями, полным
+  `DSS_SETTIME`, ISA/page/stack guards и transactional environment rollback.
+- [x] Добавить standard-library `stage10_responder.py`, fault profiles,
+  deterministic services, public DNS/NTP UDP proxy, classic pcap checker и
+  единый `stage10-mame.sh` workflow.
+- [x] Добавить `NSLOOKUP.EXE/TXT` и `NTP.EXE/TXT` в IMG/ZIP, а `S10TEST.TXT`
+  только в IMG; runtime-текст проходит CP866/CRLF и strict uppercase 8.3.
+- [x] Выполнить автоматическую приёмку: Stage 10 ASM vectors, 54 actual-EXE
+  DHCP/DNS/hostname/NTP/TZ/cleanup сценариев, четыре responder/pcap теста,
+  проверки ABI, layout, EXE headers/BSS и manifest. Чистый прогон
+  `make test-host package image` от 2026-09-02: IMG
+  `c2ec897e030b4738e602141a1c17a5be25433fd22975ccae5d7d7e6aa39e23a0`,
+  ZIP `c3c22f1e292d16f9a31a54f12360d4aa9c590f098b795e29af7cdb600ec2c8a3`,
+  IFUP `af2d2361f046204b62b9e2ae6ce05c45870eb79e90dc2d2b8c2f7463f614e26a`,
+  NSLOOKUP `fc6cf52efc3834071cfbdf0e14ad6eb804425d6231f83fae2e694ae28c3768ec`,
+  NTP `e3fe0f223b514f1cf665d4e1e5a73e0648ab2a314b690eefaa716f20613d75fa`.
 - [ ] Проверить локальные и публичные DHCP/DNS/NTP-сервисы.
-- [ ] Проверить MAME и реальную карту.
-- [ ] Добавить логи/pcap: ____________________
+- [ ] Выполнить единый MAME gate из `docs/STAGE10_TESTING_RU.md` и добавить
+  screenshots, responder log и pcap: ____________________
+- [ ] Выполнить проверки на реальном Sprinter/3C509B-TPO.
+- [ ] Добавить hardware логи/pcap: ____________________
 - [ ] Критерий этапа: `CONNECT.BAT` поднимает сеть без ручного IP и разрешает имя.
 
 ### Этап 11. TCP
@@ -1107,6 +1149,8 @@ DLSPEED.EXE
 DLDIRECT.EXE
 DLDIRCP.EXE
 TESTING.TXT
+S9TEST.TXT
+S10TEST.TXT
 ```
 
 ### 10.2. Пользовательский ZIP

@@ -164,6 +164,12 @@ WAIT_LINK_UP
 	LD	(WAIT_LINK_ELAPSED),HL
 	LD	(EL3_LAST_TICKS),HL
 .WAIT_LINK_POLL
+	IFDEF STAGE10_TFTP
+	; Keep startup cancellation responsive even before the first UDP frame.
+	; LINK_STATE and DSS_SCANKEY both run with the ISA window closed.
+	CALL	@UDPX.CHECK_CANCEL
+	JR	C,.WAIT_LINK_RETURN
+	ENDIF
 	CALL	LINK_STATE
 	JR	C,.WAIT_LINK_RETURN
 	OR	A

@@ -7,8 +7,9 @@
 UDPTEST [-n count] [-l size] [-w milliseconds] target port
 ```
 
-`target` must be a dotted IPv4 address; DNS is deferred to Stage 10. Defaults
-are one datagram, 16 payload bytes, and a 5000 ms timeout. Ranges are
+`target` is a dotted IPv4 address or ASCII hostname. A literal bypasses DNS;
+names use the common bounded resolver. Defaults are one datagram, 16 payload
+bytes, and a 5000 ms timeout. Ranges are
 `count=1..65535`, `size=0..1472`, `milliseconds=1..65535`, and
 `port=1..65535`. Flags accept `-` or `/` and are case-insensitive.
 

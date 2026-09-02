@@ -1,7 +1,8 @@
 # Быстрый старт Sprinter 3C509B Network Kit
 
-Версия 0.0.1 является bootstrap этапа 3. Сетевых команд в ней ещё нет, но
-добавлены read-only диагностики `EL3INFO`, `EL3EEP` и `ISAPROBE`.
+Версия 0.0.1 включает локальную реализацию этапов до Stage 10: polling-only
+`NETDRV`, DHCP, ARP, PING, DNS, NTP и TFTP. Read-only диагностики `EL3INFO`,
+`EL3EEP` и `ISAPROBE` сохранены; EEPROM writes и IRQ routing отсутствуют.
 
 ## Сборка на хосте
 
@@ -15,7 +16,7 @@ make package
 make image
 ```
 
-Безопасную диагностику можно скопировать на диск DSS и запустить командой:
+Перед первой настройкой на реальном Sprinter начните с безопасной диагностики:
 
 ```text
 EL3INFO -s 1 -p #110 -b AUTO
@@ -32,13 +33,11 @@ EL3INFO -s 1 -p #110 -b AUTO
 RESULT OK
 ```
 
-Код возврата — `0`. Образ содержит также `HELLO`, полный read-only EEPROM dump
-`EL3EEP` и явно ограниченный read-only `ISAPROBE`; последние три программы не
-входят в пользовательский ZIP. EEPROM никогда не записывается, а IRQ карты не
-подключается и не используется.
+Код возврата — `0`. Затем скопируйте `NETSMPL.CFG` в `NET.CFG`, задайте
+`IP=DHCP` и выполните `NETCFG -i`, `IFUP`. Для проверки сервисов используйте
+`NSLOOKUP`, `PING`, `NTP` и `TFTP`; `IFUP -r` продлевает lease, а `IFUP -d`
+выполняет best-effort RELEASE и очищает динамическое окружение.
 
-Этапы 2 и 3 остаются открыты до полного прогона в MAME и проверки прибывшей
-физической карты на реальном Sprinter. Найденные расхождения MAME записаны в
-developer-only feature request `docs/MAME_3C509B_FEATURE_REQUEST.md`. Полная
-матрица команд, ожидаемых результатов и evidence описана в
-`docs/STAGE3_TESTING_RU.md`.
+Автоматический harness не заменяет ручную MAME-приёмку и проверку физической
+карты. Текущие открытые gates и ссылки на evidence перечислены в `specs.md`;
+Stage 10 MAME-процедура описана в `docs/STAGE10_TESTING_RU.md`.

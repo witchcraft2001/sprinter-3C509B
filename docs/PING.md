@@ -8,7 +8,7 @@ PING [-t] [-n count] [-l size] [-i ttl] [-w milliseconds] target
 ```
 
 Flags accept `-` or `/` and are case-insensitive. `target` is a dotted IPv4
-address; DNS names are not supported at this stage. Defaults are four requests,
+address or ASCII hostname resolved through `NET_DNS1`/`NET_DNS2`. Defaults are four requests,
 32 payload bytes, TTL 64 and a 1000 ms timeout. Ranges are:
 
 ```text
@@ -20,13 +20,14 @@ milliseconds 1..65535
 
 `-t` repeats until Esc or Ctrl-C and cannot be combined with `-n`. Duplicate
 flags and extra arguments are rejected before the card is accessed. Requests
-are spaced by approximately 1000 ms. The displayed RTT is approximate because
-it is derived from a bounded calibration against the DSS clock.
+are spaced by approximately 1000 ms. The displayed RTT is based on the fixed
+21 MHz `CYCLES21` timebase used by Sprinter.
 
 Examples:
 
 ```text
 PING 192.168.7.44
+PING -n 1 echo.stage10.test
 PING -n 1 -l 1472 -i 255 -w 2000 203.0.113.10
 PING -t 192.168.7.1
 ```

@@ -9,9 +9,13 @@ Available DSS commands:
   NETCFG               Show the published NET_* environment.
   NETCFG -i -v         Validate NET.CFG/card and publish it.
   IFUP                 Check static setup or acquire a fresh DHCP lease.
-  PING target          Send bounded IPv4 ICMP Echo Requests.
-  TFTP addr GET file   Download a file in TFTP octet mode.
-  TFTP addr PUT file   Upload a file in TFTP octet mode.
+  IFUP -r              Renew the active DHCP lease.
+  IFUP -d              Release and clear the active DHCP lease.
+  NSLOOKUP name [dns]  Resolve an IPv4 address with DNS.
+  NTP [server]         Set the DSS clock from an NTP server.
+  PING target          Send bounded ICMP Echo Requests.
+  TFTP host GET file   Download a file in TFTP octet mode.
+  TFTP host PUT file   Upload a file in TFTP octet mode.
   ARP [-v] target      Bounded ARP diagnostic (developer image only).
   PINGALT target       Independent polling diagnostic (developer IMG only).
   UDPTEST target port  UDP echo/generator diagnostic (developer IMG only).
@@ -22,13 +26,15 @@ ISAPROBE reads ISA bytes only when slot, base, and count are all explicit:
   ISAPROBE -s 1 -b #0300 -n #0010
 
 Copy NETSMPL.CFG to NET.CFG beside NETCFG.EXE and edit it before NETCFG -i.
-NETCFG.TXT, IFUP.TXT, PING.TXT, TFTP.TXT, USAGE.TXT, and HOWTO.TXT describe the network setup.
+NETCFG.TXT, IFUP.TXT, NSLOOKUP.TXT, NTP.TXT, PING.TXT, TFTP.TXT,
+USAGE.TXT, and HOWTO.TXT describe the network setup.
 LICENSE.TXT contains the license.
 
 WARNING: EEPROM access is read-only. None of these commands saves card
 settings. ISAPROBE never writes ISA data, but reads of unknown hardware can
 have side effects; use only a range you identified beforehand.
 
-IFUP supports static setup and initial DHCP acquire. PING, UDPTEST, and TFTP
-accept dotted IPv4 addresses; DNS names, DHCP renewal and release are not
-implemented yet. A failed TFTP GET closes and retains its partial file.
+IFUP supports static setup, DHCP acquire, renewal, and release. PING, UDPTEST,
+and TFTP accept dotted IPv4 addresses or DNS names. NTP validates NET_TZ in
+quarter-hour increments before setting the clock. A failed TFTP GET closes and
+retains its partial file.

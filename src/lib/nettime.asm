@@ -10,107 +10,38 @@
 
 	MODULE NETTIME
 
-NETTIME_CAL_GUARD	EQU 4096
-NETTIME_MAX_QPS		EQU 1000 ; CYCLES21 is at least one ms at 21 MHz
+; WAIT_TICK is 21023 T-states (808-loop), i.e. one millisecond at the
+; supported 21 MHz Sprinter base clock. Keep timeout conversion deterministic:
+; client startup must not spend a wall-clock second measuring a value that is
+; already defined by the target timing contract.
+NETTIME_FIXED_QPS	EQU 1000
+NETTIME_FIXED_MS	EQU 1
 
-; CALIBRATE counts bounded CYCLES21 delays between two DSS_SYSTIME second
-; boundaries. Both the alignment and measurement have finite guards.
-CALIBRATE
-	PUSH	IX,IY
-	CALL	READ_SECOND
-	LD	(NETTIME_CAL_SECOND),A
-	LD	HL,NETTIME_CAL_GUARD
-	LD	(NETTIME_CAL_COUNT),HL
-.ALIGN
-	CALL	@S7APP.WAIT_TICK
-	CALL	READ_SECOND
-	LD	B,A
-	LD	A,(NETTIME_CAL_SECOND)
-	CP	B
-	JR	NZ,.ALIGNED
-	LD	HL,(NETTIME_CAL_COUNT)
-	DEC	HL
-	LD	(NETTIME_CAL_COUNT),HL
-	LD	A,H
-	OR	L
-	JR	NZ,.ALIGN
-	JR	.FAIL
-.ALIGNED
-	LD	A,B
-	LD	(NETTIME_CAL_SECOND),A
-	LD	HL,0
-	LD	(NETTIME_CAL_COUNT),HL
-.MEASURE
-	CALL	@S7APP.WAIT_TICK
-	LD	HL,(NETTIME_CAL_COUNT)
-	INC	HL
-	LD	(NETTIME_CAL_COUNT),HL
-	CALL	READ_SECOND
-	LD	B,A
-	LD	A,(NETTIME_CAL_SECOND)
-	CP	B
-	JR	NZ,.MEASURED
-	LD	HL,(NETTIME_CAL_COUNT)
-	LD	DE,NETTIME_CAL_GUARD
-	OR	A
-	SBC	HL,DE
-	JR	C,.MEASURE
-	JR	.FAIL
-.MEASURED
-	LD	HL,(NETTIME_CAL_COUNT)
-	LD	A,H
-	OR	L
-	JR	Z,.FAIL
-	LD	DE,NETTIME_MAX_QPS
-	OR	A
-	SBC	HL,DE
-	JR	C,.USE_COUNT
-	JR	Z,.USE_MAX
-.USE_MAX
-	LD	HL,NETTIME_MAX_QPS
-	JR	.STORE
-.USE_COUNT
-	ADD	HL,DE
-.STORE
+; INIT loads the fixed 21 MHz timebase. It is idempotent and has no delay.
+INIT
+	LD	HL,NETTIME_FIXED_QPS
 	LD	(NETTIME_QPS),HL
-	; ceil(1000/qps), used for approximate RTT output.
-	LD	DE,0
-	LD	BC,1000
-.MS_DIVIDE
-	LD	HL,BC
-	LD	BC,(NETTIME_QPS)
-	OR	A
-	SBC	HL,BC
-	JR	C,.MS_REMAINDER
-	LD	B,H
-	LD	C,L
-	INC	DE
-	JR	.MS_DIVIDE
-.MS_REMAINDER
-	ADD	HL,BC			; restore remainder before the failed subtract
-	LD	A,H
-	OR	L
-	JR	Z,.MS_STORE
-	INC	DE
-.MS_STORE
-	LD	(NETTIME_MS_PER_QUANTUM),DE
+	LD	HL,NETTIME_FIXED_MS
+	LD	(NETTIME_MS_PER_QUANTUM),HL
 	XOR	A
-	POP	IY,IX
 	RET
-.FAIL
-	LD	A,EL3_ERR_TIMER
-	SCF
-	POP	IY,IX
-	RET
+
+; Compatibility entry point for older clients. Calibration is intentionally a
+; zero-delay fixed-base initialization; all production clients use INIT via
+; START below.
+CALIBRATE
+	JP	INIT
 
 ; START
 ; In BC=timeout milliseconds 1..65535. Converts it to monotonic polling
-; quanta using the measured rate and arms an additional coarse wall watchdog.
+; quanta using the fixed 21 MHz rate and arms an additional coarse wall
+; watchdog.
 START
 	PUSH	IX,IY
 	LD	A,B
 	OR	C
 	JR	Z,.START_BAD
+	CALL	INIT
 	LD	(NETTIME_TIMEOUT_MS),BC
 	LD	HL,0
 	LD	(NETTIME_QUANTA_LEFT),HL
@@ -153,7 +84,7 @@ START
 	LD	(NETTIME_QUANTA_LEFT),HL
 .HAVE_QUANTA
 	LD	(NETTIME_QUANTA_TOTAL),HL
-	; ceil(timeout_ms/1000)+2 seconds for a stopped/incorrect calibration.
+	; ceil(timeout_ms/1000)+2 seconds for a stopped DSS wall clock.
 	LD	HL,(NETTIME_TIMEOUT_MS)
 	LD	BC,0
 .WALL_DIVIDE
@@ -184,7 +115,7 @@ START
 	POP	IY,IX
 	RET
 
-; TICK performs one calibrated finite delay. Out: Z/CF clear while live;
+; TICK performs one fixed-base finite delay. Out: Z/CF clear while live;
 ; A=EL3_ERR_RX_TIMEOUT/CF set when either monotonic or wall limit expires.
 TICK
 	PUSH	IX,IY

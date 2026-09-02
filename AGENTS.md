@@ -11,6 +11,16 @@
 - End every code iteration with `make test-host package image`. Fix failures
   before handing off the iteration.
 
+## Verification ownership and user communication
+
+- Automated tests, builds, packaging, image generation, and their failure
+  diagnosis are the agent's responsibility. Run them internally before
+  handing off code; do not ask the user to run them or report their output
+  unless the user explicitly requests that information.
+- When the user asks for testing instructions, provide only the manual
+  MAME/Sprinter procedure, expected on-screen behavior, and evidence to
+  collect. Keep automated commands out of that user-facing checklist.
+
 ## Hardware and clean-room constraints
 
 - Sprinter ISA IRQ lines are intentionally not connected. Never add IRQ routing

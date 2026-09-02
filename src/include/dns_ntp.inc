@@ -1,0 +1,45 @@
+; Backend-neutral DNS and NTP descriptor ABI for Stage 10.
+; SPDX-License-Identifier: BSD-3-Clause
+
+	IFNDEF	_DNS_NTP_INC
+	DEFINE	_DNS_NTP_INC
+
+DNS_PORT		EQU 53
+DNS_TYPE_A		EQU 1
+DNS_CLASS_IN		EQU 1
+DNS_MAX_WIRE_NAME	EQU 255
+DNS_MAX_POINTERS	EQU 32
+
+; Query builder. NAME is ASCIIZ; XID is a host-order word.
+DNSQB_BUFFER		EQU 0
+DNSQB_CAPACITY		EQU 2
+DNSQB_NAME		EQU 4
+DNSQB_XID		EQU 6
+DNSQB_LENGTH		EQU 8
+DNSQB_DESC_LENGTH	EQU 10
+
+; Reply parser. RCODE is always filled after a structurally valid header.
+DNSP_BUFFER		EQU 0
+DNSP_LENGTH		EQU 2
+DNSP_XID		EQU 4
+DNSP_RESULT		EQU 6
+DNSP_RCODE		EQU 8
+DNSP_DESC_LENGTH	EQU 10
+
+NTP_PORT		EQU 123
+NTP_PACKET_LENGTH	EQU 48
+
+; Request builder. COOKIE points to the caller-owned eight-byte transmit value.
+NTPB_BUFFER		EQU 0
+NTPB_CAPACITY		EQU 2
+NTPB_COOKIE		EQU 4
+NTPB_DESC_LENGTH	EQU 6
+
+; Reply parser. SECONDS points to four bytes in little-endian host order.
+NTPP_BUFFER		EQU 0
+NTPP_LENGTH		EQU 2
+NTPP_COOKIE		EQU 4
+NTPP_SECONDS		EQU 6
+NTPP_DESC_LENGTH	EQU 8
+
+	ENDIF

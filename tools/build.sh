@@ -47,3 +47,5 @@ build_app ping PING
 build_app pingalt PINGALT
 build_app udptest UDPTEST
 build_app tftp TFTP
+build_app nslookup NSLOOKUP
+build_app ntp NTP

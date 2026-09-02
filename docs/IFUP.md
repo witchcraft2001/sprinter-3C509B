@@ -2,18 +2,26 @@
 
 ```text
 IFUP
+IFUP -r
+IFUP -d
 ```
 
 `IFUP` uses only the environment published by `NETCFG -i`. Static mode checks
 the required address, card and link. DHCP mode always performs a fresh
 DISCOVER/OFFER/REQUEST/ACK exchange, using bounded retry intervals of
 4/8/16/16 seconds. An ACK commits the address, mask, gateway, up to two DNS
-servers, DHCP server and lease duration as one transaction.
+servers, DHCP server and lease duration as one transaction. `IFUP -r` renews
+an active DHCP lease with three 5000 ms DHCPREQUEST attempts and `ciaddr`.
+Missing mask/gateway/DNS options and a zero `yiaddr` inherit the current lease;
+an ACK commits the complete result atomically.
 
-A NAK or timeout leaves all dynamic address/DNS/lease values empty and returns
-a non-zero DSS code. There is no automatic static fallback. Renewal, RELEASE,
-`IFUP -r`, `IFUP -d`, and persistent lease state are intentionally not part of
-Stage 7.
+A renewal NAK clears dynamic address/DNS/server/lease values. Renewal timeout,
+malformed traffic, or cancellation preserves the old lease byte for byte.
+`IFUP -d` sends a best-effort DHCPRELEASE using the saved lease and then clears
+the dynamic values; repeating it without a lease succeeds without transmitting.
+Renew/release reject static mode. There is no automatic static fallback and no
+hidden `NET_STATE`: a lease is active only when `NET_IP_SRC=DHCP` and `NET_IP`,
+`NET_DHCP_SRV`, and `NET_LEASE_SEC` are valid.
 
 The card is polling-only. Link and packet waits always finish with an explicit
 status; no ISA IRQ line is used. Esc or Ctrl-C cancels a DHCP wait with the DSS

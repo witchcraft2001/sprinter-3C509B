@@ -26,8 +26,8 @@ function scenario(extra = {}) {
 function run(args, value) { return runExe(executable, args, value); }
 function checked(result) {
   assert.deepStrictEqual(result.cleanup, {isaClosed: true, pagesFreed: true, done: true});
-  assert.ok(result.minimumSp >= 0xbf90,
-    `resident stack margin exhausted: minimum SP #${result.minimumSp.toString(16)}`);
+  assert.ok(result.minimumSp >= 0xbee0,
+    `bootstrap stack margin exhausted: minimum SP #${result.minimumSp.toString(16)}`);
   cases++;
 }
 
@@ -35,7 +35,7 @@ const image = fs.readFileSync(executable);
 assert.strictEqual(image.subarray(0, 4).toString('binary'), 'EXE\x01');
 assert.strictEqual(image.readUInt16LE(4), 128);
 assert.strictEqual(image.readUInt16LE(16), 0x8100);
-assert.ok(0x8080 + image.length < 0xb000);
+assert.ok(0x8080 + image.length < 0xbef0);
 let longest = 0, current = 0;
 for (const byte of image.subarray(128)) { current = byte ? 0 : current + 1; longest = Math.max(longest, current); }
 assert.ok(longest < 128, 'UDPTEST contains zero-filled runtime BSS');
@@ -45,7 +45,7 @@ for (const help of ['-h', '/H', '-?']) {
   const result = run(help, {cardPresent: false});
   assert.strictEqual(result.exitCode, 0); assert.match(result.output, /Usage: UDPTEST/); checked(result);
 }
-for (const bad of ['', 'host.example 7777', '192.168.7.44', '192.168.7.44 0',
+for (const bad of ['', '192.168.7.44', '192.168.7.44 0',
   '192.168.7.44 65536', '-n 0 192.168.7.44 7777', '-n 65536 192.168.7.44 7777',
   '-l 1473 192.168.7.44 7777', '-w 0 192.168.7.44 7777',
   '-w 65536 192.168.7.44 7777', '-n 1 /n 2 192.168.7.44 7777']) {
@@ -132,7 +132,7 @@ const tftpImage = fs.readFileSync(tftpExecutable);
 assert.strictEqual(tftpImage.subarray(0, 4).toString('binary'), 'EXE\x01');
 assert.strictEqual(tftpImage.readUInt16LE(4), 128);
 assert.strictEqual(tftpImage.readUInt16LE(16), 0x8100);
-assert.ok(0x8080 + tftpImage.length < 0xb9a0);
+assert.ok(0x8080 + tftpImage.length < 0xbef0);
 longest = 0; current = 0;
 for (const byte of tftpImage.subarray(128)) { current = byte ? 0 : current + 1; longest = Math.max(longest, current); }
 assert.ok(longest < 128, 'TFTP contains zero-filled runtime BSS');
@@ -143,7 +143,7 @@ for (const help of ['-h', '/H', '-?']) {
   assert.strictEqual(result.exitCode, 0); assert.match(result.output, /Usage: TFTP/); checked(result);
 }
 const longName = 'R'.repeat(80);
-for (const bad of ['', 'host.example GET R', '192.168.7.44', '192.168.7.44: GET R',
+for (const bad of ['', '192.168.7.44', '192.168.7.44: GET R',
   '192.168.7.44:0 GET R', '192.168.7.44:65536 GET R', '192.168.7.44 BAD R',
   `192.168.7.44 GET ${longName}`, '192.168.7.44 GET R -o',
   '192.168.7.44 GET R -o A -o B', '192.168.7.44 GET R -y -f',

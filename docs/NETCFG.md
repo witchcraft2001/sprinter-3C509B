@@ -26,5 +26,10 @@ The keys are `NET`, `HW`, `IDPORT`, `MAC`, `IP`, `NETMASK`, `GATEWAY`, `DNS1`,
 An empty `MAC` uses the read-only EEPROM address. `IP=DHCP` selects DHCP;
 otherwise it is the static address and requires `NETMASK`.
 
+`TZ` is empty for UTC or `[+|-]H`, `[+|-]HH`, `[+|-]H:MM`, or
+`[+|-]HH:MM`. The sign defaults to positive; minutes must be exactly `00`,
+`15`, `30`, or `45`, and the range is `-12:00..+14:00`. Examples include
+`+5:30`, `+5:45`, `+9:30`, `+12:45`, and `-3:30`.
+
 In DHCP mode `NETCFG -i` clears old dynamic IP, DNS, server, and lease values.
 It does not contact a DHCP server; run `IFUP` next.

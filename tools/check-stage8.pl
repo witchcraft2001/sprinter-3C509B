@@ -60,9 +60,10 @@ die "Stage 8 one-page TX/RX layout or max-frame assertion is missing\n"
         && $memory =~ /ASSERT\s+STAGE8_MAX_FRAME\s+<=\s+1514/;
 
 my $time = slurp('src/lib/nettime.asm', 0);
-die "NETTIME lacks bounded two-edge calibration or wall watchdog\n"
-    unless $time =~ /NETTIME_CAL_GUARD\s+EQU\s+4096/
-        && $time =~ /\.ALIGN/ && $time =~ /\.MEASURE/
+die "NETTIME lacks fixed 21 MHz timebase or wall watchdog\n"
+    unless $time =~ /NETTIME_FIXED_QPS\s+EQU\s+1000/
+        && $time =~ /NETTIME_FIXED_MS\s+EQU\s+1/
+        && $time =~ /^INIT\s*$/m
         && $time =~ /NETTIME_QUANTA_LEFT/ && $time =~ /NETTIME_WALL_LIMIT/;
 die "Stage 8 uses a forbidden unbounded CPU wait primitive\n"
     if $code =~ /\bHALT\b|\bEI\b/;
@@ -70,14 +71,14 @@ die "Stage 8 uses a forbidden unbounded CPU wait primitive\n"
 my $ping = slurp('src/apps/ping.asm', 0);
 die "PING does not use NETDRV/ARP or fail-safe cleanup\n"
     unless $ping =~ /\@NETDRV\.SEND_FRAME/ && $ping =~ /\@NETDRV\.READ_FRAME/
-        && $ping =~ /\@ARP\.SELECT_NEXT_HOP/ && $ping =~ /\@S7APP\.CLEANUP/;
+        && $ping =~ /\@ARP\.SELECT_NEXT_HOP/ && $ping =~ /\@S9APP\.CLEANUP/;
 die "PING dispatcher is not bounded or PINGALT conditional is missing\n"
     unless $ping =~ /PING_DRAIN_LEFT/ && $ping =~ /IFNDEF PING_ALT_BUILD/
         && slurp('src/apps/pingalt.asm', 0) =~ /DEFINE PING_ALT_BUILD/;
 die "PING ARP wait is not protected by NETTIME or RX failures are masked\n"
     unless $ping =~ /^WAIT_ARP\s*\n[\s\S]*?\@NETTIME\.START/m
         && $ping =~ /preserve a real NETDRV\/ISA failure/
-        && $ping =~ /ASSERT\s+\$\s*<\s*RUNTIME_BASE/;
+        && $ping =~ /ASSERT\s+\$\s*\+\s*S10_BOOTSTRAP_STACK_RESERVE\s*<=\s*S10_STACK_TOP/;
 
 for my $name (qw(PING PINGALT)) {
     my $image = slurp("build/$name.EXE", 1);
@@ -85,9 +86,9 @@ for my $name (qw(PING PINGALT)) {
         unless substr($image, 0, 4) eq "EXE\x01"
             && unpack('v', substr($image, 4, 2)) == 0x0080
             && unpack('v', substr($image, 16, 2)) == 0x8100
-            && unpack('v', substr($image, 20, 2)) == 0xBFF0;
-    die "$name overlaps its resident state at 0xB500\n"
-        if 0x8080 + length($image) >= 0xB500;
+            && unpack('v', substr($image, 20, 2)) == 0xBEF0;
+    die "$name overlaps Stage 10 bootstrap stack reserve\n"
+        if 0x8080 + length($image) > 0xBEE0;
     die "$name banner/version is missing\n"
         unless index($image, "3C509B $name v0.0.1\0") >= 128;
 }

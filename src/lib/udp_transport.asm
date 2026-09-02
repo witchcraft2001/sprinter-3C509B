@@ -541,10 +541,15 @@ CHECK_CANCEL
 	LD	A,D
 	CP	0xAC
 	JR	Z,.YES
+	; Accept older DSS shims that expose Ctrl+C as ASCII 0x03.
+	LD	A,E
+	CP	0x03
+	JR	Z,.YES
 .NO
 	XOR	A
 	RET
 .YES
+	LD	A,NETDRV_ERR_CANCELLED
 	SCF
 	RET
 

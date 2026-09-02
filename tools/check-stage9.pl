@@ -80,15 +80,15 @@ die "Stage 9 one-page layout/assertions are incomplete\n"
         && $memory =~ /ASSERT\s+STAGE9_MAX_FRAME\s+<=\s+1514/
         && $memory =~ /STAGE9_SCRATCH\s*\+\s*STAGE9_SCRATCH_CAPACITY\s*<=\s*0x8000/;
 
-for my $entry ([UDPTEST => 0xB000], [TFTP => 0xB9A0]) {
+for my $entry ([UDPTEST => 0xBEE0], [TFTP => 0xBEE0]) {
     my ($name, $limit) = @$entry;
     my $image = slurp("build/$name.EXE", 1);
     die "$name header is invalid\n"
         unless substr($image, 0, 4) eq "EXE\x01"
             && unpack('v', substr($image, 4, 2)) == 0x0080
             && unpack('v', substr($image, 16, 2)) == 0x8100
-            && unpack('v', substr($image, 20, 2)) == 0xBFF0;
-    die "$name overlaps resident state\n" if 0x8080 + length($image) >= $limit;
+            && unpack('v', substr($image, 20, 2)) == 0xBEF0;
+    die "$name overlaps Stage 10 bootstrap stack reserve\n" if 0x8080 + length($image) > $limit;
     die "$name banner/version is missing\n"
         unless index($image, "3C509B $name v0.0.1\0") >= 128;
     my $longest = 0;

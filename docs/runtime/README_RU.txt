@@ -9,9 +9,13 @@ Sprinter 3C509B Network Kit 0.0.1
   NETCFG               Показать опубликованное окружение NET_*.
   NETCFG -i -v         Проверить NET.CFG/карту и опубликовать настройки.
   IFUP                 Проверить static или получить новый DHCP lease.
-  PING адрес           Отправить ограниченные IPv4 ICMP Echo Request.
-  TFTP адрес GET файл  Скачать файл в TFTP octet mode.
-  TFTP адрес PUT файл  Отправить файл в TFTP octet mode.
+  IFUP -r              Продлить активный DHCP lease.
+  IFUP -d              Освободить и удалить активный DHCP lease.
+  NSLOOKUP имя [dns]   Разрешить IPv4-адрес через DNS.
+  NTP [сервер]         Установить часы DSS по NTP.
+  PING адрес           Отправить ограниченные ICMP Echo Request.
+  TFTP узел GET файл   Скачать файл в TFTP octet mode.
+  TFTP узел PUT файл   Отправить файл в TFTP octet mode.
   ARP [-v] target      Ограниченная ARP-диагностика (только IMG).
   PINGALT адрес        Независимая polling-диагностика (только IMG).
   UDPTEST адрес порт   UDP echo/generator-диагностика (только IMG).
@@ -22,7 +26,8 @@ ISAPROBE читает ISA только при явном указании сло
   ISAPROBE -s 1 -b #0300 -n #0010
 
 Скопируйте NETSMPL.CFG в NET.CFG рядом с NETCFG.EXE и отредактируйте до
-NETCFG -i. NETCFG.TXT, IFUP.TXT, PING.TXT, TFTP.TXT, USAGE.TXT и HOWTO.TXT описывают настройку.
+NETCFG -i. NETCFG.TXT, IFUP.TXT, NSLOOKUP.TXT, NTP.TXT, PING.TXT,
+TFTP.TXT, USAGE.TXT и HOWTO.TXT описывают настройку.
 LICENSE.TXT содержит лицензию.
 
 ВНИМАНИЕ: EEPROM доступна только для чтения. Эти команды не сохраняют
@@ -30,6 +35,7 @@ LICENSE.TXT содержит лицензию.
 устройства может иметь побочный эффект; используйте только заранее известный
 диапазон.
 
-IFUP поддерживает static и начальное получение DHCP lease. PING, UDPTEST и
-TFTP принимают IPv4-адрес; DNS-имена, продление DHCP и RELEASE пока не
-реализованы. При ошибке TFTP GET partial-файл закрывается и сохраняется.
+IFUP поддерживает static, получение, продление и RELEASE DHCP lease. PING,
+UDPTEST и TFTP принимают IPv4-адрес или DNS-имя. NTP повторно проверяет NET_TZ
+с шагом 15 минут до установки часов. При ошибке TFTP GET partial-файл
+закрывается и сохраняется.
