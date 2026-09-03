@@ -1,5 +1,22 @@
 # Verification evidence
 
+## Stage 11: local TCP regressions
+
+Date: 2026-09-03. A full `make test-host package image` run passed the
+production TCP codec vectors, 42 actual `TCPTEST.EXE` scenarios and three raw
+responder/pcap tests. Coverage includes two simultaneous channels, MSS 536,
+transparent 0..4096-byte segmentation, bounded SYN/data retransmission and FIN
+waits, duplicate/out-of-order handling, zero-window recovery, RST and reconnect.
+
+- IMG: `967827330d1c8686c430827f07d2e3b689dd62063ee85c3ee6b4d8486fefbeb0`.
+- ZIP: `bd2d276be69d0e6a364a2f11b0166a85c39f3837cf14078a5f5f87b45b5d2fac`.
+- TCPTEST.EXE: `4931eb618266c701747e719e60c7f51671fe409c20c347012b24985fd67ac2d5`
+  (13004 bytes).
+
+This does not replace the MAME or physical-card gates. Record those with
+[STAGE11_TEST_TEMPLATE.md](STAGE11_TEST_TEMPLATE.md) and keep the real-hardware
+item open until its logs and pcap exist.
+
 ## Stage 9: local UDP/TFTP regressions
 
 - Date: 2026-09-01.

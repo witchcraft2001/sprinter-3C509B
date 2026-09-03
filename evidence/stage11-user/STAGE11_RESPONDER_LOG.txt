@@ -1,0 +1,41 @@
+Stage 11 MAME responder log excerpts supplied from the 2026-09-03 session.
+The complete terminal transcript is preserved in the chat; this file records
+the acceptance-significant events and final post-fix reset run.
+
+READY interface=feth1 profile=clean tcp=7777 mss=536
+clean: SYN/SYNACK, ESTABLISHED, DATA and FIN observed on two channels for
+sizes 0, 1, 536, 537, 2048 and 4096; all DSS runs returned RESULT OK.
+
+READY interface=feth1 profile=faults tcp=7777 mss=536
+DROP first SYN
+DROP first data ACK
+OUT-OF-ORDER
+DUPLICATE
+DATA channel=50260 bytes=536
+DATA channel=50261 bytes=536
+FIN channel=50260
+FIN channel=50261
+
+READY interface=feth1 profile=zero tcp=7777 mss=536
+WINDOW probe=1
+WINDOW probe=2
+WINDOW probe=3
+DATA channel=50027 bytes=536
+DATA channel=50028 bytes=536
+FIN channel=50027
+FIN channel=50028
+
+Post-fix reset run:
+READY interface=feth1 profile=reset tcp=7777 mss=536
+RST injected
+RST client-port=50028
+SYN channel=50029 mss=536
+SYN channel=50030 mss=536
+DATA channel=50029 bytes=536
+DATA channel=50030 bytes=536
+FIN channel=50029
+FIN channel=50030
+
+The earlier reset transcript showed repeated RST injection and belongs to the
+pre-fix responder; it is retained only as diagnostic history, not acceptance
+evidence.

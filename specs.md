@@ -7,13 +7,13 @@
 - Целевая платформа: Sprinter DSS
 - Сетевая карта: 3Com EtherLink III 3C509B-TPO
 - Режим шины: ISA8
-- Состояние проекта: локальная кодовая часть этапов 0–10 реализована; MAME-матрица
+- Состояние проекта: локальная кодовая часть этапов 0–11 реализована; MAME-матрица
   этапа 4 пройдена на `CYCLES21`; Stage 5/6 имеет частичные MAME pcap, но полная
   матрица остаётся открытой; автоматическая и ручная MAME-приёмка Stage 7
   пройдены; автоматическая и ручная MAME-приёмка Stage 8 пройдены;
   автоматическая и ручная MAME-приёмка Stage 9 пройдены; автоматическая Stage
-  10-приёмка пройдена, а её ручной MAME gate и все проверки на реальном
-  Sprinter ещё открыты
+  10-приёмка пройдена, а её ручной MAME gate ещё открыт; автоматическая и
+  ручная Stage 11-приёмка пройдены, проверки на реальном Sprinter ещё открыты
 
 Этот документ одновременно является техническим заданием, дорожной картой и
 журналом приёмки. Все этапы выполняются последовательно. Этап считается закрытым
@@ -41,7 +41,7 @@ MAME-приёмки текущего этапа. Отсутствие досту
 | 8 | IPv4, ICMP и PING | [x] | [x] | [ ] | [x] | [ ] |
 | 9 | UDP и TFTP | [x] | [x] | [ ] | [x] | [ ] |
 | 10 | DHCP, DNS и NTP | [x] | [ ] | [ ] | [x] | [ ] |
-| 11 | TCP | [ ] | [ ] | [ ] | [ ] | [ ] |
+| 11 | TCP | [x] | [x] | [ ] | [x] | [ ] |
 | 12 | WGET | [ ] | [ ] | [ ] | [ ] | [ ] |
 | 13 | FTP | [ ] | [ ] | [ ] | [ ] | [ ] |
 | 14 | UNET DLL и bindings | [ ] | [ ] | [ ] | [ ] | [ ] |
@@ -541,7 +541,7 @@ ARP                       2000 ms, 3 попытки
 UDP/DNS/NTP reply         5000 ms, 3 попытки
 TFTP block                5000 ms, 6 попыток
 DHCP initial              4000 ms, 4 попытки с backoff до 16000 ms
-TCP SYN                   5000 ms, 3 попытки
+TCP SYN                   1700 ms, 3 попытки (около 5.1 s суммарно)
 TCP data retransmit       1000, 2000, 4000 ms
 TCP FIN/close             5000 ms
 HTTP/FTP idle             15000 ms
@@ -576,6 +576,10 @@ RX/TX status, счётчики и целевой IP/MAC/port, если он ес
 - TCP: два channel contexts с раздельными sequence/window/retry состояниями.
 - Начальный TCP MSS: 536 байт; увеличение допускается только после тестов памяти
   и производительности в обеих средах.
+- TCP `SEND` принимает caller-owned буфер до доступной ёмкости приложения и
+  прозрачно делит его на сегменты не больше effective MSS. Поэтому нативное
+  ограничение MSS 536 совместимо с sibling API и не ограничивает операцию
+  отправки одним сегментом.
 - HTTP/TFTP/FTP пишут на диск блоками; WGET использует файловый буфер 8 КБ на
   DSS-страницах.
 - RX-кадр сначала полностью вычитывается из аппаратного FIFO, после чего верхние
@@ -993,17 +997,27 @@ hardware evidence остаётся открытым.
 
 Результат: клиентский TCP с двумя параллельными каналами.
 
-- [ ] Перенести TCP state machine через `NETDRV`.
-- [ ] Реализовать SYN, ESTABLISHED, FIN и RST paths.
-- [ ] Реализовать MSS, sequence/acknowledgement и checksum.
-- [ ] Реализовать retransmit и конечные тайм-ауты.
-- [ ] Реализовать два одновременно открытых TCP-канала.
-- [ ] Создать `TCPTEST.EXE`.
-- [ ] Проверить duplicate и out-of-order segments.
-- [ ] Проверить zero window, remote FIN/RST и connect timeout.
-- [ ] Проверить повторное соединение после ошибки.
-- [ ] Проверить MAME и реальную карту.
-- [ ] Добавить логи/pcap: ____________________
+- [x] Перенести TCP state machine через `NETDRV`.
+- [x] Реализовать SYN, ESTABLISHED, FIN и RST paths.
+- [x] Реализовать MSS, sequence/acknowledgement и checksum.
+- [x] Реализовать retransmit и конечные тайм-ауты.
+- [x] Реализовать два одновременно открытых TCP-канала.
+- [x] Создать `TCPTEST.EXE`.
+- [x] Проверить duplicate и out-of-order segments.
+- [x] Проверить zero window, remote FIN/RST и connect timeout.
+- [x] Проверить повторное соединение после ошибки.
+- [x] Выполнить автоматическую приёмку: executable TCP checksum/MSS/bounds
+  vectors, 42 actual-EXE state/multichannel/fault сценариев, три responder/pcap
+  теста, layout/EXE/manifest checks. Полный прогон
+  `make test-host package image` от 2026-09-03: IMG
+  `967827330d1c8686c430827f07d2e3b689dd62063ee85c3ee6b4d8486fefbeb0`,
+  ZIP `bd2d276be69d0e6a364a2f11b0166a85c39f3837cf14078a5f5f87b45b5d2fac`,
+  TCPTEST `4931eb618266c701747e719e60c7f51671fe409c20c347012b24985fd67ac2d5`.
+- [x] Выполнить единый MAME gate из `docs/STAGE11_TESTING_RU.md`: clean/faults/
+  zero/reset pcap прошли проверку, screenshots и capture summary сохранены в
+  `evidence/stage11-user/`.
+- [ ] Выполнить проверки на реальном Sprinter/3C509B-TPO.
+- [ ] Добавить hardware логи/pcap: ____________________
 - [ ] Критерий этапа: два канала обмениваются данными и корректно закрываются.
 
 ### Этап 12. WGET

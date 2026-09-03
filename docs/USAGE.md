@@ -41,6 +41,15 @@ UDPTEST [-n count] [-l size] [-w milliseconds] target port
 Defaults are `1`, `16`, and `5000`; the maximum payload is 1472 bytes. See
 `UDPTEST.TXT` for exact ranges and reply matching.
 
+Test two simultaneous TCP echo channels from the developer IMG:
+
+```text
+TCPTEST [-n count] [-l 0..4096] [-w milliseconds] IPv4 port
+```
+
+Defaults are `1`, `2048`, and `5000`. The native MSS is 536 bytes; larger
+buffers are divided into MSS-sized segments transparently. See `TCPTEST.TXT`.
+
 Transfer a file in TFTP octet mode:
 
 ```text

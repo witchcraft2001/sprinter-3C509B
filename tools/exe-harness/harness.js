@@ -158,6 +158,66 @@ function buildUdpReply(request, options = {}) {
   return reply;
 }
 
+function tcpSegment(frame) {
+  if (frame.length < 54 || frame[12] !== 8 || frame[13] !== 0) return null;
+  const ip = frame.slice(14);
+  if (ip[0] !== 0x45 || ip[9] !== 6 || checksum(ip.slice(0, 20))) return null;
+  const total = (ip[2] << 8) | ip[3];
+  if (total < 40 || total > 1500 || total > ip.length || (ip[6] & 0xbf) || ip[7]) return null;
+  const tcp = ip.slice(20, total), headerLength = (tcp[12] >> 4) * 4;
+  if (headerLength < 20 || headerLength > tcp.length || (tcp[12] & 15)) return null;
+  const pseudo = [...ip.slice(12, 20), 0, 6, tcp.length >> 8, tcp.length & 255, ...tcp];
+  if (checksum(pseudo)) return null;
+  let mss = 0;
+  for (let at = 20; at < headerLength;) {
+    const kind = tcp[at];
+    if (!kind) break;
+    if (kind === 1) { at++; continue; }
+    if (at + 1 >= headerLength || tcp[at + 1] < 2 || at + tcp[at + 1] > headerLength) return null;
+    if (kind === 2 && tcp[at + 1] === 4) mss = (tcp[at + 2] << 8) | tcp[at + 3];
+    at += tcp[at + 1];
+  }
+  const sourcePort = (tcp[0] << 8) | tcp[1];
+  const destinationPort = (tcp[2] << 8) | tcp[3];
+  if (!sourcePort || !destinationPort) return null;
+  return {
+    etherSource: frame.slice(6, 12), source: ip.slice(12, 16), destination: ip.slice(16, 20),
+    sourcePort, destinationPort,
+    sequence: ((tcp[4] * 0x1000000) + (tcp[5] << 16) + (tcp[6] << 8) + tcp[7]) >>> 0,
+    acknowledgement: ((tcp[8] * 0x1000000) + (tcp[9] << 16) + (tcp[10] << 8) + tcp[11]) >>> 0,
+    flags: tcp[13], window: (tcp[14] << 8) | tcp[15], mss,
+    payload: tcp.slice(headerLength),
+  };
+}
+
+function buildTcpReply(request, options = {}) {
+  const sourceMac = options.mac || [2, 0, 0, 0, 0, 44];
+  const sourceIp = options.ip || request.destination;
+  const destinationIp = request.source;
+  const payload = Array.from(options.payload || []);
+  const tcp = [request.destinationPort >> 8, request.destinationPort & 255,
+    request.sourcePort >> 8, request.sourcePort & 255];
+  const sequence = options.sequence >>> 0, acknowledgement = options.acknowledgement >>> 0;
+  tcp.push(sequence >>> 24, (sequence >>> 16) & 255, (sequence >>> 8) & 255, sequence & 255,
+    acknowledgement >>> 24, (acknowledgement >>> 16) & 255,
+    (acknowledgement >>> 8) & 255, acknowledgement & 255);
+  const syn = options.flags & 2;
+  tcp.push(syn ? 0x60 : 0x50, options.flags, (options.window ?? 4096) >> 8,
+    (options.window ?? 4096) & 255, 0, 0, 0, 0);
+  if (syn) tcp.push(2, 4, ((options.mss || 536) >> 8) & 255, (options.mss || 536) & 255);
+  tcp.push(...payload);
+  const tcpSum = checksum([...sourceIp, ...destinationIp, 0, 6,
+    tcp.length >> 8, tcp.length & 255, ...tcp]);
+  tcp[16] = tcpSum >> 8; tcp[17] = tcpSum & 255;
+  const total = 20 + tcp.length;
+  const ip = [0x45, 0, total >> 8, total & 255, 0x51, 0x11, 0x40, 0,
+    options.ttl || 62, 6, 0, 0, ...sourceIp, ...destinationIp];
+  putChecksum(ip, 0, 20, 10);
+  const reply = [...request.etherSource, ...sourceMac, 8, 0, ...ip, ...tcp];
+  while (reply.length < 60) reply.push(0);
+  return reply;
+}
+
 function buildDnsReply(request, options = {}) {
   const query = request.payload;
   if (query.length < 17) return null;
@@ -359,6 +419,10 @@ class EtherLinkIII {
     this.ntpRequestCount = 0;
     this.tftpResponseCount = 0;
     this.tftpSession = null;
+    this.tcpRequestCount = 0;
+    this.tcpSynCount = 0;
+    this.tcpDataCount = 0;
+    this.tcpConnections = new Map();
     this.delayed = [];
     this.generated = [];
   }
@@ -556,6 +620,10 @@ class EtherLinkIII {
         else this.rxQueue.push({frame: reply, cursor: 0});
       }
     }
+    const tcp = tcpSegment(frame);
+    if (this.scenario.tcp && tcp &&
+        (!this.scenario.tcp.port || tcp.destinationPort === this.scenario.tcp.port))
+      this.respondTcp(tcp, this.scenario.tcp);
     const datagram = udpDatagram(frame);
     const dnsScenario = this.scenario.dns;
     if (dnsScenario && datagram && datagram.destinationPort === 53) {
@@ -640,6 +708,155 @@ class EtherLinkIII {
         if (udpScenario.delayPolls) this.delayed.push({polls: udpScenario.delayPolls, frame: reply});
         else this.rxQueue.push({frame: reply, cursor: 0});
       }
+    }
+  }
+
+  respondTcp(segment, options) {
+    this.tcpRequestCount++;
+    const key = `${segment.source.join('.')}:${segment.sourcePort}/${segment.destinationPort}`;
+    const queue = (reply) => {
+      this.generated.push(reply);
+      if (this.accepts(reply)) this.rxQueue.push({frame: reply, cursor: 0});
+    };
+    if (segment.flags & 4) { this.tcpConnections.delete(key); return; }
+    if ((options.drop || 0) >= this.tcpRequestCount || options.mode === 'drop') return;
+    if (segment.flags & 2) {
+      this.tcpSynCount++;
+      if ((options.dropSyn || 0) >= this.tcpSynCount) return;
+      if (options.resetOnSyn && (options.resetAlways ||
+          this.tcpSynCount === (options.resetOnSynAt || 1))) {
+        queue(buildTcpReply(segment, {sequence: 0,
+          acknowledgement: (segment.sequence + 1) >>> 0, flags: 0x14, window: 0,
+          mac: options.mac, ip: options.ip}));
+        return;
+      }
+      let connection = this.tcpConnections.get(key);
+      if (!connection || connection.clientNext !== (segment.sequence + 1) >>> 0) {
+        const ordinal = this.tcpConnections.size + 1;
+        const serverIsn = ((options.serverIsn ?? 0x10203040) + ordinal * 0x10000) >>> 0;
+        connection = {serverIsn, serverNext: (serverIsn + 1) >>> 0,
+          serverAcked: (serverIsn + 1) >>> 0, clientNext: (segment.sequence + 1) >>> 0,
+          sendQueue: Buffer.alloc(0), clientWindow: segment.window, established: false,
+          advertisedWindow: options.zeroWindowProbes ? 0 : (options.window ?? 4096), finSent: false};
+        this.tcpConnections.set(key, connection);
+      }
+      queue(buildTcpReply(segment, {sequence: connection.serverIsn, acknowledgement: connection.clientNext,
+        flags: 0x12, window: connection.advertisedWindow,
+        mss: options.mss || 536,
+        mac: options.mac, ip: options.ip}));
+      return;
+    }
+    const connection = this.tcpConnections.get(key);
+    if (!connection) {
+      queue(buildTcpReply(segment, {sequence: 0, acknowledgement: 0, flags: 4,
+        window: 0, mac: options.mac, ip: options.ip}));
+      return;
+    }
+    connection.clientWindow = segment.window;
+    if (segment.flags & 0x10) {
+      const acknowledged = (segment.acknowledgement - connection.serverAcked) >>> 0;
+      const outstanding = (connection.serverNext - connection.serverAcked) >>> 0;
+      if (acknowledged <= outstanding) connection.serverAcked = segment.acknowledgement;
+    }
+    if (!connection.established && !segment.payload.length && !(segment.flags & 1) &&
+        segment.acknowledgement === connection.serverNext) {
+      connection.established = true;
+      return;
+    }
+    if (segment.payload.length && options.zeroWindowProbes &&
+        segment.sequence === (connection.clientNext - 1) >>> 0) {
+      connection.probes = (connection.probes || 0) + 1;
+      if (connection.probes >= options.zeroWindowProbes)
+        connection.advertisedWindow = options.window ?? 4096;
+      queue(buildTcpReply(segment, {sequence: connection.serverNext,
+        acknowledgement: connection.clientNext, flags: 0x10,
+        window: connection.advertisedWindow, mac: options.mac, ip: options.ip}));
+      return;
+    }
+    if (segment.payload.length) {
+      this.tcpDataCount++;
+      if (options.resetOnData && (options.resetAlways ||
+          this.tcpDataCount === (options.resetOnDataAt || 1))) {
+        queue(buildTcpReply(segment, {sequence: connection.serverNext,
+          acknowledgement: connection.clientNext, flags: 0x14, window: 0,
+          mac: options.mac, ip: options.ip}));
+        return;
+      }
+      if (segment.sequence !== connection.clientNext) {
+        queue(buildTcpReply(segment, {sequence: connection.serverNext,
+          acknowledgement: connection.clientNext, flags: 0x10, window: connection.advertisedWindow,
+          mac: options.mac, ip: options.ip}));
+        return;
+      }
+      connection.clientNext = (connection.clientNext + segment.payload.length) >>> 0;
+      connection.sendQueue = Buffer.concat([connection.sendQueue, Buffer.from(segment.payload)]);
+      if ((options.dropDataResponses || 0) >= this.tcpDataCount) return;
+      if (options.outOfSequenceRstBeforeData && !connection.badRstSent) {
+        connection.badRstSent = true;
+        queue(buildTcpReply(segment, {sequence: (connection.serverNext + 1) >>> 0,
+          acknowledgement: connection.clientNext, flags: 0x14, window: 0,
+          mac: options.mac, ip: options.ip}));
+      }
+    }
+    if (segment.flags & 1) {
+      connection.clientNext = (connection.clientNext + 1) >>> 0;
+      if (options.ackOnlyClose && !connection.finSent) {
+        queue(buildTcpReply(segment, {sequence: connection.serverNext,
+          acknowledgement: connection.clientNext, flags: 0x10,
+          window: connection.advertisedWindow, mac: options.mac, ip: options.ip}));
+        return;
+      }
+      if (options.splitClose && !connection.finSent) {
+        queue(buildTcpReply(segment, {sequence: connection.serverNext,
+          acknowledgement: connection.clientNext, flags: 0x10,
+          window: connection.advertisedWindow, mac: options.mac, ip: options.ip}));
+        queue(buildTcpReply(segment, {sequence: connection.serverNext,
+          acknowledgement: connection.clientNext, flags: 0x11,
+          window: connection.advertisedWindow, mac: options.mac, ip: options.ip}));
+        connection.finSent = true;
+        connection.serverNext = (connection.serverNext + 1) >>> 0;
+        return;
+      }
+      queue(buildTcpReply(segment, {sequence: connection.serverNext,
+        acknowledgement: connection.clientNext, flags: connection.finSent ? 0x10 : 0x11,
+        window: connection.advertisedWindow,
+        mac: options.mac, ip: options.ip}));
+      if (!connection.finSent) {
+        connection.finSent = true;
+        connection.serverNext = (connection.serverNext + 1) >>> 0;
+      }
+      return;
+    }
+    const inFlight = (connection.serverNext - connection.serverAcked) >>> 0;
+    const available = Math.max(0, connection.clientWindow - inFlight);
+    if (connection.sendQueue.length && available) {
+      const size = Math.min(options.mss || 536, available, connection.sendQueue.length);
+      const payload = connection.sendQueue.subarray(0, size);
+      connection.sendQueue = connection.sendQueue.subarray(size);
+      if (options.outOfOrderBeforeData && !connection.outOfOrderSent) {
+        connection.outOfOrderSent = true;
+        queue(buildTcpReply(segment, {sequence: (connection.serverNext + payload.length) >>> 0,
+          acknowledgement: connection.clientNext, flags: 0x18, payload,
+          window: options.window ?? 4096, mac: options.mac, ip: options.ip}));
+      }
+      const remoteFin = options.remoteFinAfterData && !connection.finSent;
+      const reply = buildTcpReply(segment, {sequence: connection.serverNext,
+        acknowledgement: connection.clientNext, flags: remoteFin ? 0x19 : 0x18, payload,
+        window: connection.advertisedWindow, mac: options.mac, ip: options.ip});
+      queue(reply);
+      if (options.duplicateData) queue(reply.slice());
+      if (options.outOfOrderFinAfterData && !connection.badFinSent) {
+        connection.badFinSent = true;
+        queue(buildTcpReply(segment, {sequence: (connection.serverNext + size + 1) >>> 0,
+          acknowledgement: connection.clientNext, flags: 0x11,
+          window: connection.advertisedWindow, mac: options.mac, ip: options.ip}));
+      }
+      connection.serverNext = (connection.serverNext + size + (remoteFin ? 1 : 0)) >>> 0;
+      if (remoteFin) connection.finSent = true;
+    } else if (segment.payload.length) {
+      queue(buildTcpReply(segment, {sequence: connection.serverNext,
+        acknowledgement: connection.clientNext, flags: 0x10, window: connection.advertisedWindow,
+        mac: options.mac, ip: options.ip}));
     }
   }
 
@@ -1062,6 +1279,9 @@ function runExe(exePath, args = '', inputScenario = {}) {
           clockReads >= scenario.clockFreezeAfterReads;
         clockSecond = (clockSecond + (frozen ? 0 : (scenario.timeStepSeconds ?? 1))) % 86400;
         clockReads++;
+        // DSS does not promise IX/IY preservation. Exercise callers that need
+        // their context pointer across the system-time service.
+        if (scenario.clobberIndexOnSystime) { s.ix = 0x1f3d; s.iy = 0x2e4c; }
         setCarry(s, false); return ret(s);
       }
       case 0x22: {
@@ -1212,6 +1432,7 @@ function runExe(exePath, args = '', inputScenario = {}) {
       dhcpRelease: card.dhcpReleaseCount,
       arp: card.arpRequestCount, icmp: card.icmpRequestCount, dns: card.dnsRequestCount,
       ntp: card.ntpRequestCount, udp: card.udpRequestCount,
+      tcp: card.tcpRequestCount,
     },
     setTimeCalls,
     ...(scenario.traceDss ? {dssEvents} : {}),
