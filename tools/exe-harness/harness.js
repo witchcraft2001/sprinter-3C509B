@@ -154,6 +154,12 @@ function buildUdpReply(request, options = {}) {
   if (options.foreignDestination) { reply[30] ^= 1; putChecksum(reply, 14, 20, 24); }
   if (options.badIpChecksum) reply[24] ^= 1;
   if (options.badUdpChecksum) reply[40] ^= 1;
+  if (options.udpLengthDelta) {
+    const claimed = udpLength + options.udpLengthDelta;
+    reply[38] = (claimed >> 8) & 255; reply[39] = claimed & 255;
+    // A zero checksum remains legal for IPv4 and isolates length validation.
+    reply[40] = 0; reply[41] = 0;
+  }
   while (reply.length < 60) reply.push(0);
   return reply;
 }
@@ -227,15 +233,26 @@ function buildDnsReply(request, options = {}) {
     if (!size || size > 63 || cursor + size > query.length) return null;
     cursor += size;
   }
-  if (cursor + 5 > query.length) return null;
-  const question = query.slice(12, cursor + 5);
+  if (cursor >= query.length || query[cursor] !== 0) return null;
+  cursor++;
+  if (cursor + 4 !== query.length || query[cursor] !== 0 || query[cursor + 1] !== 1 ||
+      query[cursor + 2] !== 0 || query[cursor + 3] !== 1) return null;
+  const question = query.slice(12, cursor + 4);
   const id = ((query[0] << 8) | query[1]) ^ (options.staleId ? 1 : 0);
   const rcode = options.nxdomain ? 3 : (options.rcode || 0);
-  const answers = rcode || options.noAnswer ? 0 : 1;
+  const prefixedAnswer = options.cnameBeforeAnswer || options.paddingBeforeAnswer;
+  const answers = rcode || options.noAnswer ? 0 : (prefixedAnswer ? 2 : 1);
   const payload = [id >> 8, id & 255, 0x81, 0x80 | rcode, 0, 1, 0, answers, 0, 0, 0, 0,
     ...question];
   if (answers) {
     const address = options.address || [192, 168, 7, 44];
+    if (options.cnameBeforeAnswer)
+      payload.push(0xc0, 0x0c, 0, 5, 0, 1, 0, 0, 0, 60, 0, 2, 0xc0, 0x0c);
+    if (options.paddingBeforeAnswer) {
+      const size = options.paddingBeforeAnswer;
+      payload.push(0xc0, 0x0c, 0, 16, 0, 1, 0, 0, 0, 60,
+        (size >> 8) & 255, size & 255, ...Array(size).fill(0x41));
+    }
     if (options.pointerLoop) {
       const answerOffset = payload.length;
       payload.push(0xc0 | ((answerOffset >> 8) & 0x3f), answerOffset & 255);
@@ -251,6 +268,7 @@ function buildDnsReply(request, options = {}) {
     sourcePort: options.sourcePort ?? 53,
     destinationPort: options.destinationPort ?? request.sourcePort,
     badUdpChecksum: options.badChecksum,
+    udpLengthDelta: options.udpLengthDelta,
   });
 }
 
@@ -423,6 +441,8 @@ class EtherLinkIII {
     this.tcpSynCount = 0;
     this.tcpDataCount = 0;
     this.tcpConnections = new Map();
+    this.httpRequests = [];
+    this.httpBytesSent = 0;
     this.delayed = [];
     this.generated = [];
   }
@@ -635,7 +655,10 @@ class EtherLinkIII {
       const replies = [];
       if (dns.staleBeforeReply) replies.push(buildDnsReply(datagram, {...dns, staleId: true}));
       if (dns.foreignPortBeforeReply) replies.push(buildDnsReply(datagram, {...dns, sourcePort: 54}));
-      if (dns.badChecksumBeforeReply) replies.push(buildDnsReply(datagram, {...dns, badChecksum: true}));
+      if (dns.badChecksumBeforeReply) replies.push(buildDnsReply(datagram, {...dns,
+        address: dns.badChecksumAddress || dns.address, badChecksum: true}));
+      if (dns.badLengthBeforeReply) replies.push(buildDnsReply(datagram, {...dns,
+        address: dns.badLengthAddress || dns.address, udpLengthDelta: 1}));
       if (dns.malformedBeforeReply) replies.push(buildDnsReply(datagram, {...dns, pointerLoop: true}));
       replies.push(buildDnsReply(datagram, dns));
       for (const reply of replies.filter(Boolean)) {
@@ -737,7 +760,8 @@ class EtherLinkIII {
         connection = {serverIsn, serverNext: (serverIsn + 1) >>> 0,
           serverAcked: (serverIsn + 1) >>> 0, clientNext: (segment.sequence + 1) >>> 0,
           sendQueue: Buffer.alloc(0), clientWindow: segment.window, established: false,
-          advertisedWindow: options.zeroWindowProbes ? 0 : (options.window ?? 4096), finSent: false};
+          advertisedWindow: options.zeroWindowProbes ? 0 : (options.window ?? 4096), finSent: false,
+          httpRequest: Buffer.alloc(0), httpReady: false};
         this.tcpConnections.set(key, connection);
       }
       queue(buildTcpReply(segment, {sequence: connection.serverIsn, acknowledgement: connection.clientNext,
@@ -789,7 +813,37 @@ class EtherLinkIII {
         return;
       }
       connection.clientNext = (connection.clientNext + segment.payload.length) >>> 0;
-      connection.sendQueue = Buffer.concat([connection.sendQueue, Buffer.from(segment.payload)]);
+      if (options.mode === 'http') {
+        connection.httpRequest = Buffer.concat([connection.httpRequest, Buffer.from(segment.payload)]);
+        if (!connection.httpReady && connection.httpRequest.includes(Buffer.from('\r\n\r\n'))) {
+          connection.httpReady = true;
+          const request = connection.httpRequest.toString('latin1');
+          this.httpRequests.push(request);
+          const requestLine = request.split('\r\n', 1)[0].split(' ');
+          const target = requestLine.length >= 2 ? requestLine[1] : '';
+          let response = options.responses && Object.prototype.hasOwnProperty.call(options.responses, target) ?
+            options.responses[target] : options.response;
+          if (Array.isArray(response)) response = response.shift();
+          if (response && typeof response === 'object' && !Buffer.isBuffer(response)) {
+            if (response.raw !== undefined) response = response.raw;
+            else {
+              const body = Buffer.isBuffer(response.body) ? response.body :
+                Buffer.from(response.body || '', 'latin1');
+              const headers = {...(response.headers || {})};
+              if (!response.closeDelimited && !Object.keys(headers).some((name) =>
+                  name.toLowerCase() === 'content-length')) headers['Content-Length'] = body.length;
+              response = Buffer.concat([Buffer.from(`HTTP/1.0 ${response.status || '200 OK'}\r\n` +
+                Object.entries(headers).map(([name, value]) => `${name}: ${value}\r\n`).join('') +
+                '\r\n', 'latin1'), body]);
+            }
+          }
+          if (response === undefined) response = 'HTTP/1.0 404 Not Found\r\nContent-Length: 0\r\n\r\n';
+          connection.sendQueue = Buffer.isBuffer(response) ? Buffer.from(response) :
+            Buffer.from(response, 'latin1');
+        }
+      } else {
+        connection.sendQueue = Buffer.concat([connection.sendQueue, Buffer.from(segment.payload)]);
+      }
       if ((options.dropDataResponses || 0) >= this.tcpDataCount) return;
       if (options.outOfSequenceRstBeforeData && !connection.badRstSent) {
         connection.badRstSent = true;
@@ -830,7 +884,8 @@ class EtherLinkIII {
     const inFlight = (connection.serverNext - connection.serverAcked) >>> 0;
     const available = Math.max(0, connection.clientWindow - inFlight);
     if (connection.sendQueue.length && available) {
-      const size = Math.min(options.mss || 536, available, connection.sendQueue.length);
+      const size = Math.min(options.responseChunkSize || options.mss || 536,
+        available, connection.sendQueue.length);
       const payload = connection.sendQueue.subarray(0, size);
       connection.sendQueue = connection.sendQueue.subarray(size);
       if (options.outOfOrderBeforeData && !connection.outOfOrderSent) {
@@ -839,11 +894,15 @@ class EtherLinkIII {
           acknowledgement: connection.clientNext, flags: 0x18, payload,
           window: options.window ?? 4096, mac: options.mac, ip: options.ip}));
       }
-      const remoteFin = options.remoteFinAfterData && !connection.finSent;
+      const remoteFin = !connection.finSent &&
+        ((options.mode === 'http' && !options.keepOpen && connection.httpReady &&
+          connection.sendQueue.length === 0) ||
+         options.remoteFinAfterData);
       const reply = buildTcpReply(segment, {sequence: connection.serverNext,
         acknowledgement: connection.clientNext, flags: remoteFin ? 0x19 : 0x18, payload,
         window: connection.advertisedWindow, mac: options.mac, ip: options.ip});
       queue(reply);
+      if (options.mode === 'http') this.httpBytesSent += size;
       if (options.duplicateData) queue(reply.slice());
       if (options.outOfOrderFinAfterData && !connection.badFinSent) {
         connection.badFinSent = true;
@@ -1080,12 +1139,39 @@ function runExe(exePath, args = '', inputScenario = {}) {
   if (headerSize !== 128 || entry !== entry2) throw new Error('unsupported DSS EXE header layout');
   const loadAddress = entry - headerSize;
   if (loadAddress < 0 || loadAddress + exe.length > 0xc000) throw new Error('EXE crosses 0xC000');
+  // DSS installs this stack before the entry point runs, and it runs the loader
+  // and the interrupt handlers on it. An entry stack sitting just above the
+  // image therefore corrupts whichever routine happens to end that image --
+  // silently, and only where that routine is reached. Demand a real gap.
+  // It may descend through the consumed header, or clear the whole image; what
+  // it may not do is start just above the last routine.
+  const entryStackGap = 0x40, imageEnd = loadAddress + exe.length;
+  if (stack > entry && stack - imageEnd < entryStackGap)
+    throw new Error(`entry stack 0x${stack.toString(16)} leaves ` +
+      `${stack - imageEnd} bytes above the image end 0x${imageEnd.toString(16)}, ` +
+      `needs ${entryStackGap} or must sit at or below the entry point`);
 
-  const ram = new Uint8Array(0x10000);
+  // Real DSS hands out pages with arbitrary contents. pageFill models that:
+  // a byte value, or 'random' with the optional pageSeed for a repeatable run.
+  let fillState = (scenario.pageSeed || 0x2545) & 0xffff;
+  const fillByte = () => {
+    if (scenario.pageFill === 'random') {
+      fillState = (fillState * 25173 + 13849) & 0xffff;
+      return fillState >> 8;
+    }
+    return scenario.pageFill & 0xff;
+  };
+  const freshPage = (size) => {
+    const page = new Uint8Array(size);
+    if (scenario.pageFill !== undefined)
+      for (let i = 0; i < size; i++) page[i] = fillByte();
+    return page;
+  };
+  const ram = freshPage(0x10000);
   for (let i = 0; i < exe.length; i++) ram[loadAddress + i] = exe[i];
   const card = new EtherLinkIII(scenario);
   let page3 = 3, systemIsa = false, isaOpen = false, selectedSlot = 0;
-  let win1 = null, nextBlock = 16;
+  let win1 = null, win2 = null, nextBlock = 16;
   const pages = new Map(), allocations = new Map();
   const allocated = (id) => pages.has(id);
   const environment = scenario.environment || {};
@@ -1101,10 +1187,10 @@ function runExe(exePath, args = '', inputScenario = {}) {
   ]));
   const openFiles = new Map();
   let nextHandle = 4, envSetCount = 0, clockSecond = scenario.clockSecond || 0;
-  let fileReadCalls = 0, fileWriteCalls = 0, totalWritten = 0;
-  let clockReads = 0, scanCount = 0;
+  let fileReadCalls = 0, fileWriteCalls = 0, fileCloseCalls = 0, totalWritten = 0;
+  let clockReads = 0, scanCount = 0, keyDelivered = false;
   const dssEvents = [];
-  let stdout = '', exitCode = null, steps = 0, minimumSp = stack;
+  let stdout = '', exitCode = null, steps = 0, minimumSp = stack, minimumPageSp = 0x10000;
   const setTimeCalls = [];
   const pcTrace = [];
 
@@ -1124,6 +1210,7 @@ function runExe(exePath, args = '', inputScenario = {}) {
       return 0xff;
     }
     if (address >= 0x4000 && address < 0x8000 && win1 !== null) return pages.get(win1)[address - 0x4000];
+    if (address >= 0x8000 && address < 0xc000 && win2 !== null) return pages.get(win2)[address - 0x8000];
     return ram[address];
   };
   const wr = (address, value) => {
@@ -1136,6 +1223,7 @@ function runExe(exePath, args = '', inputScenario = {}) {
       return;
     }
     if (address >= 0x4000 && address < 0x8000 && win1 !== null) { pages.get(win1)[address - 0x4000] = value; return; }
+    if (address >= 0x8000 && address < 0xc000 && win2 !== null) { pages.get(win2)[address - 0x8000] = value; return; }
     ram[address] = value;
   };
 
@@ -1172,11 +1260,19 @@ function runExe(exePath, args = '', inputScenario = {}) {
     },
   });
 
-  const cmdAddress = 0x7000;
+  // DSS owns the PSP placement; model it outside the program's own image. For a
+  // WIN2-loaded image that is 0x7000, inside the window the program is about to
+  // remap, which is what makes SAVE_COMMAND's copy necessary. A WIN1-loaded
+  // image occupies that window itself, so its PSP goes in DSS's low memory.
+  const cmdAddress = loadAddress < 0x8000 ? 0x3000 : 0x7000;
   if (Buffer.byteLength(args, 'ascii') > 255) throw new Error('command line exceeds DSS byte length');
   wr(cmdAddress, Buffer.byteLength(args, 'ascii'));
   for (let i = 0; i < args.length; i++) wr(cmdAddress + 1 + i, args.charCodeAt(i));
   let state = cpu.getState(); state.pc = entry; state.sp = stack; state.ix = cmdAddress; cpu.setState(state);
+  // DSS reaches the entry point with the loader's own frames, and at least one
+  // interrupt frame, already spent below this stack. Model that so a program
+  // that parks its entry stack on top of its own code fails here too.
+  for (let i = 1; i <= entryStackGap; i++) wr((stack - i) & 0xffff, 0x76 + (i & 1));
   const setCarry = (s, value) => { s.flags.C = value ? 1 : 0; };
   const ret = (s) => {
     const lo = rd(s.sp), hi = rd((s.sp + 1) & 0xffff);
@@ -1192,9 +1288,25 @@ function runExe(exePath, args = '', inputScenario = {}) {
     for (let i = 0; i < bytes.length; i++) wr(address + i, bytes[i]);
     wr(address + bytes.length, 0);
   };
+  // Real DSS runs its handler on the caller's stack. Model that: a call
+  // scribbles the words below SP, so a program whose stack sits too close to
+  // its own code corrupts itself here instead of only on hardware.
+  const dssStackBytes = scenario.dssStackBytes === undefined ? 48 : scenario.dssStackBytes;
+  const spendCallerStack = (sp) => {
+    for (let i = 1; i <= dssStackBytes; i++) wr((sp - i) & 0xffff, 0x76 + (i & 1));
+  };
   const dss = () => {
     if (isaOpen) throw new Error('DSS call while ISA window is open');
     const s = cpu.getState(), fn = s.c, count = s.b || 1;
+    // Console output that scrolls calls BIOS WIN_MOVE, which maps the video
+    // page over WIN1 and then restores SLOT1 from a POP taken while that page
+    // is still mapped: a caller whose stack is in WIN1 wedges on its first
+    // scrolled line. Nothing here can model that page swap, so reject the
+    // placement itself. Non-console calls are fine on a WIN1 stack, which is
+    // what lets a WIN1-resident image claim its page before it prints.
+    if ((fn === 0x5b || fn === 0x5c) && s.sp > 0x4000 && s.sp <= 0x8000)
+      throw new Error(`DSS console call with the caller stack in WIN1: SP=${s.sp.toString(16)}`);
+    spendCallerStack(s.sp);
     switch (fn) {
       case 0x11: {
         const name = canonicalName(cstr((s.h << 8) | s.l));
@@ -1206,6 +1318,10 @@ function runExe(exePath, args = '', inputScenario = {}) {
         s.a = handle; setCarry(s, false); return ret(s);
       }
       case 0x12: {
+        fileCloseCalls++;
+        if (scenario.fileCloseFailAt === fileCloseCalls) {
+          s.a = 1; setCarry(s, true); return ret(s);
+        }
         if (!openFiles.delete(s.a)) throw new Error(`CLOSE_FILE of unknown handle ${s.a}`);
         setCarry(s, false); return ret(s);
       }
@@ -1256,6 +1372,27 @@ function runExe(exePath, args = '', inputScenario = {}) {
         if (scenario.traceDss) dssEvents.push(`WRITE ${file.name} ${requested}`);
         setCarry(s, false); return ret(s);
       }
+      case 0x15: {
+        const file = openFiles.get(s.a);
+        if (!file) throw new Error(`MOVE_FP of unknown handle ${s.a}`);
+        const raw = ((((s.h << 8) | s.l) * 0x10000) + s.ix) >>> 0;
+        const offset = raw > 0x7fffffff ? raw - 0x100000000 : raw;
+        let base;
+        if (s.b === 0) base = 0;
+        else if (s.b === 1) base = file.offset;
+        else if (s.b === 2) base = file.data.length;
+        else throw new Error(`MOVE_FP with invalid whence ${s.b}`);
+        const position = base + offset;
+        if (scenario.fileSeekFail || position < 0 || position > 0xffffffff) {
+          s.a = 1; setCarry(s, true); return ret(s);
+        }
+        file.offset = position;
+        s.ix = position & 0xffff;
+        s.h = (position >>> 24) & 0xff;
+        s.l = (position >>> 16) & 0xff;
+        if (scenario.traceDss) dssEvents.push(`SEEK ${file.name} ${position}`);
+        setCarry(s, false); return ret(s);
+      }
       case 0x1e:
         writeCstr((s.h << 8) | s.l, currentDir); setCarry(s, false); return ret(s);
       case 0x1d: {
@@ -1299,7 +1436,11 @@ function runExe(exePath, args = '', inputScenario = {}) {
       }
       case 0x31: {
         scanCount++;
-        if (scenario.key && scanCount === (scenario.keyAtScan || 1)) {
+        const keyReady = scenario.keyAfterHttpBytes !== undefined ?
+          card.httpBytesSent >= scenario.keyAfterHttpBytes :
+          scanCount === (scenario.keyAtScan || 1);
+        if (scenario.key && !keyDelivered && keyReady) {
+          keyDelivered = true;
           if (scenario.key === 'escape') { s.b = 0; s.d = 1; s.e = 0x1b; }
           // DSS represents Ctrl+letter as a positional scancode with bit 7
           // set and the X_CTRL modifier; it does not return ASCII 0x03.
@@ -1314,19 +1455,28 @@ function runExe(exePath, args = '', inputScenario = {}) {
       case 0x3d: {
         const base = nextBlock; nextBlock += count;
         allocations.set(base, count);
-        for (let i = 0; i < count; i++) pages.set(base + i, new Uint8Array(0x4000));
+        for (let i = 0; i < count; i++) pages.set(base + i, freshPage(0x4000));
         s.a = base; setCarry(s, false); return ret(s);
       }
       case 0x39: {
         const page = s.a + s.b;
         if (!allocated(page)) throw new Error(`SETWIN1 of unallocated page ${page}`);
+        if (loadAddress < 0x8000) throw new Error('SETWIN1 would remap the image window');
         win1 = page; setCarry(s, false); return ret(s);
+      }
+      case 0x3a: {
+        const page = s.a + s.b;
+        if (!allocated(page)) throw new Error(`SETWIN2 of unallocated page ${page}`);
+        if (loadAddress >= 0x8000) throw new Error('SETWIN2 would remap the image window');
+        win2 = page; setCarry(s, false); return ret(s);
       }
       case 0x3e: {
         const countPages = allocations.get(s.a);
         if (!countPages) throw new Error(`FREEMEM of unknown block ${s.a}`);
         for (let i = 0; i < countPages; i++) pages.delete(s.a + i);
-        allocations.delete(s.a); if (!allocated(win1)) win1 = null;
+        allocations.delete(s.a);
+        if (!allocated(win1)) win1 = null;
+        if (!allocated(win2)) win2 = null;
         setCarry(s, false); return ret(s);
       }
       case 0x46: {
@@ -1376,7 +1526,12 @@ function runExe(exePath, args = '', inputScenario = {}) {
   try {
     const limit = scenario.stepLimit || 200_000_000;
     for (;;) {
-      minimumSp = Math.min(minimumSp, cpu.getState().sp);
+      const sp = cpu.getState().sp;
+      minimumSp = Math.min(minimumSp, sp);
+      // The runtime stack lives in the claimed page, which is a different window
+      // from the entry stack, so the overall minimum says nothing about it.
+      if (win2 !== null && sp > 0x8000 && sp <= 0xc000) minimumPageSp = Math.min(minimumPageSp, sp);
+      else if (win1 !== null && sp > 0x4000 && sp <= 0x8000) minimumPageSp = Math.min(minimumPageSp, sp);
       if (scenario.stopPc !== undefined && cpu.getState().pc === scenario.stopPc) {
         const stopped = cpu.getState();
         throw new Error(`stop PC=${stopped.pc.toString(16)} SP=${stopped.sp.toString(16)} ` +
@@ -1423,6 +1578,7 @@ function runExe(exePath, args = '', inputScenario = {}) {
       done: !card.rxEnabled && !card.txEnabled && card.window === 0,
     },
     card: {slot: card.slot, base: card.base, mac: hex(card.mac), station: hex(card.station), active: card.active},
+    httpRequests: card.httpRequests.slice(),
     environment: {...environment},
     currentDir,
     files: Object.fromEntries([...files].map(([name, data]) => [name, Buffer.from(data)])),
@@ -1441,6 +1597,7 @@ function runExe(exePath, args = '', inputScenario = {}) {
     ]))} : {}),
     steps,
     minimumSp,
+    minimumPageSp: minimumPageSp === 0x10000 ? null : minimumPageSp,
   };
 }
 

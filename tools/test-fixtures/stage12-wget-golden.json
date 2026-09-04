@@ -1,0 +1,10 @@
+{
+  "reference": "../sprinter-rtl8019a@9ec98b00c6490fed5eb722c52b47d11c70a199ae",
+  "normalization": ["banner", "REGS hardware line"],
+  "help": "<WGET-BANNER>\r\nUsage:\r\n  WGET url [-o output] [-y|-f] [-r] [-d]\r\n  WGET /?\r\n\r\n  url     http://host[:port][/path]\r\n  -o file write body to <file> (default: derived from URL).\r\n  -y, -f  overwrite local file without prompt.\r\n  -r      resume: append to <file>, request Range from server.\r\n  -d      dot progress instead of the KB counter (less\r\n          console work, use it to compare throughput).\r\nRESULT OK\r\n",
+  "invalid": "<WGET-BANNER>\r\n[E] usage: missing or invalid URL\r\nUsage:\r\n  WGET url [-o output] [-y|-f] [-r] [-d]\r\n  WGET /?\r\n\r\n  url     http://host[:port][/path]\r\n  -o file write body to <file> (default: derived from URL).\r\n  -y, -f  overwrite local file without prompt.\r\n  -r      resume: append to <file>, request Range from server.\r\n  -d      dot progress instead of the KB counter (less\r\n          console work, use it to compare throughput).\r\nRESULT FAIL\r\n",
+  "small": "<WGET-BANNER>\r\nResolved 192.168.7.44 -> 192.168.7.44 port 80\r\nConnecting to 192.168.7.44 port 80...ESTABLISHED.\r\n\r0KB / 0KB\r0KB / 0KB\r\nDone. 5 bytes received.\r\n  5 bytes in 0 sec\r\nRESULT OK\r\n",
+  "prompt_cancel": "<WGET-BANNER>\r\nLocal file 'KEEP.BIN' exists. Overwrite/Resume/Cancel [O/R/C]? c\r\nAborted by user.\r\n",
+  "not_found": "<WGET-BANNER>\r\nResolved 192.168.7.44 -> 192.168.7.44 port 80\r\nConnecting to 192.168.7.44 port 80...ESTABLISHED.\r\n[E] HTTP/1.0 404 Not Found\r\nRESULT FAIL\r\n",
+  "range_ignored": "<WGET-BANNER>\r\nResolved 192.168.7.44 -> 192.168.7.44 port 80\r\nConnecting to 192.168.7.44 port 80...ESTABLISHED.\r\n[E] server ignored Range (no resume). Rerun without -r.\r\nRESULT FAIL\r\n"
+}

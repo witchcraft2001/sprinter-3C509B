@@ -59,3 +59,15 @@ TFTP host[:port] PUT local [-o remote]
 
 The default request port is 69. `host` may be IPv4 or a hostname. GET prompts
 before overwriting an existing file unless `-y` or `-f` is present.
+
+Download a plain HTTP resource:
+
+```text
+WGET url [-o output] [-y|-f] [-r] [-d]
+```
+
+The default output is the URL basename or `OUTPUT.BIN`. Existing files prompt
+for Overwrite/Resume/Cancel. `-r` requests the remainder and appends only after
+a 206 response. `-d` emits one dot per 8 KiB flush instead of the KB counter;
+the final time/speed summary remains. See `WGET.TXT` for redirects and failure
+retention rules.

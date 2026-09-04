@@ -50,3 +50,4 @@ build_app tftp TFTP
 build_app nslookup NSLOOKUP
 build_app ntp NTP
 build_app tcptest TCPTEST
+build_app wget WGET

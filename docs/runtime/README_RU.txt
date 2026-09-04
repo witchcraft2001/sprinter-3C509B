@@ -16,6 +16,7 @@ Sprinter 3C509B Network Kit 0.0.1
   PING адрес           Отправить ограниченные ICMP Echo Request.
   TFTP узел GET файл   Скачать файл в TFTP octet mode.
   TFTP узел PUT файл   Отправить файл в TFTP octet mode.
+  WGET http://узел/файл [-o имя] [-y|-f] [-r] [-d]
   ARP [-v] target      Ограниченная ARP-диагностика (только IMG).
   PINGALT адрес        Независимая polling-диагностика (только IMG).
   UDPTEST адрес порт   UDP echo/generator-диагностика (только IMG).
@@ -27,7 +28,7 @@ ISAPROBE читает ISA только при явном указании сло
 
 Скопируйте NETSMPL.CFG в NET.CFG рядом с NETCFG.EXE и отредактируйте до
 NETCFG -i. NETCFG.TXT, IFUP.TXT, NSLOOKUP.TXT, NTP.TXT, PING.TXT,
-TFTP.TXT, USAGE.TXT и HOWTO.TXT описывают настройку.
+TFTP.TXT, WGET.TXT, USAGE.TXT и HOWTO.TXT описывают настройку.
 LICENSE.TXT содержит лицензию.
 
 ВНИМАНИЕ: EEPROM доступна только для чтения. Эти команды не сохраняют
@@ -39,3 +40,8 @@ IFUP поддерживает static, получение, продление и 
 UDPTEST и TFTP принимают IPv4-адрес или DNS-имя. NTP повторно проверяет NET_TZ
 с шагом 15 минут до установки часов. При ошибке TFTP GET partial-файл
 закрывается и сохраняется.
+
+WGET загружает обычные HTTP/1.0 URL, проходит до пяти redirect и пишет блоками
+по 8 КБ. После timeout или отмены partial-файл сохраняется. -r продолжает
+загрузку только при ответе Range/206; -d заменяет счётчик прогресса точками,
+но сохраняет итоговую строку времени и скорости.

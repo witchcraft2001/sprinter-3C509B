@@ -220,6 +220,7 @@ READ_FRAME
 	POP	IY,IX
 	RET
 
+	IFNDEF STAGE12_LAYOUT
 ; DISCARD_FRAME
 ; Discards only the current complete packet. Empty/incomplete FIFO is NO_FRAME.
 ; Out: A=EL3_OK/CF=0 or explicit error/CF=1.
@@ -240,17 +241,20 @@ DISCARD_FRAME
 .DISCARD_RETURN
 	POP	IY,IX
 	RET
+	ENDIF
 
 ; LOOPBACK_ENABLE / LOOPBACK_DISABLE
 ; Diagnostic-only RMW of Window 4 Net Diagnostic bit 13. Both verify the
 ; result and return to Window 1. Clobbers AF, BC, DE and HL; preserves IX/IY.
 ; Out: A=EL3_OK/CF=0 or explicit error/CF=1.
 LOOPBACK_ENABLE
+	IFNDEF STAGE12_LAYOUT
 	PUSH	IX,IY
 	LD	A,1
 	CALL	LOOPBACK_SET
 	POP	IY,IX
 	RET
+	ENDIF
 
 LOOPBACK_DISABLE
 	PUSH	IX,IY

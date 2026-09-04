@@ -22,6 +22,7 @@ CLEAR
 	LD	(S9_TFTP_FILE_HANDLE),A
 	RET
 
+	IFNDEF STAGE12_LAYOUT	; WGET uses S11APP.ALLOCATE_FRESH, which maps WIN2
 ALLOCATE
 	PUSH	IX,IY
 	LD	B,1
@@ -44,6 +45,7 @@ ALLOCATE
 	SCF
 	POP	IY,IX
 	RET
+	ENDIF
 
 INIT_DRIVER
 	LD	HL,NETDRV_CONFIG
@@ -69,6 +71,7 @@ WAIT_TICK
 
 ; CLEANUP closes a TFTP file first, then NETDRV and the DSS page. In A is the
 ; primary status; a later cleanup error is used only when the primary is zero.
+	IFNDEF STAGE12_LAYOUT
 CLEANUP
 	PUSH	IX,IY
 	LD	(NETDRV_FAIL_CODE),A
@@ -124,6 +127,7 @@ CLEANUP
 	XOR	A
 	POP	IY,IX
 	RET
+	ENDIF
 
 ; LOAD_ACTIVE_CONFIG reads only the public NET_* environment. All parsing is
 ; bounded and no card/ISA access occurs here.

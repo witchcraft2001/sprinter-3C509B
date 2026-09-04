@@ -9,7 +9,9 @@
 
 	MODULE S11APP
 
-; SAVE_COMMAND runs before WIN1 remapping and preserves the complete DSS record.
+; SAVE_COMMAND runs before the page is claimed and preserves the complete DSS
+; record. The destination is outside the window about to be remapped, so the
+; record survives wherever DSS chose to put the original.
 SAVE_COMMAND
 	PUSH	IY
 	PUSH	IX
@@ -25,6 +27,9 @@ SAVE_COMMAND
 	RET
 
 ; ALLOCATE_FRESH maps one page, then copies the saved command into that page.
+; Stage 12's image occupies WIN1, so it claims WIN2; every other caller is the
+; other way round. The caller must not print before this returns: the entry
+; stack is still in the image window, which BIOS WIN_MOVE remaps on a scroll.
 ALLOCATE_FRESH
 	PUSH	IY
 	LD	B,1
@@ -34,7 +39,11 @@ ALLOCATE_FRESH
 	LD	E,A
 	PUSH	DE
 	LD	B,0
+	IFDEF STAGE12_LAYOUT
+	LD	C,DSS_SETWIN2
+	ELSE
 	LD	C,DSS_SETWIN1
+	ENDIF
 	RST	DSS
 	POP	DE
 	JP	C,.SET_FAIL

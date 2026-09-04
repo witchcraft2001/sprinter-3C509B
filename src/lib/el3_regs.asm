@@ -105,6 +105,7 @@ WAIT_QUANTUM
 	JR	NZ,.LOOP
 	RET
 
+	IFNDEF STAGE12_LAYOUT
 ; LINK_STATE
 ; Out: A=0 when the TPO link beat is absent, A=1 when present, CF=0;
 ;      explicit register error with CF=1 otherwise.
@@ -208,6 +209,7 @@ WAIT_LINK_UP
 .WAIT_LINK_RETURN
 	POP	IY,IX
 	RET
+	ENDIF
 
 ; SELECT_WINDOW
 ; In: A=window 0..6. Out: explicit status. Preserve IX and IY.
@@ -231,12 +233,14 @@ SELECT_WINDOW
 ; RESET_GLOBAL / RESET_RX / RESET_TX
 ; Issue the documented reset and wait for finite CIP completion.
 ; Preserve IX and IY; increment the software reset counter per command.
+	IFNDEF STAGE12_LAYOUT	; no caller anywhere; WGET cannot spare the bytes
 RESET_GLOBAL
 	PUSH	IX,IY
 	LD	HL,EL3_CMD_GLOBAL_RESET
 	CALL	RESET_COMMAND
 	POP	IY,IX
 	RET
+	ENDIF
 
 RESET_RX
 	PUSH	IX,IY
@@ -566,6 +570,7 @@ CLEAR_VERIFY_DIAGNOSTICS
 	LD	(EL3_VERIFY_ACTUAL),HL
 	RET
 
+	IFNDEF STAGE12_LAYOUT
 ; SNAPSHOT
 ; In: HL=60-byte destination. Out: explicit status. Preserve IX and IY.
 SNAPSHOT
@@ -774,6 +779,7 @@ SNAP_RESTORE_DIAGNOSTICS
 	LD	HL,(SNAP_LAST_STATUS)
 	LD	(EL3_LAST_STATUS),HL
 	RET
+	ENDIF
 
 CMD_SYNC
 	CALL	CMD
@@ -788,15 +794,19 @@ INC_WORD
 	RET
 
 INIT_ACTIVE		DB 0
+	IFNDEF STAGE12_LAYOUT
 SNAP_POINTER		DW 0
 SNAP_LAST_COMMAND	DW 0
 SNAP_LAST_STATUS	DW 0
 SNAP_WINDOW		DB 0xFF
 SNAP_ERROR		DB 0
+	ENDIF
+	IFNDEF STAGE12_LAYOUT
 LINK_RESULT		DB 0
 LINK_ERROR		DB 0
 WAIT_LINK_LIMIT		DW 0
 WAIT_LINK_ELAPSED	DW 0
+	ENDIF
 
 	ENDMODULE
 	ENDIF

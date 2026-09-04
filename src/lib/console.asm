@@ -161,6 +161,7 @@ FORMAT_DEC16
 	LD	(IY+0),A
 	RET
 
+	IFNDEF STAGE12_LAYOUT
 ; MAC: HL -> six bytes in network order. Preserves all registers.
 MAC
 	PUSH	AF,BC,DE,HL,IX,IY
@@ -177,6 +178,7 @@ MAC
 .DONE
 	POP	IY,IX,HL,DE,BC,AF
 	RET
+	ENDIF
 
 CRLF	DB 13,10,0
 CONSOLE_DEC_BUFFER DS 6,0

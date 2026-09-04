@@ -84,13 +84,13 @@ die "common quarter-hour timezone parser is incomplete\n"
 
 my $memory = slurp('src/include/memory.inc', 0);
 die "Stage 10 mapped-page layout/assertions are incomplete\n"
-    unless $memory =~ /STAGE9_TX_BUFFER\s+EQU\s+0x4000/
-        && $memory =~ /STAGE9_RX_BUFFER\s+EQU\s+0x4800/
-        && $memory =~ /STAGE9_FILE_BUFFER\s+EQU\s+0x5000/
-        && $memory =~ /STAGE9_SCRATCH\s+EQU\s+0x7800/
-        && $memory =~ /S10_PAGE_COMMAND_BUFFER\s+EQU\s+0x7E00/
+    unless $memory =~ /STAGE9_TX_BUFFER\s+EQU\s+PAGE_BASE \+ 0x0000/
+        && $memory =~ /STAGE9_RX_BUFFER\s+EQU\s+PAGE_BASE \+ 0x0800/
+        && $memory =~ /STAGE9_FILE_BUFFER\s+EQU\s+PAGE_BASE \+ 0x1000/
+        && $memory =~ /STAGE9_SCRATCH\s+EQU\s+PAGE_BASE \+ 0x3800/
+        && $memory =~ /S10_PAGE_COMMAND_BUFFER EQU PAGE_BASE \+ 0x3E00/
         && $memory =~ /S10_STACK_TOP\s+EQU\s+0xBEF0/
-        && $memory =~ /S10_BOOTSTRAP_STACK_RESERVE\s+EQU\s+0x0010/
+        && $memory =~ /S10_BOOTSTRAP_STACK_RESERVE EQU 0x0010/
         && $memory =~ /ASSERT\s+STAGE9_MAX_FRAME\s+<=\s+1514/
         && $memory =~ /ASSERT\s+STAGE9_SCRATCH\s*\+\s*STAGE9_SCRATCH_CAPACITY\s*<=\s*S10_PAGE_COMMAND_BUFFER/;
 

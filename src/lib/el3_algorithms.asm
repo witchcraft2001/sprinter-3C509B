@@ -10,6 +10,7 @@
 
 	MODULE EL3ALG
 
+	IFNDEF STAGE12_LAYOUT	; WGET maps its own statuses, and needs the bytes
 ; TO_DSS_EXIT maps a detailed EL3 status to the common DSS process-exit ABI.
 ; In: A=detailed EL3 status. Out: B=1 arguments, 2 hardware, 3 timeout/network,
 ; or 5 local DSS/memory. Clobbers AF and B; preserves DE, HL, IX and IY.
@@ -46,6 +47,7 @@ TO_DSS_EXIT
 .EXIT_LOCAL
 	LD	B,DSS_EXIT_LOCAL
 	RET
+	ENDIF
 
 ; LFSR_NEXT
 ; In: A = current activation byte. Out: A = next byte.

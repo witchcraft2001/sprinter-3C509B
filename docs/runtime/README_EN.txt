@@ -16,6 +16,7 @@ Available DSS commands:
   PING target          Send bounded ICMP Echo Requests.
   TFTP host GET file   Download a file in TFTP octet mode.
   TFTP host PUT file   Upload a file in TFTP octet mode.
+  WGET http://host/file [-o name] [-y|-f] [-r] [-d]
   ARP [-v] target      Bounded ARP diagnostic (developer image only).
   PINGALT target       Independent polling diagnostic (developer IMG only).
   UDPTEST target port  UDP echo/generator diagnostic (developer IMG only).
@@ -26,7 +27,7 @@ ISAPROBE reads ISA bytes only when slot, base, and count are all explicit:
   ISAPROBE -s 1 -b #0300 -n #0010
 
 Copy NETSMPL.CFG to NET.CFG beside NETCFG.EXE and edit it before NETCFG -i.
-NETCFG.TXT, IFUP.TXT, NSLOOKUP.TXT, NTP.TXT, PING.TXT, TFTP.TXT,
+NETCFG.TXT, IFUP.TXT, NSLOOKUP.TXT, NTP.TXT, PING.TXT, TFTP.TXT, WGET.TXT,
 USAGE.TXT, and HOWTO.TXT describe the network setup.
 LICENSE.TXT contains the license.
 
@@ -38,3 +39,8 @@ IFUP supports static setup, DHCP acquire, renewal, and release. PING, UDPTEST,
 and TFTP accept dotted IPv4 addresses or DNS names. NTP validates NET_TZ in
 quarter-hour increments before setting the clock. A failed TFTP GET closes and
 retains its partial file.
+
+WGET downloads plain HTTP/1.0 URLs. It follows up to five redirects, writes in
+8 KiB blocks and retains partial data after timeout or cancellation. Use -r
+to resume only when the server supports Range/206; -d changes progress to
+dots but keeps the final time and speed summary.

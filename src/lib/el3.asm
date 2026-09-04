@@ -257,6 +257,7 @@ ID_READ_WORD
 	SCF
 	JR	.RETURN
 
+	IFNDEF STAGE12_LAYOUT	; unused by WGET
 ; WINDOW_EEPROM_READ
 ; In: A=address 00..3F. Out: HL=word. READ opcode only; no write/erase API.
 ; Busy is checked before and after READ with finite CYCLES21 timing.
@@ -287,6 +288,7 @@ WINDOW_EEPROM_READ
 	LD	A,EL3_ERR_PARAMETER
 	SCF
 	JR	.RETURN
+	ENDIF
 
 ; WAIT_EEPROM_READY
 ; Polls EBY with ISA closed and one CYCLES21 quantum between reads.

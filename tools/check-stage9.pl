@@ -72,13 +72,13 @@ die "Stage 9 cleanup order is not file, NETDRV, DSS page\n"
 
 my $memory = slurp('src/include/memory.inc', 0);
 die "Stage 9 one-page layout/assertions are incomplete\n"
-    unless $memory =~ /STAGE9_TX_BUFFER\s+EQU\s+0x4000/
-        && $memory =~ /STAGE9_RX_BUFFER\s+EQU\s+0x4800/
-        && $memory =~ /STAGE9_FILE_BUFFER\s+EQU\s+0x5000/
+    unless $memory =~ /STAGE9_TX_BUFFER\s+EQU\s+PAGE_BASE \+ 0x0000/
+        && $memory =~ /STAGE9_RX_BUFFER\s+EQU\s+PAGE_BASE \+ 0x0800/
+        && $memory =~ /STAGE9_FILE_BUFFER\s+EQU\s+PAGE_BASE \+ 0x1000/
         && $memory =~ /STAGE9_FILE_CAPACITY\s+EQU\s+0x2000/
         && $memory =~ /STAGE9_MAX_FRAME\s+EQU\s+14\s*\+\s*20\s*\+\s*8\s*\+\s*1472/
         && $memory =~ /ASSERT\s+STAGE9_MAX_FRAME\s+<=\s+1514/
-        && $memory =~ /STAGE9_SCRATCH\s*\+\s*STAGE9_SCRATCH_CAPACITY\s*<=\s*0x8000/;
+        && $memory =~ /STAGE9_SCRATCH\s*\+\s*STAGE9_SCRATCH_CAPACITY\s*<=\s*PAGE_BASE \+ 0x4000/;
 
 for my $entry ([UDPTEST => 0xBEE0], [TFTP => 0xBEE0]) {
     my ($name, $limit) = @$entry;

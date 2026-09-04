@@ -21,14 +21,23 @@ OPEN
 	LD	A,(IS_OPEN)
 	OR	A
 	JR	NZ,.STATE_ERROR
+	; Sample IFF2 before DI clears it. A maskable interrupt accepted
+	; during LD A,I clears P/V regardless of IFF2 (documented Z80
+	; erratum); that interrupt has already been serviced and its handler
+	; returns with interrupts enabled, so a second read observes IFF2
+	; correctly. Sampling once would record "was disabled" and CLOSE
+	; would then skip its EI, leaving DSS without timer and keyboard for
+	; the rest of the run.
 	LD	A,I
-	DI
-	JP	PO,.IFF_OFF
-	LD	A,1
-	JR	.IFF_SAVED
-.IFF_OFF
+	JP	PE,.IFF_ON
+	LD	A,I
+	JP	PE,.IFF_ON
 	XOR	A
+	JR	.IFF_SAVED
+.IFF_ON
+	LD	A,1
 .IFF_SAVED
+	DI
 	LD	(IFF_WAS_ENABLED),A
 	LD	BC,PAGE3
 	IN	A,(C)
@@ -100,6 +109,7 @@ MAP_POINTER
 	LD	L,C
 	RET
 
+	IFNDEF STAGE12_LAYOUT	; EL3IO uses its own burst path; WGET needs the bytes
 ; READ8
 ; In: A = slot, BC = port. Out: A = byte, CF=0; explicit status on failure.
 ; Preserves BC, DE, HL, IX and IY.
@@ -114,6 +124,7 @@ READ8
 	LD	A,(READ_VALUE)
 	OR	A
 	RET
+	ENDIF
 
 ; WRITE8
 ; In: D = slot, BC = port, A = byte. Out: status in A/CF.

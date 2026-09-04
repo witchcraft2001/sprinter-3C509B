@@ -525,6 +525,7 @@ ABORT
 	POP	IY,IX
 	RET
 
+	IFNDEF STAGE12_LAYOUT	; WGET reports through its own diagnostics
 ; STATUS: In A=channel. Out A=TCP_STATE_*, B=last status, CF clear.
 ; Invalid channel returns NETDRV_ERR_PARAMETER/CF set. Clobbers AF/B/HL;
 ; preserves C/DE/IX/IY.
@@ -538,6 +539,7 @@ STATUS
 .STATUS_RETURN
 	POP	IY,IX
 	RET
+	ENDIF
 
 SELECT_CONTEXT
 	CP	2

@@ -58,11 +58,13 @@ for my $file (qw(src/lib/netdrv.asm src/lib/arp.asm src/lib/dhcp.asm
 }
 
 my $memory = slurp('src/include/memory.inc', 0);
-die "Stage 7 buffers are not the private WIN1 #4000/#4800 layout\n"
-    unless $memory =~ /STAGE7_TX_BUFFER\s+EQU\s+0x4000/
-        && $memory =~ /STAGE7_RX_BUFFER\s+EQU\s+0x4800/
+# PAGE_BASE is the window the private page is mapped over: 0x4000 for every
+# utility whose image is in WIN2, 0x8000 for a WIN1-resident image (Stage 12).
+die "Stage 7 buffers are not the private #0000/#0800 page layout\n"
+    unless $memory =~ /STAGE7_TX_BUFFER\s+EQU\s+PAGE_BASE \+ 0x0000/
+        && $memory =~ /STAGE7_RX_BUFFER\s+EQU\s+PAGE_BASE \+ 0x0800/
         && $memory =~ /ASSERT\s+STAGE7_TX_BUFFER\s*\+\s*STAGE7_TX_CAPACITY\s*<=\s*STAGE7_RX_BUFFER/
-        && $memory =~ /ASSERT\s+STAGE7_RX_BUFFER\s*\+\s*STAGE7_RX_CAPACITY\s*<=\s*0x8000/;
+        && $memory =~ /ASSERT\s+STAGE7_RX_BUFFER\s*\+\s*STAGE7_RX_CAPACITY\s*<=\s*PAGE_BASE \+ 0x4000/;
 
 my $dhcp = slurp('src/lib/dhcp.asm', 0);
 my $ifup = slurp('src/apps/ifup.asm', 0);

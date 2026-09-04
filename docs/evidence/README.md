@@ -1,5 +1,34 @@
 # Verification evidence
 
+## Stage 12: local WGET regressions
+
+Date: 2026-09-03. The sibling-facing golden console fixture is pinned to
+`sprinter-rtl8019a@9ec98b00c6490fed5eb722c52b47d11c70a199ae`; comparison
+normalizes only the backend banner and the hardware-specific `REGS` line.
+
+The full `make test-host package image` run passed 53 actual `WGET.EXE`
+scenarios and four raw responder tests. Coverage includes help/invalid URL,
+arbitrary option order, prompt O/R/C, dot/counter progress, zero/small/>64 KiB,
+TCP header/body boundaries, Content-Length and close-delimited bodies, five
+redirects, 404/500, DSS `MOVE_FP` resume with 206 gating, Range ignored, 8 KiB
+writes, disk full and close failure, premature FIN, DNS/TCP timeout, UDP
+length/checksum rejection, trailing-dot/CNAME/large DNS replies, redirect-safe
+output cleanup, port overflow, Esc/Ctrl+C, B/s and KB/s summaries, midnight
+wrap, byte hashes, cleanup and stack/layout guards.
+
+- IMG: `96830030e236979eb4f23dd3dddd601dca27907d204e381f87142773e88ffd1e`.
+- ZIP: `abda20485d25f14af207c09a4ff5c2d511e83607f0f8278f629d436dc800afc2`.
+- WGET.EXE: `dc0866f2f8fdea687970e11c8aea66309ee051808aa9b8c1a726b69f99e38593`
+  (16222 bytes; extracted IMG copy is byte-identical).
+- Golden JSON: `662d3bf06f5c1181eb8fbc2f59697da1cbb640fb3423e3cf48fa908c937614ae`.
+- ZERO.BIN: `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`.
+- SMALL.BIN: `62de44205d5a14ca883460f18f19cb6e0968279a7967ad4ef432193629a5fda0`.
+- LARGE/RANGE.BIN: `7caed97a4d7f1e7e7be8767bc9437e6c77122bc9306517ff2f672e6de941f315`.
+
+This is local automated evidence only. The Stage 12 MAME and physical-card
+gates remain open. Use [STAGE12_TEST_TEMPLATE.md](STAGE12_TEST_TEMPLATE.md) for
+the single-session screenshots, responder log, pcap and extracted-file hashes.
+
 ## Stage 11: local TCP regressions
 
 Date: 2026-09-03. A full `make test-host package image` run passed the

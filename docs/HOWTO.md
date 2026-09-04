@@ -24,5 +24,10 @@ name. GET asks before replacing an existing local file; `-y` or `-f` permits
 replacement without the prompt. Interrupted or failed GET files are retained
 as partial data so they can be inspected.
 
+For plain HTTP, use `WGET http://host/path`. Add `-o name` to choose the local
+file, `-y` or `-f` to overwrite without prompting, `-r` to resume through a
+Range/206 exchange, or `-d` for dot progress. HTTPS redirects are rejected.
+Timeout and cancellation retain the partial file for a later resume.
+
 If a timeout or unexpected status occurs, stop. The program closes the ISA
 window, releases its DSS page, prints `RESULT FAIL`, and returns control to DSS.
