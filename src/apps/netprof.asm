@@ -17,7 +17,7 @@
 
 EXE_VERSION	EQU 1
 	DEFINE RUNTIME_BASE 0x7000
-	DEFINE EL3_ATTACH_PROBE		; enables -n; see el3.asm DISCOVER
+	DEFINE EL3_ATTACH_PROBE		; enables -r; see el3.asm DISCOVER
 	DEFINE STAGE9_LAYOUT
 	DEFINE STAGE10_PAGE_LAYOUT
 	DEFINE STAGE10_DNS
@@ -50,7 +50,7 @@ START
 	JP	C,BOOT_FAIL
 	LD	SP,S10_RUNTIME_STACK_TOP
 	LD	(CMDLINE_SOURCE),IX
-	CALL	SCAN_NO_RESET
+	CALL	SCAN_FORCE_RESET
 	CALL	@ARP.CLEAR_CACHE
 	LD	HL,MSG_BANNER
 	CALL	@CONSOLE.LINE
@@ -86,12 +86,19 @@ START
 	CALL	@CONSOLE.DEC8
 	LD	HL,@CONSOLE.CRLF
 	CALL	@CONSOLE.STRING
-	LD	A,(@EL3.SKIP_GLOBAL_RESET)
+	; Which DISCOVER pass answered. FAST means the adapter was still alive
+	; from the previous program and its link was never dropped; RESET means
+	; it had to be reset, and the seconds P5 reports are the switch port
+	; coming back afterwards.
+	LD	HL,MSG_ATTACH
+	CALL	@CONSOLE.STRING
+	LD	A,(@EL3.ATTACH_RESET)
 	OR	A
-	JR	Z,.RESET_DONE
-	LD	HL,MSG_NORESET
+	LD	HL,MSG_ATTACH_FAST
+	JR	Z,.ATTACH_NAMED
+	LD	HL,MSG_ATTACH_RESET
+.ATTACH_NAMED
 	CALL	@CONSOLE.LINE
-.RESET_DONE
 
 	CALL	@S9APP.INIT_DRIVER
 	JP	C,HARDWARE_FAIL
@@ -243,11 +250,13 @@ TIME_ARP
 	LD	HL,@CONSOLE.CRLF
 	JP	@CONSOLE.STRING
 
-; SCAN_NO_RESET looks for -n before anything touches the adapter. It has to
-; run this early because the reset it suppresses is the very first thing
-; DISCOVER does. Anywhere on the line, either case; PARSE_TARGET skips the
-; flag token so an address can follow it.
-SCAN_NO_RESET
+; SCAN_FORCE_RESET looks for -r before anything touches the adapter, because
+; the pass it selects is the very first thing DISCOVER does. DISCOVER attaches
+; to a live adapter and resets only one that will not answer; -r makes it reset
+; first, which is what every program used to do, so the two costs can be put on
+; the screen one under the other. Anywhere on the line, either case;
+; PARSE_TARGET skips the flag token so an address can follow it.
+SCAN_FORCE_RESET
 	LD	HL,(CMDLINE_SOURCE)
 	LD	A,(HL)
 	CP	2			; a two-character flag needs two characters
@@ -261,11 +270,11 @@ SCAN_NO_RESET
 	CP	'-'
 	JR	NZ,.NEXT
 	LD	A,(HL)
-	AND	0xDF			; fold case: -n and -N
-	CP	'N'
+	AND	0xDF			; fold case: -r and -R
+	CP	'R'
 	JR	NZ,.NEXT
-	LD	A,1
-	LD	(@EL3.SKIP_GLOBAL_RESET),A
+	LD	A,EL3_ID_GLOBAL_RESET	; see EL3.ATTACH_RESET for the encoding
+	LD	(@EL3.FORCE_RESET),A
 	RET
 .NEXT
 	DJNZ	.SCAN
@@ -441,7 +450,9 @@ MSG_P5		DB "[P5] ARP=",0
 MSG_P6		DB "[P6] ARP2=",0
 MSG_P7		DB "[P7] TICKS/SEC=",0
 MSG_P8		DB "[P8] 10K TICKS=",0
-MSG_NORESET	DB "[P2] GLOBAL RESET=SKIPPED",0
+MSG_ATTACH	DB "[P2] ATTACH=",0
+MSG_ATTACH_FAST	DB "FAST",0
+MSG_ATTACH_RESET DB "RESET",0
 MSG_SECONDS	DB "s",0
 MSG_SLOT	DB "[P2] EEPROM SLOT=",0
 MSG_TARGET	DB "[P5] TARGET=",0

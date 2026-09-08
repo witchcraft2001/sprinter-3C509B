@@ -139,17 +139,17 @@ const profilerEnv = {
   NET_DNS1: '192.168.7.1', NET_DNS2: '192.168.7.2',
 };
 
-// -n suppresses the ID-port global reset, the diagnostic that asks whether the
-// pause in front of every utility's first frame is our own link bounce. The
-// card must still be discovered, activated and driven without it, and the
-// address after the flag must still be the target rather than the gateway.
+// -r forces the ID-port global reset DISCOVER now uses only as recovery: the
+// diagnostic that puts the cost of a reset next to the cost of attaching to a
+// live adapter. Both passes must discover, activate and drive the same card,
+// and an address after the flag must still be the target, not the gateway.
 {
-  const result = runExe(profiler, '-n 192.168.7.44', {
+  const result = runExe(profiler, '-r 192.168.7.44', {
     strictPc: true, stepLimit: 900_000_000, clockFreezeAfterReads: 0,
     arp: {mac: [2, 0, 0, 0, 0, 44]}, environment: profilerEnv,
   });
   assert.strictEqual(result.exitCode, 0, result.output);
-  assert.match(result.output, /^\[P2\] GLOBAL RESET=SKIPPED$/m, result.output);
+  assert.match(result.output, /^\[P2\] ATTACH=RESET$/m, result.output);
   assert.match(result.output, /^\[P5\] TARGET=192\.168\.7\.44$/m, result.output);
   assert.match(result.output, /^\[P5\] ARP=\d+s TRY=1$/m, result.output);
   assert.match(result.output, /RESULT OK/);
@@ -163,8 +163,8 @@ const profilerEnv = {
     arp: {mac: [2, 0, 0, 0, 0, 44]}, environment: profilerEnv,
   });
   assert.strictEqual(result.exitCode, 0, result.output);
-  assert.doesNotMatch(result.output, /GLOBAL RESET=SKIPPED/,
-    'the reset is suppressed only by -n');
+  assert.match(result.output, /^\[P2\] ATTACH=FAST$/m,
+    'a card that answers must be attached to, not reset');
   for (const stage of [/^\[P1\] CONFIG=\d+s$/m, /^\[P2\] DISCOVER=\d+s$/m,
     /^\[P2\] EEPROM SLOT=1$/m, /^\[P3\] DRIVER=\d+s$/m, /^\[P4\] LINK=\d+s$/m,
     /^\[P4\] LINK QUANTA=\d+$/m, /^\[P5\] TARGET=192\.168\.7\.44$/m,

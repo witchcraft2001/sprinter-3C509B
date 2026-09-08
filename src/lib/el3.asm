@@ -39,41 +39,67 @@ CONFIGURE
 	RET
 
 ; DISCOVER
-; Performs classic reset, reads all 64 EEPROM words through the ID port,
-; and validates IDs, MAC, and checksums. It never activates or writes EEPROM.
-; Out: EL3_OK/CF=0 or explicit error/CF=1. Preserves IX and IY.
+; Reads all 64 EEPROM words through the ID port and validates IDs, MAC and
+; checksums. It never activates or writes EEPROM.
+;
+; It attaches to a live adapter first and only resets one that will not answer.
+; The ID-port global reset turns the adapter off and on again, and with it the
+; 10baseT transceiver: the link drops, and the switch port then needs seconds
+; before it forwards a frame again. Doing that at every program start is what
+; put a multi-second pause in front of the first frame every utility sends --
+; NETPROF on a real Sprinter resolves its first target in 2..6 s after a reset
+; and in 0 s without one, and a resident packet driver of the kind the sibling
+; kits load does not pay it because it comes up once per boot rather than once
+; per program.
+;
+; The reset stays as what it always was, a recovery: an adapter that does not
+; produce a valid EEPROM image gets one and is tried again. Nothing else is
+; lost by attaching, because EL3.INIT disables RX and TX, resets both FIFOs,
+; clears the loopback bit and rewrites the station address regardless of which
+; pass got here, so a fast attach still starts from a known datapath.
+;
+; Out: EL3_OK/CF=0 or explicit error/CF=1. ATTACH_RESET records which pass
+; answered. Preserves IX and IY.
 DISCOVER
 	PUSH	IX,IY
 	LD	HL,0
 	LD	(EL3_LAST_TICKS),HL
+	XOR	A
+	IFDEF EL3_ATTACH_PROBE
+	LD	A,(FORCE_RESET)		; NETPROF -r: start at the reset pass, so
+	ENDIF				; the two costs can be measured side by side
+	LD	(ATTACH_RESET),A
+	CALL	.PASS
+	JR	NC,.RETURN
+	; BIT reads the flag without touching A or the carry, so the first
+	; pass's status and its failure both survive the decision to retry.
+	LD	HL,ATTACH_RESET
+	BIT	7,(HL)
+	JR	NZ,.RETURN		; the reset pass has already run
+	LD	(HL),EL3_ID_GLOBAL_RESET
+	CALL	.PASS
+.RETURN
+	POP	IY,IX
+	RET
+
+; One discovery pass. Out: EL3_OK/CF=0 or error/CF=1; clobbers AF/BC/DE/HL.
+.PASS
 	LD	A,EL3_STAGE_RESET
 	LD	(EL3_LAST_STAGE),A
 	CALL	ID_SEQUENCE
-	JR	C,.RETURN
-	IFDEF EL3_ATTACH_PROBE
-	; NETPROF -n. The global reset turns the adapter, and with it the
-	; 10baseT transceiver, off and on again at every program start; the
-	; switch port then needs seconds before it forwards, which is what puts
-	; a pause in front of the first frame every utility sends. Skipping it
-	; asks whether that is really the cause. Diagnostic only: without the
-	; reset there is no recovery from an adapter left in a bad state, so no
-	; shipping application defines EL3_ATTACH_PROBE.
-	LD	A,(SKIP_GLOBAL_RESET)
+	RET	C
+	LD	A,(ATTACH_RESET)	; the command to issue, or zero to attach
 	OR	A
-	JR	NZ,.TAG
-	ENDIF
-	LD	A,EL3_ID_GLOBAL_RESET
+	JR	Z,.TAG
 	CALL	ID_WRITE
-	JR	C,.RETURN
+	RET	C
 	CALL	WAIT_ONE_QUANTUM
 	CALL	ID_SEQUENCE
-	JR	C,.RETURN
-	IFDEF EL3_ATTACH_PROBE
+	RET	C
 .TAG
-	ENDIF
 	LD	A,EL3_ID_TAG_ZERO
 	CALL	ID_WRITE
-	JR	C,.RETURN
+	RET	C
 	LD	A,EL3_STAGE_EEPROM
 	LD	(EL3_LAST_STAGE),A
 	LD	HL,EEPROM_BUFFER
@@ -93,14 +119,11 @@ DISCOVER
 	JR	NZ,.EEPROM_LOOP
 	LD	A,EL3_STAGE_VALIDATE
 	LD	(EL3_LAST_STAGE),A
-	CALL	@EL3ALG.VALIDATE
-	JR	.RETURN
+	JP	@EL3ALG.VALIDATE
 .READ_FAILED
-	POP	HL
-	INC	SP
-	INC	SP
-.RETURN
-	POP	IY,IX
+	POP	HL			; discard the saved word index; POP and
+	INC	SP			; INC SP leave ID_READ_WORD's status and
+	INC	SP			; carry untouched
 	RET
 
 ; ACTIVATE
@@ -353,8 +376,13 @@ WAIT_ONE_QUANTUM
 SLOT			DB ISA_SLOT_1
 CURRENT_EEPROM_ADDRESS	DB 0
 ID_COMMAND		DB 0
+; Zero while attaching to a live adapter, EL3_ID_GLOBAL_RESET on the recovery
+; pass: DISCOVER writes it straight to the ID port and reads back which pass
+; answered. Its top bit is the "has already reset" test, so any value stored
+; here must keep bit 7 set.
+ATTACH_RESET		DB 0
 	IFDEF EL3_ATTACH_PROBE
-SKIP_GLOBAL_RESET	DB 0	; set by NETPROF -n; see DISCOVER
+FORCE_RESET		DB 0	; same encoding; set by NETPROF -r
 	ENDIF
 
 	ENDMODULE

@@ -429,7 +429,13 @@ S10_BOOTSTRAP_STACK	EQU S10_STACK_TOP
 ; slack the loader and one interrupt frame need under S10_STACK_TOP.
 S10_BOOTSTRAP_STACK_RESERVE EQU 0x0010
 	ELSE
-S10_BOOTSTRAP_STACK_RESERVE EQU 0x0010
+; DSS installs the header stack before the entry point runs and executes the
+; loader and the interrupt handlers on it, so an image ending just under it
+; gets its last routine overwritten -- silently, and only where that routine is
+; reached. This is the same 64-byte gap the EXE harness enforces at load time;
+; keeping the two equal makes the assembler, not a test run, the thing that
+; catches an image growing into its own stack.
+S10_BOOTSTRAP_STACK_RESERVE EQU 0x0040
 	ENDIF
 ; Neither variant may put the runtime stack in WIN1: BIOS WIN_MOVE maps the
 ; video page over WIN1 on every scrolled console line and restores SLOT1 from a
