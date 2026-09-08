@@ -32,6 +32,50 @@ TEST_START
 	SBC	HL,DE
 	JP	NZ,FAIL_1
 
+	; Even length whose carry must wrap end-around: FF FF 00 02 sums to
+	; 0002h, so the complement is FFFDh.
+	LD	HL,CARRY_BYTES
+	LD	BC,4
+	CALL	@ETHERNET.CHECKSUM
+	LD	DE,0xFFFD
+	OR	A
+	SBC	HL,DE
+	JP	NZ,FAIL_7
+
+	; Saturation: FFFFh + FFFFh must fold to a zero checksum, not FFFFh.
+	LD	HL,ONES_BYTES
+	LD	BC,4
+	CALL	@ETHERNET.CHECKSUM
+	LD	A,H
+	OR	L
+	JP	NZ,FAIL_8
+
+	; 600 bytes of 01h is 300 words of 0101h = 12D2Ch, folding to 2D2Dh and
+	; complementing to D2D2h. Past 256 words this is the only case that
+	; reaches ACCUMULATE's outer pass.
+	LD	HL,WORK
+	LD	DE,WORK+1
+	LD	BC,600
+	LD	(HL),1
+	LDIR
+	LD	HL,WORK
+	LD	BC,600
+	CALL	@ETHERNET.CHECKSUM
+	LD	DE,0xD2D2
+	OR	A
+	SBC	HL,DE
+	JP	NZ,FAIL_9
+
+	; The same buffer at an odd length pads the trailing byte as a high
+	; half: 2D2Dh + 0100h = 2E2Dh, complement D1D2h.
+	LD	HL,WORK
+	LD	BC,601
+	CALL	@ETHERNET.CHECKSUM
+	LD	DE,0xD1D2
+	OR	A
+	SBC	HL,DE
+	JP	NZ,FAIL_10
+
 	LD	HL,LOCAL_IP
 	LD	DE,NET_LOCAL_IP
 	LD	BC,4
@@ -274,11 +318,21 @@ FAIL_4:	LD A,4
 FAIL_5:	LD A,5
 	JR FAIL
 FAIL_6:	LD A,6
+	JR FAIL
+FAIL_7:	LD A,7
+	JR FAIL
+FAIL_8:	LD A,8
+	JR FAIL
+FAIL_9:	LD A,9
+	JR FAIL
+FAIL_10: LD A,10
 FAIL:	LD (TEST_RESULT),A
 TEST_DONE
 	NOP
 
 CHECKSUM_TEXT	DB "123456789"
+CARRY_BYTES	DB 0xFF,0xFF,0x00,0x02
+ONES_BYTES	DB 0xFF,0xFF,0xFF,0xFF
 LOCAL_IP	DB 192,168,7,2
 MASK		DB 255,255,255,0
 MASK32		DB 255,255,255,255

@@ -9,6 +9,30 @@ TCP_HEADER_LENGTH	EQU 20
 TCP_SYN_HEADER_LENGTH	EQU 24
 TCP_MSS			EQU 536
 
+; Receive window advertised while a channel is not backpressured: a whole
+; multiple of TCP_MSS, since a non-multiple stalls the pipe on every window
+; exhaustion (observed on the sibling RTL8019A kit's TCP stack). Every
+; accepted segment is still ACKed immediately (no delayed/coalesced ACK: an
+; attempt at one had to be backed out, see tcp_transport.asm's ACK_IF_DATA);
+; the win here is letting the peer keep more than one segment in flight
+; instead of stopping and waiting for each one's ACK.
+; TCP_RECV_SEGMENTS is capped by S11_PENDING_CAPACITY (memory.inc), which must
+; hold a whole TCP_RECV_WINDOW so a burst can be appended, not just one MSS.
+; STAGE12_LAYOUT is the key for that page space: WGET and DLSPEED reserve it
+; for their single channel, FTP (which also defines it) for both of its.
+;
+; Five is also what the sibling kit settled on, and the ceiling is the card
+; rather than the page: whatever we advertise may arrive while the application
+; is busy elsewhere -- flushing its disk buffer, say -- and until READ_FRAME
+; runs again it all has to sit in the 3C509B's own RX FIFO. Five segments plus
+; framing is about 3 KiB against a FIFO of several, so a burst still fits.
+	IFDEF STAGE12_LAYOUT
+TCP_RECV_SEGMENTS	EQU 5
+	ELSE
+TCP_RECV_SEGMENTS	EQU 1
+	ENDIF
+TCP_RECV_WINDOW		EQU TCP_RECV_SEGMENTS * TCP_MSS
+
 TCP_FLAG_FIN		EQU 0x01
 TCP_FLAG_SYN		EQU 0x02
 TCP_FLAG_RST		EQU 0x04

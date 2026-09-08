@@ -35,13 +35,13 @@ function normalized(output) {
 }
 function checked(result) {
   assert.deepStrictEqual(result.cleanup, {isaClosed: true, pagesFreed: true, done: true});
-  // The runtime stack grows down from BFF0h in the claimed page; BE00h is the
-  // command copy directly beneath it.
-  assert.ok(result.minimumPageSp === null || result.minimumPageSp >= 0xbf00,
-    `Stage 12 page stack guard crossed: #${result.minimumPageSp.toString(16)}`);
-  // The entry stack must stay clear of the image, which ends just below 7F0Ah.
-  assert.ok(result.minimumSp >= 0x7f40,
-    `Stage 12 entry stack reached the image: #${result.minimumSp.toString(16)}`);
+  // The standard layout claims no page, so there is one stack for the whole
+  // run: it grows down from BFF0h, and BE00h is the command copy directly
+  // beneath it. Crossing that is what would corrupt the parsed command line.
+  assert.strictEqual(result.minimumPageSp, null,
+    'Stage 12 no longer claims a runtime page, so none should be tracked');
+  assert.ok(result.minimumSp >= 0xbf00,
+    `Stage 12 stack reached the command copy: #${result.minimumSp.toString(16)}`);
   cases++;
 }
 function response(status, body = Buffer.alloc(0), headers = {}, closeDelimited = false) {
@@ -59,10 +59,15 @@ assert.strictEqual(image.readUInt16LE(4), 128);
 // cannot host a stack above itself in the window it runs from.
 assert.strictEqual(image.readUInt16LE(16), 0x4100);
 // DSS installs the header stack before the entry point runs, and spends it on
-// the loader and on interrupt frames, so it must be clear of the image already.
-assert.strictEqual(image.readUInt16LE(20), 0x8000);
-assert.ok(0x4080 + image.length + 0xc0 <= 0x8000,
-  'WGET image reaches into its entry stack reserve');
+// the loader and on interrupt frames, so it must be clear of the image
+// already. The standard layout hands the program WIN1+WIN2 as one region, so
+// the stack sits at the top of WIN2 -- a whole window clear of the image.
+assert.strictEqual(image.readUInt16LE(20), 0xbff0);
+// The image holds code and rodata only; PAGE_BASE (0x8000) is where the
+// runtime data area begins, so that is what bounds it. Keep this strict: an
+// image crossing it silently overwrites buffers instead of failing to load.
+assert.ok(0x4080 + image.length <= 0x8000,
+  'WGET image runs into its runtime data area');
 let longest = 0, zeroRun = 0;
 for (const byte of image.subarray(128)) {
   zeroRun = byte ? 0 : zeroRun + 1; longest = Math.max(longest, zeroRun);
@@ -138,7 +143,7 @@ assert.strictEqual(result.exitCode, 0, result.output);
 assert.match(result.httpRequests[0], /Range: bytes=70003-/);
 assert.strictEqual(sha256(outputFile(result, 'resumed.bin')),
   sha256(Buffer.concat([prior, remainder])));
-assert.ok(result.dssEvents.includes('WRITE C:\\NET\\RESUMED.BIN 8192'));
+assert.ok(result.dssEvents.includes('WRITE C:\\NET\\RESUMED.BIN 6144'));
 checked(result);
 
 result = run('http://192.168.7.44/keep.bin -r', scenario({
@@ -232,15 +237,17 @@ result = run('http://192.168.7.44/LARGE.BIN -y', scenario({
 assert.strictEqual(result.exitCode, 0, result.output);
 assert.strictEqual(sha256(outputFile(result, 'large.bin')), sha256(large));
 const writes = result.dssEvents.filter((event) => event.startsWith('WRITE '));
+// The disk buffer is 6 KiB: the two KiB it gave up went to the TCP receive
+// window, which is worth more than larger write batches (memory.inc).
 assert.deepStrictEqual(writes.slice(0, 8).map((event) => Number(event.split(' ').pop())),
-  Array(8).fill(8192));
-assert.strictEqual(Number(writes.at(-1).split(' ').pop()), 4465); checked(result);
+  Array(8).fill(6144));
+assert.strictEqual(Number(writes.at(-1).split(' ').pop()), 2417); checked(result);
 
 result = run('http://192.168.7.44/FULL.BIN -y', scenario({
   response: response('200 OK', Buffer.alloc(9000, 0x5a))},
   {diskFullAfter: 8192, traceDss: true}));
 assert.strictEqual(result.exitCode, 5); assert.match(result.output, /file create\/write failed/);
-assert.strictEqual(outputFile(result, 'full.bin').length, 8192); checked(result);
+assert.strictEqual(outputFile(result, 'full.bin').length, 6144); checked(result);
 
 result = run('http://192.168.7.44/CLOSEERR.BIN -y', scenario({
   response: response('200 OK', 'complete')}, {fileCloseFailAt: 1}));
@@ -303,7 +310,10 @@ checked(result);
 for (const key of ['escape', 'ctrl-c']) {
   result = run('http://192.168.7.44/CANCEL.BIN -y', scenario({
     response: response('200 OK', Buffer.alloc(10000, 0x63)), keepOpen: true},
-    {key, keyAfterHttpBytes: 1000, timeStepSeconds: 1}));
+    // The responder now fills the advertised window in one burst, so the key
+    // has to land after WGET has drained a few segments rather than after the
+    // first one -- otherwise the cancel is seen before any body is buffered.
+    {key, keyAfterHttpBytes: 4000, timeStepSeconds: 1}));
   assert.strictEqual(result.exitCode, 7); assert.match(result.output, /Aborted by user \(Esc\/Ctrl\+C\)\./);
   assert.ok(outputFile(result, 'cancel.bin').length > 0); checked(result);
 }
@@ -317,6 +327,18 @@ result = run('http://192.168.7.44/FAST.BIN -y', scenario({
   response: response('200 OK', Buffer.alloc(70001, 0x21))},
   {clockFreezeAfterReads: undefined, timeStepSeconds: 0.01}));
 assert.match(result.output, /  70001 bytes in [1-9][0-9]* sec, [1-9][0-9]* KB\/s\r\n/);
+// Two things are worth gating on a fixed 70 KiB download. Emulated CPU work is
+// one: the hot loops (ETHERNET.ACCUMULATE, EL3IO.FIFO_READ) brought it from
+// 2664k to 2055k steps, and advertising a real receive window took it to 1706k
+// by removing one redundant ACK per segment.
+assert.ok(result.steps < 1_900_000,
+  `70 KiB download cost ${result.steps} steps, over the 1900k budget`);
+// The other is the depth of the receive pipe, which is what a latency-bound
+// link actually cares about and what CPU steps cannot see. The peer must be
+// able to keep a whole window in flight; a binary or one-MSS window shows up
+// here immediately.
+assert.ok(result.maxInFlight >= 5 * 536,
+  `peer kept only ${result.maxInFlight} bytes in flight, expected a 5-segment window`);
 checked(result);
 
 result = run('http://192.168.7.44/MIDNIGHT.BIN -y', scenario({

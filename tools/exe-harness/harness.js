@@ -443,6 +443,28 @@ class EtherLinkIII {
     this.tcpConnections = new Map();
     this.httpRequests = [];
     this.httpBytesSent = 0;
+    // FTP mode (scenario.ftp): the control connection is a fixed port that
+    // pushes an unsolicited banner on ESTABLISHED and answers a small verb
+    // table; PASV self-announces a data port tracked the same way the TFTP
+    // responder tracks its own TID. Both channels reuse respondTcp's SYN/ACK
+    // and window-filling machinery via the onEstablished/onData/onFinSent
+    // hooks below -- see respondFtp().
+    this.ftpRequests = [];
+    this.ftpUploadChunks = [];
+    this.ftpDataPort = null;
+    this.ftpControlConn = null;
+    this.ftpPendingVerb = null;
+    this.ftpControlOptions = null;
+    this.ftpDataOptions = null;
+    // Destination ports the client RST'd, in order. A channel the client
+    // walks away from without an RST or a FIN simply never appears here,
+    // which is what lets a scenario assert that a failed transfer actually
+    // tore its data connection down instead of leaving it half-open.
+    this.tcpResetPorts = [];
+    // Peak bytes the server has sent but the client has not yet acknowledged:
+    // the depth of the receive pipe, and the one number that says whether an
+    // advertised window is actually keeping segments in flight.
+    this.maxInFlight = 0;
     this.delayed = [];
     this.generated = [];
   }
@@ -644,6 +666,7 @@ class EtherLinkIII {
     if (this.scenario.tcp && tcp &&
         (!this.scenario.tcp.port || tcp.destinationPort === this.scenario.tcp.port))
       this.respondTcp(tcp, this.scenario.tcp);
+    if (this.scenario.ftp && tcp) this.respondFtp(tcp);
     const datagram = udpDatagram(frame);
     const dnsScenario = this.scenario.dns;
     if (dnsScenario && datagram && datagram.destinationPort === 53) {
@@ -741,7 +764,11 @@ class EtherLinkIII {
       this.generated.push(reply);
       if (this.accepts(reply)) this.rxQueue.push({frame: reply, cursor: 0});
     };
-    if (segment.flags & 4) { this.tcpConnections.delete(key); return; }
+    if (segment.flags & 4) {
+      this.tcpResetPorts.push(segment.destinationPort);
+      this.tcpConnections.delete(key);
+      return;
+    }
     if ((options.drop || 0) >= this.tcpRequestCount || options.mode === 'drop') return;
     if (segment.flags & 2) {
       this.tcpSynCount++;
@@ -764,6 +791,11 @@ class EtherLinkIII {
           httpRequest: Buffer.alloc(0), httpReady: false};
         this.tcpConnections.set(key, connection);
       }
+      // Kept fresh on every segment so an out-of-band push (e.g. an FTP data
+      // channel that must send unprompted once a command arrives on a wholly
+      // different connection) can still address a reply without a fresh
+      // triggering frame -- see drainConnectionSendQueue()/respondFtp().
+      connection.lastSegment = segment;
       queue(buildTcpReply(segment, {sequence: connection.serverIsn, acknowledgement: connection.clientNext,
         flags: 0x12, window: connection.advertisedWindow,
         mss: options.mss || 536,
@@ -776,6 +808,13 @@ class EtherLinkIII {
         window: 0, mac: options.mac, ip: options.ip}));
       return;
     }
+    // A connection this respondTcp itself RST'd (options.abortAfterBytes) is
+    // dead: no real peer answers anything further on it, including a client
+    // frame that was already in flight when the RST went out. Without this,
+    // a data burst queued ahead of the abort point kept draining across a
+    // later trigger as if the RST had never happened.
+    if (connection.aborted) return;
+    connection.lastSegment = segment;
     connection.clientWindow = segment.window;
     if (segment.flags & 0x10) {
       const acknowledged = (segment.acknowledgement - connection.serverAcked) >>> 0;
@@ -785,7 +824,12 @@ class EtherLinkIII {
     if (!connection.established && !segment.payload.length && !(segment.flags & 1) &&
         segment.acknowledgement === connection.serverNext) {
       connection.established = true;
-      return;
+      // FTP's control channel pushes an unsolicited "220 ..." banner the
+      // instant the connection comes up, with no request to react to; other
+      // callers never set this, so the early return below is unchanged for
+      // them.
+      if (options.onEstablished) options.onEstablished(connection);
+      if (!connection.sendQueue.length) return;
     }
     if (segment.payload.length && options.zeroWindowProbes &&
         segment.sequence === (connection.clientNext - 1) >>> 0) {
@@ -813,7 +857,12 @@ class EtherLinkIII {
         return;
       }
       connection.clientNext = (connection.clientNext + segment.payload.length) >>> 0;
-      if (options.mode === 'http') {
+      if (options.onData) {
+        // FTP mode owns both directions of the connection itself (command
+        // parsing on control, upload capture on data), so it replaces the
+        // generic http/echo handling below rather than adding to it.
+        options.onData(connection, Buffer.from(segment.payload));
+      } else if (options.mode === 'http') {
         connection.httpRequest = Buffer.concat([connection.httpRequest, Buffer.from(segment.payload)]);
         if (!connection.httpReady && connection.httpRequest.includes(Buffer.from('\r\n\r\n'))) {
           connection.httpReady = true;
@@ -878,27 +927,56 @@ class EtherLinkIII {
       if (!connection.finSent) {
         connection.finSent = true;
         connection.serverNext = (connection.serverNext + 1) >>> 0;
+        // FTP's STOR completes this way: the client closes the data channel
+        // once its upload is done, and that close is the cue to send "226"
+        // on the (separate) control connection.
+        if (options.onFinSent) options.onFinSent(connection);
       }
       return;
     }
-    const inFlight = (connection.serverNext - connection.serverAcked) >>> 0;
-    const available = Math.max(0, connection.clientWindow - inFlight);
-    if (connection.sendQueue.length && available) {
+    const sentAny = this.drainConnectionSendQueue(connection, segment, options);
+    if (!sentAny && segment.payload.length) {
+      queue(buildTcpReply(segment, {sequence: connection.serverNext,
+        acknowledgement: connection.clientNext, flags: 0x10, window: connection.advertisedWindow,
+        mac: options.mac, ip: options.ip}));
+    }
+  }
+
+  // Keep sending while the window the client advertised still has room, the
+  // way a real server does. Replying with a single segment per received
+  // frame made the model a strict stop-and-wait pipe, so no receive-window
+  // change could ever show up in a measurement taken here. `template` only
+  // supplies addressing (ports/IPs/ether source): it need not be the frame
+  // that triggered this call, which is what lets an out-of-band FTP command
+  // (arriving on a different connection entirely) drain a data channel's
+  // queue using that channel's own last-seen segment as the template.
+  drainConnectionSendQueue(connection, template, options) {
+    const queue = (reply) => {
+      this.generated.push(reply);
+      if (this.accepts(reply)) this.rxQueue.push({frame: reply, cursor: 0});
+    };
+    let sentAny = false;
+    for (;;) {
+      const inFlight = (connection.serverNext - connection.serverAcked) >>> 0;
+      const available = Math.max(0, connection.clientWindow - inFlight);
+      if (!connection.sendQueue.length || !available) break;
       const size = Math.min(options.responseChunkSize || options.mss || 536,
         available, connection.sendQueue.length);
+      sentAny = true;
       const payload = connection.sendQueue.subarray(0, size);
       connection.sendQueue = connection.sendQueue.subarray(size);
       if (options.outOfOrderBeforeData && !connection.outOfOrderSent) {
         connection.outOfOrderSent = true;
-        queue(buildTcpReply(segment, {sequence: (connection.serverNext + payload.length) >>> 0,
+        queue(buildTcpReply(template, {sequence: (connection.serverNext + payload.length) >>> 0,
           acknowledgement: connection.clientNext, flags: 0x18, payload,
           window: options.window ?? 4096, mac: options.mac, ip: options.ip}));
       }
       const remoteFin = !connection.finSent &&
         ((options.mode === 'http' && !options.keepOpen && connection.httpReady &&
           connection.sendQueue.length === 0) ||
+         (options.finWhenDrained && connection.sendQueue.length === 0) ||
          options.remoteFinAfterData);
-      const reply = buildTcpReply(segment, {sequence: connection.serverNext,
+      const reply = buildTcpReply(template, {sequence: connection.serverNext,
         acknowledgement: connection.clientNext, flags: remoteFin ? 0x19 : 0x18, payload,
         window: connection.advertisedWindow, mac: options.mac, ip: options.ip});
       queue(reply);
@@ -906,16 +984,223 @@ class EtherLinkIII {
       if (options.duplicateData) queue(reply.slice());
       if (options.outOfOrderFinAfterData && !connection.badFinSent) {
         connection.badFinSent = true;
-        queue(buildTcpReply(segment, {sequence: (connection.serverNext + size + 1) >>> 0,
+        queue(buildTcpReply(template, {sequence: (connection.serverNext + size + 1) >>> 0,
           acknowledgement: connection.clientNext, flags: 0x11,
           window: connection.advertisedWindow, mac: options.mac, ip: options.ip}));
       }
       connection.serverNext = (connection.serverNext + size + (remoteFin ? 1 : 0)) >>> 0;
-      if (remoteFin) connection.finSent = true;
-    } else if (segment.payload.length) {
-      queue(buildTcpReply(segment, {sequence: connection.serverNext,
-        acknowledgement: connection.clientNext, flags: 0x10, window: connection.advertisedWindow,
-        mac: options.mac, ip: options.ip}));
+      if (remoteFin) {
+        connection.finSent = true;
+        if (options.onFinSent) options.onFinSent(connection);
+      }
+      if (options.mode === 'ftpData') this.ftpDataBytesSent = (this.ftpDataBytesSent || 0) + size;
+      this.maxInFlight = Math.max(this.maxInFlight,
+        (connection.serverNext - connection.serverAcked) >>> 0);
+      if (options.abortAfterBytes !== undefined || options.stallAfterBytes !== undefined) {
+        connection.bytesSent = (connection.bytesSent || 0) + size;
+        const threshold = options.abortAfterBytes ?? options.stallAfterBytes;
+        if (connection.bytesSent >= threshold && !connection.aborted) {
+          connection.aborted = true;
+          if (options.abortAfterBytes !== undefined) {
+            queue(buildTcpReply(template, {sequence: connection.serverNext,
+              acknowledgement: connection.clientNext, flags: 0x04, window: 0,
+              mac: options.mac, ip: options.ip}));
+          } else {
+            // Silence, no RST: the remainder of the queue is simply dropped,
+            // so the peer's own idle-receive timeout is what has to notice
+            // and fail the transfer -- unlike an RST, this has only one
+            // sane interpretation on the client side.
+            connection.sendQueue = Buffer.alloc(0);
+          }
+          break;
+        }
+      }
+    }
+    return sentAny;
+  }
+
+  // ------------------------------------------------------------------
+  // FTP mode (scenario.ftp): a fixed control port plus a self-announced
+  // data port picked on PASV, the same "own the dynamic endpoint" pattern
+  // as the TFTP responder's server TID. Both channels are ordinary
+  // respondTcp connections; FTP semantics hook in via onEstablished (push
+  // the unsolicited 220 banner / a RETR-LIST fixture), onData (parse
+  // control-channel command lines / capture a STOR upload) and onFinSent
+  // (queue "226 Transfer complete" once a data channel closes), so the
+  // handshake and window-filling machinery above is reused rather than
+  // reimplemented.
+  // ------------------------------------------------------------------
+
+  respondFtp(segment) {
+    const ftp = this.scenario.ftp;
+    const controlPort = ftp.port || 21;
+    if (segment.destinationPort === controlPort) {
+      if (!this.ftpControlOptions) this.ftpControlOptions = this.buildFtpControlOptions(ftp);
+      this.respondTcp(segment, this.ftpControlOptions);
+      return;
+    }
+    if (this.ftpDataPort && segment.destinationPort === this.ftpDataPort) {
+      if (!this.ftpDataOptions) this.ftpDataOptions = this.buildFtpDataOptions(ftp);
+      this.respondTcp(segment, this.ftpDataOptions);
+    }
+  }
+
+  buildFtpControlOptions(ftp) {
+    return {
+      mac: ftp.mac, ip: ftp.ip, window: ftp.controlWindow ?? 4096,
+      onEstablished: (connection) => {
+        this.ftpControlConn = connection;
+        if (ftp.suppressBanner) return;
+        const banner = ftp.banner || '220 Test FTP server ready.\r\n';
+        connection.sendQueue = Buffer.concat([connection.sendQueue, Buffer.from(banner, 'latin1')]);
+      },
+      onData: (connection, payload) => this.handleFtpControlData(connection, payload, ftp),
+    };
+  }
+
+  buildFtpDataOptions(ftp) {
+    return {
+      mac: ftp.mac, ip: ftp.ip, window: ftp.dataWindow ?? 4096, mss: ftp.mss || 536,
+      responseChunkSize: ftp.responseChunkSize,
+      mode: 'ftpData',
+      finWhenDrained: true,
+      abortAfterBytes: ftp.dataAbortAfterBytes,
+      stallAfterBytes: ftp.dataStallAfterBytes,
+      onEstablished: (connection) => {
+        // Normally beaten to it by pushFtpDataIfReady() below, since RETR/LIST
+        // arrives on the control channel only after this data channel's own
+        // handshake has already completed. Kept as a fallback for the
+        // reverse ordering.
+        const pending = this.ftpPendingVerb;
+        if (!pending || pending.verb === 'STOR') return;
+        connection.sendQueue = Buffer.concat([connection.sendQueue, this.resolveFtpFixture(pending, ftp)]);
+      },
+      onData: (connection, payload) => {
+        this.ftpUploadChunks.push(payload);
+        connection.bytesReceived = (connection.bytesReceived || 0) + payload.length;
+        if (ftp.dataAbortAfterBytes !== undefined &&
+            connection.bytesReceived >= ftp.dataAbortAfterBytes && !connection.aborted) {
+          connection.aborted = true;
+          const template = connection.lastSegment;
+          const rst = buildTcpReply(template, {sequence: connection.serverNext,
+            acknowledgement: connection.clientNext, flags: 0x04, window: 0,
+            mac: ftp.mac, ip: ftp.ip});
+          this.generated.push(rst);
+          if (this.accepts(rst)) this.rxQueue.push({frame: rst, cursor: 0});
+        }
+      },
+      onFinSent: () => {
+        if (ftp.suppress226) return;
+        this.sendFtpControlReply('226 Transfer complete.\r\n');
+      },
+    };
+  }
+
+  resolveFtpFixture(pending, ftp) {
+    if (pending.verb === 'LIST') {
+      const listing = ftp.listing !== undefined ? ftp.listing : '';
+      return Buffer.isBuffer(listing) ? listing : Buffer.from(listing, 'latin1');
+    }
+    const fixtures = ftp.fixtures || {};
+    const key = Object.keys(fixtures).find((name) => name.toUpperCase() === pending.arg.toUpperCase());
+    const data = key === undefined ? Buffer.alloc(0) : fixtures[key];
+    return Buffer.isBuffer(data) ? data : Buffer.from(data);
+  }
+
+  sendFtpControlReply(text) {
+    const connection = this.ftpControlConn;
+    if (!connection) return;
+    connection.sendQueue = Buffer.concat([connection.sendQueue, Buffer.from(text, 'latin1')]);
+    this.drainConnectionSendQueue(connection, connection.lastSegment, this.ftpControlOptions);
+  }
+
+  // Once RETR/LIST is accepted, the data channel's handshake has already
+  // completed (ftp.asm opens it, then optionally REST, before sending the
+  // verb), so push straight into that connection's queue instead of waiting
+  // for a triggering frame that will never come on an otherwise-idle
+  // download channel.
+  pushFtpDataIfReady(ftp) {
+    if (!this.ftpDataPort || !this.ftpPendingVerb) return;
+    for (const [key, connection] of this.tcpConnections) {
+      if (!key.endsWith(`/${this.ftpDataPort}`)) continue;
+      if (!connection.established) return;
+      connection.sendQueue = Buffer.concat([connection.sendQueue, this.resolveFtpFixture(this.ftpPendingVerb, ftp)]);
+      if (!this.ftpDataOptions) this.ftpDataOptions = this.buildFtpDataOptions(ftp);
+      this.drainConnectionSendQueue(connection, connection.lastSegment, this.ftpDataOptions);
+      return;
+    }
+  }
+
+  handleFtpControlData(connection, payload, ftp) {
+    connection.ftpAccum = Buffer.concat([connection.ftpAccum || Buffer.alloc(0), payload]);
+    for (;;) {
+      const idx = connection.ftpAccum.indexOf('\r\n', 0, 'latin1');
+      if (idx < 0) break;
+      const line = connection.ftpAccum.slice(0, idx).toString('latin1');
+      connection.ftpAccum = connection.ftpAccum.slice(idx + 2);
+      this.ftpRequests.push(line);
+      const reply = this.computeFtpReply(line, ftp, connection);
+      if (reply) connection.sendQueue = Buffer.concat([connection.sendQueue, Buffer.from(reply, 'latin1')]);
+      if (this.ftpPendingVerb && this.ftpPendingVerb.needsPush) {
+        this.ftpPendingVerb.needsPush = false;
+        this.pushFtpDataIfReady(ftp);
+      }
+    }
+  }
+
+  computeFtpReply(line, ftp, connection) {
+    const spaceAt = line.indexOf(' ');
+    const verb = (spaceAt < 0 ? line : line.slice(0, spaceAt)).toUpperCase();
+    const arg = spaceAt < 0 ? '' : line.slice(spaceAt + 1);
+    const refused = new Set((ftp.refuseVerbs || []).map((v) => v.toUpperCase()));
+    switch (verb) {
+      case 'USER':
+        return `${ftp.userReply ?? 331} User ${arg} OK, need password.\r\n`;
+      case 'PASS':
+        if (ftp.refusePass) return '530 Login incorrect.\r\n';
+        return `${ftp.passReply ?? 230} Login successful.\r\n`;
+      case 'TYPE':
+        return '200 Type set to I.\r\n';
+      case 'SIZE': {
+        if (ftp.refuseSize) return '550 Could not get file size.\r\n';
+        const sizes = ftp.fixtureSizes || {};
+        const known = Object.keys(sizes).find((n) => n.toUpperCase() === arg.toUpperCase());
+        const n = known !== undefined ? sizes[known] : (ftp.sizeBytes ?? 0);
+        return `213 ${n}\r\n`;
+      }
+      case 'PASV': {
+        if (ftp.pasvGarbled) return '227 Not really passive.\r\n';
+        this.ftpDataPort = ftp.dataPort || (30000 + (this.ftpPasvCount = (this.ftpPasvCount || 0) + 1));
+        // Reusing the control host as the data host (the simplest legal PASV
+        // reply, and the one every fixture below relies on) keeps the data
+        // channel on the same routable subnet as the control channel without
+        // requiring a gateway in the scenario's NET_GW config.
+        const ip = ftp.dataIp || (connection.lastSegment ? Array.from(connection.lastSegment.destination) : [127, 0, 0, 1]);
+        const p = this.ftpDataPort;
+        return `227 Entering Passive Mode (${ip[0]},${ip[1]},${ip[2]},${ip[3]},${(p >> 8) & 255},${p & 255}).\r\n`;
+      }
+      case 'REST':
+        if (ftp.restRefused) return '502 REST not supported.\r\n';
+        return `350 Restarting at ${arg}.\r\n`;
+      case 'RETR':
+      case 'STOR':
+      case 'LIST': {
+        const refusedNow = refused.has(verb) || (verb === 'RETR' && ftp.refuseRetr) ||
+          (verb === 'STOR' && ftp.refuseStor) || (verb === 'LIST' && ftp.refuseList);
+        if (refusedNow) return '550 Failed.\r\n';
+        // Deferred to handleFtpControlData, once this "150" text is actually
+        // queued: pushing the data-channel fixture from here can complete a
+        // small transfer (and its "226") synchronously, before the caller
+        // has appended this very reply -- sending 226 ahead of 150 on the
+        // wire, which no real server does even though ftp.asm's reader
+        // tolerates whatever order replies arrive in.
+        this.ftpPendingVerb = {verb, arg, needsPush: verb !== 'STOR'};
+        return '150 Opening data connection.\r\n';
+      }
+      case 'QUIT':
+        return '221 Goodbye.\r\n';
+      default:
+        return '500 Unknown command.\r\n';
     }
   }
 
@@ -1438,6 +1723,8 @@ function runExe(exePath, args = '', inputScenario = {}) {
         scanCount++;
         const keyReady = scenario.keyAfterHttpBytes !== undefined ?
           card.httpBytesSent >= scenario.keyAfterHttpBytes :
+          scenario.keyAfterFtpBytes !== undefined ?
+          (card.ftpDataBytesSent || 0) >= scenario.keyAfterFtpBytes :
           scanCount === (scenario.keyAtScan || 1);
         if (scenario.key && !keyDelivered && keyReady) {
           keyDelivered = true;
@@ -1583,6 +1870,11 @@ function runExe(exePath, args = '', inputScenario = {}) {
     currentDir,
     files: Object.fromEntries([...files].map(([name, data]) => [name, Buffer.from(data)])),
     tftpUploads: scenario.tftp && scenario.tftp.uploads ? {...scenario.tftp.uploads} : {},
+    ftpRequests: card.ftpRequests.slice(),
+    ftpUploads: Buffer.concat(card.ftpUploadChunks),
+    ftpDataBytesSent: card.ftpDataBytesSent || 0,
+    ftpDataPort: card.ftpDataPort,
+    tcpResetPorts: card.tcpResetPorts.slice(),
     requestCounts: {
       dhcpDiscover: card.dhcpDiscoverCount, dhcpRequest: card.dhcpRequestCount,
       dhcpRelease: card.dhcpReleaseCount,
@@ -1590,6 +1882,7 @@ function runExe(exePath, args = '', inputScenario = {}) {
       ntp: card.ntpRequestCount, udp: card.udpRequestCount,
       tcp: card.tcpRequestCount,
     },
+    maxInFlight: card.maxInFlight,
     setTimeCalls,
     ...(scenario.traceDss ? {dssEvents} : {}),
     ...(scenario.dumpMemory ? {memory: Object.fromEntries(scenario.dumpMemory.map(([start, length]) => [

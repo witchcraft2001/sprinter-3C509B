@@ -37,17 +37,17 @@ WGET_HEADER_SIZE EQU 256
 	DW 0x0080,0,0,0,0,0
 	; DSS installs this stack before the entry point runs and spends it on the
 	; loader and on interrupt frames, so it has to be clear of the image on its
-	; own. 8000h is the top of the image window, and the ASSERT at the end of
-	; this file keeps S10_BOOTSTRAP_STACK_RESERVE bytes free beneath it.
+	; own. BFF0h is the top of WIN2, which the standard layout hands to the
+	; program along with WIN1, so it is clear of the image by 16 KiB.
 	DW START,START,S10_BOOTSTRAP_STACK
 	DS 106,0
 
 	ORG 0x4100
 START
-	; Restates the header stack. It is still WIN1, so nothing may print until
-	; ALLOCATE_FRESH has claimed WIN2 and SP has moved into it: BIOS WIN_MOVE
-	; maps the video page over WIN1 on a scrolled line and restores SLOT1 from a
-	; POP taken while that page is mapped. BOOT_FAIL is silent for that reason.
+	; Restates the header stack. It is already at the top of WIN2, so the WIN1
+	; hazard that used to gag this path is gone: BIOS WIN_MOVE maps the video
+	; page over WIN1 on a scrolled line and restores SLOT1 from a POP taken
+	; while that page is mapped, which only ever threatened a WIN1 stack.
 	LD	SP,S10_BOOTSTRAP_STACK
 	CALL	@S11APP.SAVE_COMMAND
 	CALL	@S11APP.ALLOCATE_FRESH
@@ -1056,13 +1056,18 @@ SHIFT_WORK32
 	RL	(HL)
 	RET
 
+; PROGRESS_TICK is called once per disk-buffer flush, so the counter it keeps is
+; a count of flushes. Repainting on every one puts an update on screen each
+; buffer -- a few KiB -- which is what makes a download look like it is
+; progressing. Printing every fourth flush instead meant one repaint per four
+; buffers, so a transfer showed two or three figures for its whole length and
+; read as a stall between them; the repaint itself is a carriage return and one
+; short line, nothing against the disk write that precedes it.
 PROGRESS_TICK
 	LD	A,(W12_FLAGS)
 	BIT	2,A
 	JR	NZ,.DOT
-	LD	A,(W12_PROGRESS_COUNT)
-	AND	3
-	CALL	Z,PRINT_PROGRESS
+	CALL	PRINT_PROGRESS
 	LD	HL,W12_PROGRESS_COUNT
 	INC	(HL)
 	RET
@@ -1467,13 +1472,15 @@ EXIT_NO_RESULT
 	RST	DSS
 .DRIVER
 	CALL	@NETDRV.DONE
-	LD	A,(NETDRV_MEMORY_BLOCK)
+	IFNDEF STAGE12_LAYOUT
 	; The runtime stack is inside the block about to be released, so go back to
 	; the entry stack first. Nothing prints from here on, which is what makes a
 	; WIN1 stack safe again.
+	LD	A,(NETDRV_MEMORY_BLOCK)
 	LD	SP,S10_BOOTSTRAP_STACK
 	LD	C,DSS_FREEMEM
 	RST	DSS
+	ENDIF
 	LD	A,(SAVED_EXIT_CODE)
 	LD	B,A
 	LD	C,DSS_EXIT
@@ -1544,10 +1551,10 @@ MSG_OK		DB "RESULT OK",13,10,0
 MSG_FAIL	DB "RESULT FAIL",13,10,0
 
 ; Bottom of the command staging area, long dead by exit time: the command itself
-; lives in WIN1 from ALLOCATE_FRESH onwards. It is also the far end of the stack
-; that grows down from 8100h -- 256 bytes away, where the deepest observed run
-; still leaves ~180 bytes of margin. Read after DSS_FREEMEM has taken WIN1 away,
-; which is exactly why it may not live in the page.
+; is copied into the runtime area by ALLOCATE_FRESH. It sits below the load
+; address in WIN1, so it is the one cell that survives whatever the exit path
+; does to the windows -- which is why the exit code is kept here and not in the
+; runtime data area.
 SAVED_EXIT_CODE EQU S10_COMMAND_BUFFER
 
 	ENDMODULE
@@ -1572,9 +1579,12 @@ SAVED_EXIT_CODE EQU S10_COMMAND_BUFFER
 	INCLUDE "stage11_app.asm"
 	INCLUDE "stage12_dns.asm"
 
-	; The image shares WIN1 with the entry stack DSS installs at its top, so it
-	; must stop a full reserve short of it.
-	ASSERT $ + S10_BOOTSTRAP_STACK_RESERVE <= S10_STACK_TOP
+
+
+	; The image is code and rodata only. What bounds it is the runtime data
+	; area, which starts at PAGE_BASE -- not the entry stack, which now sits a
+	; whole window above at the top of WIN2.
+	ASSERT $ <= PAGE_BASE
 	; ... and the command record and exit code below the load address are not
 	; code either.
 	ASSERT S10_COMMAND_BUFFER + 0x0100 <= 0x4100

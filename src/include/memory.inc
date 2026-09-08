@@ -111,10 +111,14 @@ NETDRV_ACTIVE		EQU RUNTIME_BASE + 0x250
 NETDRV_MEMORY_BLOCK	EQU RUNTIME_BASE + 0x251
 NETDRV_PAGE_ALLOCATED	EQU RUNTIME_BASE + 0x252
 	IFDEF STAGE10_PAGE_LAYOUT
+	IFDEF STAGE13_LAYOUT
+NETDRV_FAIL_CODE	EQU PAGE_BASE + 0x2E3E ; page-backed; see the STAGE13_LAYOUT S11 block below
+	ELSE
 	IFDEF STAGE12_LAYOUT
 NETDRV_FAIL_CODE	EQU PAGE_BASE + 0x2D5F ; page-backed; Stage 12 cleanup keeps status on stack
 	ELSE
 NETDRV_FAIL_CODE	EQU 0xBEF1 ; survives release of the mapped DSS page
+	ENDIF
 	ENDIF
 	ELSE
 NETDRV_FAIL_CODE	EQU RUNTIME_BASE + 0x253
@@ -221,15 +225,30 @@ NETTIME_ELAPSED_MS	EQU NETTIME_STATE_BASE + 0x15 ; word
 	; Stage 9 compact application state. Large packet/file storage remains in the
 	; one mapped DSS page; this bookkeeping is resident and below STACK_TOP.
 	IFDEF STAGE9_LAYOUT
-	IFDEF STAGE12_LAYOUT
-; WGET keeps an uninterrupted 8 KiB disk buffer while retaining one-MSS TCP
-; queues. HTTP never needs the 1514-byte UDP diagnostic packets used by Stage 9.
+	IFDEF STAGE13_LAYOUT
+; Same TX/RX split as STAGE12_LAYOUT (WGET); the file buffer is smaller
+; because it doubles as STOR's read-chunk source and the page also carries a
+; second full pending region and context for the data channel.
 STAGE9_TX_BUFFER	EQU PAGE_BASE + 0x0000
 STAGE9_TX_CAPACITY	EQU 0x0400
 STAGE9_RX_BUFFER	EQU PAGE_BASE + 0x0400
 STAGE9_RX_CAPACITY	EQU 0x0400
 STAGE9_FILE_BUFFER	EQU PAGE_BASE + 0x0800
-STAGE9_FILE_CAPACITY	EQU 0x2000
+STAGE9_FILE_CAPACITY	EQU 0x1000
+STAGE9_MAX_FRAME	EQU 14 + 20 + 20 + 536
+	ELSE
+	IFDEF STAGE12_LAYOUT
+; WGET batches disk writes in 6 KiB and spends the two KiB that used to sit
+; here on the TCP receive window instead: write batching only saves DSS calls,
+; while the window decides how many segments the peer may keep in flight, and
+; the second is what the transfer rate is made of. HTTP never needs the
+; 1514-byte UDP diagnostic packets used by Stage 9.
+STAGE9_TX_BUFFER	EQU PAGE_BASE + 0x0000
+STAGE9_TX_CAPACITY	EQU 0x0400
+STAGE9_RX_BUFFER	EQU PAGE_BASE + 0x0400
+STAGE9_RX_CAPACITY	EQU 0x0400
+STAGE9_FILE_BUFFER	EQU PAGE_BASE + 0x0800
+STAGE9_FILE_CAPACITY	EQU 0x1800
 STAGE9_MAX_FRAME	EQU 14 + 20 + 20 + 536
 	ELSE
 STAGE9_TX_BUFFER	EQU PAGE_BASE + 0x0000
@@ -239,6 +258,7 @@ STAGE9_RX_CAPACITY	EQU 0x0800
 STAGE9_FILE_BUFFER	EQU PAGE_BASE + 0x1000
 STAGE9_FILE_CAPACITY	EQU 0x2000
 	ENDIF
+	ENDIF
 	IFDEF STAGE10_PAGE_LAYOUT
 STAGE9_SCRATCH		EQU PAGE_BASE + 0x3800
 STAGE9_SCRATCH_CAPACITY EQU 0x0600
@@ -247,7 +267,9 @@ STAGE9_SCRATCH		EQU PAGE_BASE + 0x3000
 STAGE9_SCRATCH_CAPACITY EQU 0x1000
 	ENDIF
 	IFNDEF STAGE12_LAYOUT
+	IFNDEF STAGE13_LAYOUT
 STAGE9_MAX_FRAME	EQU 14 + 20 + 8 + 1472
+	ENDIF
 	ENDIF
 
 S9_STATE_BASE		EQU RUNTIME_BASE + 0x300
@@ -270,10 +292,14 @@ S9_ATTEMPTS		EQU S9_STATE_BASE + 0x022
 S9_RX_LENGTH		EQU S9_STATE_BASE + 0x023 ; word
 S9_DRAIN_LEFT		EQU S9_STATE_BASE + 0x025
 	IFDEF STAGE10_PAGE_LAYOUT
+	IFDEF STAGE13_LAYOUT
+S9_EXIT_CODE		EQU PAGE_BASE + 0x2E3F ; page-backed; see the STAGE13_LAYOUT S11 block below
+	ELSE
 	IFDEF STAGE12_LAYOUT
 S9_EXIT_CODE		EQU PAGE_BASE + 0x2D5E
 	ELSE
 S9_EXIT_CODE		EQU 0xBEF0 ; survives release of the mapped DSS page
+	ENDIF
 	ENDIF
 	ELSE
 S9_EXIT_CODE		EQU S9_STATE_BASE + 0x026
@@ -292,10 +318,17 @@ S9_UDP_PARSE_DESC	EQU S9_STATE_BASE + 0x080 ; 20 bytes
 S9_ICMP_COPY_DESC	EQU S9_STATE_BASE + 0x0A0 ; 8 bytes
 S9_ICMP_REPLY_DESC	EQU S9_STATE_BASE + 0x0B0 ; 10 bytes
 
+	IFDEF STAGE13_LAYOUT
+; Just past the highest RUNTIME_BASE-aliased field FTP's own call graph
+; touches (S9_TFTP_ERROR_DESC+10, ~0xB4EA) and clear of the F13 string block
+; below, which starts only after S11_REMOTE_TEXT at PAGE_BASE+0x3700.
+S9_ENV_BUFFER		EQU PAGE_BASE + 0x3500
+	ELSE
 	IFDEF STAGE12_LAYOUT
 S9_ENV_BUFFER		EQU PAGE_BASE + 0x3B00 ; leaves the persistent WGET strings intact
 	ELSE
 S9_ENV_BUFFER		EQU STAGE9_SCRATCH ; 256-byte DSS ENV_GET destination
+	ENDIF
 	ENDIF
 S9_TFTP_MODE		EQU S9_STATE_BASE + 0x180
 S9_TFTP_FORCE		EQU S9_STATE_BASE + 0x181
@@ -371,11 +404,12 @@ S10_PAGE_COMMAND_BUFFER EQU PAGE_BASE + 0x3E00 ; command after WIN1 remapping
 ; copied there before WIN2 is claimed, and the exit code is read from there
 ; after the page is released. It is 16 KiB away from every stack.
 S10_COMMAND_BUFFER	EQU 0x4000
-; Entry/bootstrap stack: the top of the image window, installed by the loader
-; before the entry point runs and therefore already clear of the image. It is
-; still WIN1, so nothing may print until CLAIM_RUNTIME_PAGE has moved the stack
-; into the claimed page.
-S10_STACK_TOP		EQU 0x8000
+; Entry/bootstrap stack: the top of WIN2. In the standard DSS layout the
+; program owns WIN1+WIN2 as one contiguous 0x4100..0xBFFF region, so this is
+; already the program's RAM when the loader installs the stack -- far above the
+; image and outside WIN1, which is what makes it safe from both the loader and
+; the BIOS WIN_MOVE remap.
+S10_STACK_TOP		EQU 0xBFF0
 S10_BOOTSTRAP_STACK	EQU S10_STACK_TOP
 	ELSE
 S10_COMMAND_BUFFER	EQU 0xBF00 ; bootstrap copy before WIN1 remapping
@@ -383,9 +417,10 @@ S10_STACK_TOP		EQU 0xBEF0 ; bootstrap/header stack and linked-code limit
 S10_BOOTSTRAP_STACK	EQU S10_STACK_TOP
 	ENDIF
 	IFDEF STAGE12_LAYOUT
-; Room the loader, one interrupt frame and the two DSS calls of the page claim
-; need under the entry stack before the image begins.
-S10_BOOTSTRAP_STACK_RESERVE EQU 0x00C0
+; The entry stack no longer sits just above the image, so it no longer bounds
+; it; PAGE_BASE does (see the ASSERT at the end of wget.asm). This is only the
+; slack the loader and one interrupt frame need under S10_STACK_TOP.
+S10_BOOTSTRAP_STACK_RESERVE EQU 0x0010
 	ELSE
 S10_BOOTSTRAP_STACK_RESERVE EQU 0x0010
 	ENDIF
@@ -412,24 +447,54 @@ S10_RUNTIME_STACK_TOP	EQU 0xC000
 ; Stage 11 reuses the Stage 9 packet buffers and dedicates the remaining DSS
 ; page space to an application stream buffer, two honest one-MSS receive
 ; queues and two independent TCP contexts.
+	IFDEF STAGE13_LAYOUT
+; FTP keeps both channels open at once (control + data), so unlike WGET it
+; needs two real pending regions and two real contexts, each as deep as
+; WGET's single one (the deep receive window is keyed off STAGE12_LAYOUT,
+; which FTP also defines, and applies to both channels; only the
+; single-context restriction is keyed off TCPX_SINGLE_CONTEXT, which FTP
+; opts out of -- see tcp_transport.asm). Packed flush against RUNTIME_BASE
+; with no slack, so
+; NETDRV_FAIL_CODE/S9_EXIT_CODE above are carved out of F13_STATE_BASE's own
+; reserve instead of a gap in this block.
+S11_PENDING0		EQU PAGE_BASE + 0x1800
+S11_PENDING_CAPACITY	EQU 0x0A78	; TCP_RECV_SEGMENTS * TCP_MSS; see tcp_transport.asm's ASSERT
+S11_PENDING1		EQU S11_PENDING0 + S11_PENDING_CAPACITY
+S11_CONTEXT0		EQU S11_PENDING1 + S11_PENDING_CAPACITY
+S11_CONTEXT1		EQU S11_CONTEXT0 + S11_CONTEXT_SIZE
+S11_STATE_BASE		EQU S11_CONTEXT1 + S11_CONTEXT_SIZE
+S11_APP_BUFFER		EQU S11_STATE_BASE + 0x0100
+S11_APP_CAPACITY	EQU 0x01C0	; flush: S11_APP_BUFFER + S11_APP_CAPACITY = RUNTIME_BASE exactly
+	ELSE
 	IFDEF STAGE12_LAYOUT
-S11_PENDING0		EQU PAGE_BASE + 0x2800
-S11_PENDING1		EQU PAGE_BASE + 0x2A20
+; WGET's channel never selects context 1 (see SELECT_CONTEXT's
+; STAGE12_LAYOUT branch), so the second one-MSS queue and context that the
+; two-channel layout below reserves are folded back into one pending region
+; sized for the full TCP_RECV_WINDOW (tcp.inc) instead of a single MSS.
+; The region starts where the disk buffer used to end: two of its eight KiB pay
+; for a receive window the peer can actually keep segments in flight against,
+; which is worth far more than the larger write batches. Everything above
+; S11_CONTEXT0 is unchanged.
+S11_PENDING0		EQU PAGE_BASE + 0x2000
+S11_PENDING1		EQU S11_PENDING0	; PENDING_BASE's IX==CONTEXT0 branch always
+						; fires under STAGE12_LAYOUT; this alias only
+						; keeps the shared unconditional code assembling
+S11_PENDING_CAPACITY	EQU 0x0A78	; TCP_RECV_SEGMENTS * TCP_MSS; see tcp_transport.asm's ASSERT
 S11_CONTEXT0		EQU PAGE_BASE + 0x2C40
-S11_CONTEXT1		EQU PAGE_BASE + 0x2C80
-S11_STATE_BASE		EQU PAGE_BASE + 0x2CC0
-S11_APP_BUFFER		EQU PAGE_BASE + 0x2DC0
+S11_STATE_BASE		EQU PAGE_BASE + 0x2C80
+S11_APP_BUFFER		EQU PAGE_BASE + 0x2D80
 S11_APP_CAPACITY	EQU 0x0220
 	ELSE
 S11_APP_BUFFER		EQU PAGE_BASE + 0x1000
 S11_APP_CAPACITY	EQU 0x1000
 S11_PENDING0		EQU PAGE_BASE + 0x2000
 S11_PENDING1		EQU PAGE_BASE + 0x2220
+S11_PENDING_CAPACITY	EQU 0x0218
 S11_CONTEXT0		EQU PAGE_BASE + 0x2500
 S11_CONTEXT1		EQU PAGE_BASE + 0x2540
 S11_STATE_BASE		EQU PAGE_BASE + 0x2600
 	ENDIF
-S11_PENDING_CAPACITY	EQU 0x0218
+	ENDIF
 S11_CONTEXT_SIZE	EQU 40
 S11_TCP_BUILD_DESC	EQU S11_STATE_BASE + 0x00
 S11_TCP_PARSE_DESC	EQU S11_STATE_BASE + 0x20
@@ -460,15 +525,113 @@ S11_IPV4_BUILD_DESC	EQU S11_STATE_BASE + 0x70
 S11_IPV4_PARSE_DESC	EQU S11_STATE_BASE + 0x80
 S11_REMOTE_TEXT		EQU PAGE_BASE + 0x3700
 
-	IFNDEF STAGE12_LAYOUT
-	ASSERT S11_APP_BUFFER + S11_APP_CAPACITY <= S11_PENDING0
-	ENDIF
+	IFDEF STAGE13_LAYOUT
 	ASSERT S11_PENDING0 + S11_PENDING_CAPACITY <= S11_PENDING1
 	ASSERT S11_PENDING1 + S11_PENDING_CAPACITY <= S11_CONTEXT0
 	ASSERT S11_CONTEXT0 + S11_CONTEXT_SIZE <= S11_CONTEXT1
 	ASSERT S11_CONTEXT1 + S11_CONTEXT_SIZE <= S11_STATE_BASE
+	ASSERT S11_STATE_BASE + 0x0100 <= S11_APP_BUFFER
+	ASSERT S11_APP_BUFFER + S11_APP_CAPACITY <= RUNTIME_BASE
+	ELSE
+	IFNDEF STAGE12_LAYOUT
+	ASSERT S11_APP_BUFFER + S11_APP_CAPACITY <= S11_PENDING0
+	ASSERT S11_PENDING0 + S11_PENDING_CAPACITY <= S11_PENDING1
+	ASSERT S11_PENDING1 + S11_PENDING_CAPACITY <= S11_CONTEXT0
+	ASSERT S11_CONTEXT0 + S11_CONTEXT_SIZE <= S11_CONTEXT1
+	ASSERT S11_CONTEXT1 + S11_CONTEXT_SIZE <= S11_STATE_BASE
+	ELSE
+	ASSERT S11_PENDING0 + S11_PENDING_CAPACITY <= S11_CONTEXT0
+	ASSERT S11_CONTEXT0 + S11_CONTEXT_SIZE <= S11_STATE_BASE
+	ENDIF
+	ENDIF
 	ASSERT S11_STATE_BASE + 0x0100 <= S11_REMOTE_TEXT
 
+	IFDEF STAGE13_LAYOUT
+; FTP state, laid out the same way WGET's W12 block is: scalars reuse the
+; slack past S11's own field high-water mark inside S11_STATE_BASE's 0x100
+; reserve, and the two page-backed status bytes NETDRV_FAIL_CODE/S9_EXIT_CODE
+; (memory.inc, above) are carved out of the tail of that same reserve since,
+; unlike WGET's single-context layout, this one packs flush with no spare
+; gap of its own. Strings start right after S11_REMOTE_TEXT, same as W12's.
+F13_STATE_BASE		EQU S11_STATE_BASE + 0xA0
+; FLAGS bits: 0 force(-y/-f), 1 resume(-r), 2 dots(-d), 3 list(-l and -n
+; alike, see PARSE_FTP), 5 has -o, 6 has -u, 7 has -p. Bit 4 is unused and
+; PUT is not a flag: it sets F13_MODE.
+F13_FLAGS		EQU F13_STATE_BASE + 0x00
+F13_MODE		EQU F13_STATE_BASE + 0x01	; 0 GET, 1 PUT, 2 LIST -- decided post-parse
+F13_CTRL_PORT		EQU F13_STATE_BASE + 0x02 ; word, host order, default 21
+F13_REPLY_CODE		EQU F13_STATE_BASE + 0x04 ; three ASCII digits, not NUL-terminated
+F13_ACCUM_LEN		EQU F13_STATE_BASE + 0x07 ; word, bytes buffered in F13_ACCUM_BUF
+F13_LINE_LEN		EQU F13_STATE_BASE + 0x09 ; word, length of the extracted reply line
+F13_DATA_PORT		EQU F13_STATE_BASE + 0x0B ; word, host order, from PASV
+F13_DATA_IP		EQU F13_STATE_BASE + 0x0D ; four bytes, network order
+F13_TOTAL_SIZE		EQU F13_STATE_BASE + 0x11 ; four bytes LE, from SIZE/local seek
+F13_TOTAL_KNOWN	EQU F13_STATE_BASE + 0x15
+F13_TRANSFERRED	EQU F13_STATE_BASE + 0x16 ; four bytes LE, this session's bytes
+F13_RESUME_OFFSET	EQU F13_STATE_BASE + 0x1A ; four bytes LE
+F13_START_TIME		EQU F13_STATE_BASE + 0x1E ; three-byte seconds-of-day
+F13_ELAPSED		EQU F13_STATE_BASE + 0x21 ; three bytes
+F13_FILE_HANDLE	EQU F13_STATE_BASE + 0x24
+F13_FILE_OPEN		EQU F13_STATE_BASE + 0x25
+F13_PROGRESS_COUNT	EQU F13_STATE_BASE + 0x26
+F13_LAST_ERROR		EQU F13_STATE_BASE + 0x27
+F13_RESUME_SELECTED	EQU F13_STATE_BASE + 0x28
+F13_WORK32		EQU F13_STATE_BASE + 0x29 ; four bytes, decimal math scratch
+F13_NUMBER_BUFFER	EQU F13_STATE_BASE + 0x2D ; eleven bytes
+F13_POS_COUNT		EQU F13_STATE_BASE + 0x38 ; PARSE_FTP's positional-argument cursor
+F13_LOCAL_ARG_PTR	EQU F13_STATE_BASE + 0x39 ; word, resolved local file path
+F13_REMOTE_ARG_PTR	EQU F13_STATE_BASE + 0x3B ; word, resolved RETR/STOR/LIST argument
+F13_BUFFER_USED	EQU F13_STATE_BASE + 0x3D ; word, bytes staged in STAGE9_FILE_BUFFER
+F13_CHUNK_PTR		EQU F13_STATE_BASE + 0x3F ; word, APPEND_DATA cursor
+F13_CHUNK_LEN		EQU F13_STATE_BASE + 0x41 ; word, APPEND_DATA remaining
+F13_TOTAL_WRITTEN	EQU F13_STATE_BASE + 0x43 ; four bytes LE, progress display only
+; F13_STATE_BASE+0x47 .. +0x5D remains free for further scalars; +0x5E/+0x5F
+; are NETDRV_FAIL_CODE/S9_EXIT_CODE (memory.inc, above).
+F13_HOST		EQU PAGE_BASE + 0x3800 ; 64 bytes
+F13_REMOTE_PATH	EQU PAGE_BASE + 0x3840 ; 256 bytes, RETR/STOR/LIST argument
+F13_LOCAL_OUTPUT	EQU PAGE_BASE + 0x3940 ; 96 bytes
+F13_ACCUM_BUF		EQU PAGE_BASE + 0x39A0 ; 512 bytes, control-reply accumulator
+F13_REPLY_LINE		EQU PAGE_BASE + 0x3BA0 ; 256 bytes, one extracted reply line
+F13_SAVED_CWD		EQU PAGE_BASE + 0x3CA0 ; 256 bytes; file.asm's FILE_SAVED_CWD
+F13_DIR_BUFFER		EQU PAGE_BASE + 0x3DA0 ; 96 bytes; file.asm's FILE_DIR_BUFFER
+; The last three fields deliberately reuse the page's command-record range
+; (F13_USER == S10_PAGE_COMMAND_BUFFER; the ASSERT below pins that). Nothing
+; else fits below 3E00h, and the page copy is redundant here: ALLOCATE_FRESH
+; leaves FTP's IX on the WIN1 copy at S10_COMMAND_BUFFER precisely because
+; PARSE_FTP writes -u/-p/-o into these three while it is still tokenising the
+; command line, which would otherwise overwrite its own unparsed tail.
+F13_USER		EQU PAGE_BASE + 0x3E00 ; 32 bytes, -u (default "anonymous")
+F13_PASS		EQU PAGE_BASE + 0x3E20 ; 32 bytes, -p (default "anonymous@")
+; -o's raw text needs its own storage: F13_REPLY_LINE looked "dead until the
+; control dialog starts" when this was first written, but DERIVE_ARGS only
+; stores a pointer to it, and every reply the control dialog reads (220,
+; USER, PASS, TYPE, SIZE, PASV) overwrites F13_REPLY_LINE before that pointer
+; is ever dereferenced -- so -o silently renamed to the last reply's text.
+F13_OUTPUT_OVERRIDE	EQU PAGE_BASE + 0x3E40 ; 96 bytes, -o (GET local / PUT remote)
+F13_URL			EQU S11_REMOTE_TEXT ; 256 bytes, resolver input
+; file.asm's OPEN_OUTPUT_ORC/OPEN_APPEND (shared with WGET) are written
+; against the W12_* names; alias them so FTP's RETR resume uses the same
+; code unmodified.
+W12_RESUME_OFFSET	EQU F13_RESUME_OFFSET
+W12_RESUME_SELECTED	EQU F13_RESUME_SELECTED
+W12_FILE_HANDLE	EQU F13_FILE_HANDLE
+
+	ASSERT STAGE9_FILE_BUFFER + STAGE9_FILE_CAPACITY <= S11_PENDING0
+	ASSERT S11_IPV4_PARSE_DESC + 18 <= F13_STATE_BASE
+	ASSERT F13_STATE_BASE + 0x60 <= S11_APP_BUFFER
+	ASSERT S9_ENV_BUFFER + 300 <= S11_REMOTE_TEXT
+	ASSERT F13_HOST + 64 <= F13_REMOTE_PATH
+	ASSERT F13_REMOTE_PATH + 256 <= F13_LOCAL_OUTPUT
+	ASSERT F13_LOCAL_OUTPUT + 96 <= F13_ACCUM_BUF
+	ASSERT F13_ACCUM_BUF + 512 <= F13_REPLY_LINE
+	ASSERT F13_REPLY_LINE + 256 <= F13_SAVED_CWD
+	ASSERT F13_SAVED_CWD + 256 <= F13_DIR_BUFFER
+	ASSERT F13_DIR_BUFFER + 96 <= F13_USER
+	ASSERT F13_USER + 32 <= F13_PASS
+	ASSERT F13_PASS + 32 <= F13_OUTPUT_OVERRIDE
+	ASSERT F13_OUTPUT_OVERRIDE + 96 <= S10_RUNTIME_STACK_TOP - 0x0100
+	ASSERT F13_USER == S10_PAGE_COMMAND_BUFFER ; see the note above the block
+	ELSE
 	IFDEF STAGE12_LAYOUT
 ; HTTP/WGET state lives in regions unused by the TFTP application. The DNS
 ; descriptors at 7600h remain intact and can be reused on every redirect.
@@ -520,6 +683,7 @@ W12_URL			EQU S11_REMOTE_TEXT ; 256 bytes
 	ASSERT W12_OUTPUT_SNAPSHOT + 96 <= S9_ENV_BUFFER
 	ASSERT W12_URL + 256 <= STAGE9_SCRATCH
 	ASSERT S9_TFTP_ERROR_DESC + 10 <= S10_RUNTIME_STACK_TOP - 0x0100
+	ENDIF
 	ENDIF
 	ENDIF
 	ENDIF

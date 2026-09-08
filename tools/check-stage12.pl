@@ -36,28 +36,48 @@ die "Stage 12 may call DSS with the ISA window open\n"
 die "WGET resume does not use DSS MOVE_FP/206 gating\n"
     unless $code =~ /DSS_MOVE_FP/ && $code =~ /SEEK_END/ &&
            $code =~ /LD\s+DE,206/ && $code =~ /Range: bytes=/;
-die "WGET 8 KiB buffer or shared 2 KiB work area changed\n"
-    unless $code =~ /STAGE9_FILE_CAPACITY\s+EQU\s+0x2000/ &&
+die "WGET 6 KiB disk buffer or shared 2 KiB work area changed\n"
+    unless $code =~ /STAGE9_FILE_CAPACITY\s+EQU\s+0x1800/ &&
            $code =~ /STAGE9_TX_CAPACITY\s+EQU\s+0x0400/ &&
            $code =~ /STAGE9_RX_CAPACITY\s+EQU\s+0x0400/;
+# The advertised receive window is the whole point of the Stage 12 transport
+# tuning: it must be the room actually left in the pending region, never the
+# full-or-nothing value it started as, which closed the window on every accepted
+# segment and made the peer stop after each MSS.
+my $transport = slurp('src/lib/tcp_transport.asm', 0);
+die "Stage 12 advertises a binary receive window instead of real free space\n"
+    unless $transport =~ /HL = free = CAPACITY - OFF - LEN/ &&
+           $transport !~ /LD\s+HL,TCP_RECV_WINDOW\s*\n\s*JP\s+Z,\.WINDOW_OPEN/ &&
+           $transport =~ /silly window syndrome/;
+die "Stage 12 receive window is no longer several segments deep\n"
+    unless slurp('src/include/tcp.inc', 0) =~
+           /IFDEF STAGE12_LAYOUT\nTCP_RECV_SEGMENTS\s+EQU\s+[2-9]/ &&
+           $code =~ /S11_PENDING_CAPACITY\s+EQU\s+0x0A78/;
+die "Stage 12 test responders answer one segment per frame\n"
+    unless slurp('tools/host/stage12_responder.py', 0) =~ /while connection\["pending"\]:/ &&
+           $code =~ /Keep sending while the window the client advertised still has room/;
+
 die "Stage 12 layout assertions are incomplete\n"
     unless $code =~ /W12_STATE_BASE \+ 0x40 <= S11_APP_BUFFER/ &&
            $code =~ /S9_TFTP_ERROR_DESC \+ 10 <= S10_RUNTIME_STACK_TOP - 0x0100/ &&
-           $code =~ /S10_BOOTSTRAP_STACK_RESERVE <= S10_STACK_TOP/;
+           $code =~ /ASSERT \$ <= PAGE_BASE/;
 die "Stage 12 does not preserve the IX command record before its first DSS call\n"
     unless $code =~ /SAVE_COMMAND[\s\S]*LDIR[\s\S]*ALLOCATE_FRESH[\s\S]*DSS_GETMEM/ &&
            $code =~ /S10_COMMAND_BUFFER\s+EQU\s+0x4000/;
-# WGET's image fills a whole window, so it loads into WIN1 and claims WIN2. Its
-# stack must end up in the claimed page, and nothing may print before it does.
-die "Stage 12 does not claim WIN2 for its runtime page\n"
+# WGET runs the standard DSS layout: the program owns WIN1+WIN2 as one region,
+# so it claims no page, and both stacks live at the top of WIN2. Re-introducing
+# a GETMEM/SETWIN2 claim would put the entry stack back inside a window that is
+# remapped under it, which is what used to make oversized images fail silently.
+die "Stage 12 no longer runs the standard WIN1+WIN2 layout\n"
     unless $code =~ /PAGE_BASE\s+EQU\s+0x8000/ &&
-           $code =~ /DSS_SETWIN2/ &&
+           $code =~ /S10_STACK_TOP\s+EQU\s+0xBFF0/ &&
+           $code =~ /No GETMEM: WIN2 is the program's own second window/ &&
            $code =~ /S10_RUNTIME_STACK_TOP\s+EQU\s+PAGE_BASE \+ 0x3FF0/;
 die "Stage 12 prints before its runtime page is claimed\n"
     unless $code =~ /ALLOCATE_FRESH\s*\n\s*JP\s+C,BOOT_FAIL\s*\n\s*LD\s+SP,S10_RUNTIME_STACK_TOP/ &&
            $code =~ /BOOT_FAIL\s*\n\s*DSS_RETURN/;
-die "WGET cleanup does not close file/driver/page in order\n"
-    unless $code =~ /EXIT_NO_RESULT[\s\S]*DSS_CLOSE_FILE[\s\S]*NETDRV\.DONE[\s\S]*DSS_FREEMEM[\s\S]*DSS_EXIT/;
+die "WGET cleanup does not close file then driver before exit\n"
+    unless $code =~ /EXIT_NO_RESULT[\s\S]*DSS_CLOSE_FILE[\s\S]*NETDRV\.DONE[\s\S]*DSS_EXIT/;
 die "WGET may report success after a failed final file close\n"
     unless $code =~ /DOWNLOAD_DONE[\s\S]*CLOSE_OUTPUT[\s\S]*JP\s+C,FILE_FAIL/ &&
            $code =~ /CLOSE_OUTPUT[\s\S]*DSS_CLOSE_FILE[\s\S]*RET\s+C/;
@@ -66,12 +86,14 @@ my $exe = slurp('build/WGET.EXE', 1);
 die "WGET.EXE has invalid DSS header\n"
     unless substr($exe, 0, 4) eq "EXE\x01" && unpack('v', substr($exe, 4, 2)) == 128 &&
            unpack('v', substr($exe, 16, 2)) == 0x4100 &&
-           unpack('v', substr($exe, 20, 2)) == 0x8000;
-# DSS installs the header stack before the entry point runs and spends it on the
-# loader and on interrupt frames, so it must already be clear of the image.
-die "WGET.EXE entry stack is not clear of its own code\n"
-    if unpack('v', substr($exe, 20, 2)) < 0x4080 + length($exe) + 0xC0;
-die "WGET.EXE overlaps bootstrap stack reserve\n" if 0x8080 + length($exe) > 0xBFE0;
+           unpack('v', substr($exe, 20, 2)) == 0xBFF0;
+# The image is code and rodata loaded at 4080h; PAGE_BASE (8000h) is where the
+# runtime data area starts, so that bounds it. The header stack sits at the top
+# of WIN2, a whole window above, and must stay clear of the data area's top.
+die "WGET.EXE runs into its runtime data area\n"
+    if 0x4080 + length($exe) > 0x8000;
+die "WGET.EXE entry stack is not at the top of WIN2\n"
+    if unpack('v', substr($exe, 20, 2)) != 0xBFF0;
 my $payload = substr($exe, 128);
 die "WGET.EXE contains zero-filled runtime BSS\n" if $payload =~ /\x00{128}/;
 
@@ -102,4 +124,4 @@ for my $tag ('ZERO.BIN', 'SMALL.BIN', 'LARGE.BIN', 'RANGE.BIN',
     die "Stage 12 responder lacks $tag\n" unless $responder =~ /\Q$tag\E/;
 }
 
-print "Stage 12 host contract: sibling golden UX, HTTP/DNS, 8 KiB files, resume, bounded waits, cleanup and artifacts passed\n";
+print "Stage 12 host contract: sibling golden UX, HTTP/DNS, 6 KiB files, resume, bounded waits, cleanup and artifacts passed\n";

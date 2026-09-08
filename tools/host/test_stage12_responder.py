@@ -43,6 +43,33 @@ class Stage12ResponderTest(unittest.TestCase):
         self.assertEqual(parsed["mss"], 536)
         self.assertEqual(struct.unpack("!H", frame[12:14])[0], 0x0800)
 
+    def test_response_fills_the_advertised_window(self):
+        # A responder that answers one segment per received frame is a
+        # stop-and-wait pipe whatever window the client offers, which is what
+        # made the receive-window work invisible in MAME. Five MSS advertised
+        # has to come back as five segments off one request.
+        responder = stage12.Responder("default")
+        window = 5 * stage11.TCP_MSS
+        # build_tcp writes a server->client frame, so hand it the mirrored
+        # tuple to get a client->server one.
+        mirror = {"destination_port": 49152, "source_port": stage12.HTTP_PORT,
+                  "destination": stage12.CLIENT_IP, "source": stage12.SERVICE_IP,
+                  "ether_source": bytes.fromhex("02608c123456")}
+        client = lambda seq, ack, flags, payload=b"": stage11.build_tcp(
+            mirror, seq, ack, flags, payload, window=window)
+        synack = responder.handle(client(1000, 0, 0x02))
+        self.assertEqual([label for label, _ in synack], ["SYNACK"])
+        server_isn = stage11.parse_tcp(synack[0][1])["sequence"]
+        get = b"GET /LARGE.BIN HTTP/1.0\r\nHost: wget.stage12.test\r\n\r\n"
+        replies = responder.handle(client(1001, server_isn + 1, 0x18, get))
+        self.assertEqual(len(replies), 5, "responder did not fill the window")
+        payloads = [stage11.parse_tcp(frame)["payload"] for _, frame in replies]
+        self.assertEqual(sum(len(p) for p in payloads), window)
+        # Contiguous and in order, so the client accepts every one of them.
+        sequences = [stage11.parse_tcp(frame)["sequence"] for _, frame in replies]
+        for previous, following, payload in zip(sequences, sequences[1:], payloads):
+            self.assertEqual(following, previous + len(payload))
+
 
 if __name__ == "__main__":
     unittest.main()

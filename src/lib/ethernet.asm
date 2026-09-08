@@ -16,9 +16,9 @@ IP_PROTO_UDP		EQU 17
 
 ; CHECKSUM
 ; In: HL=bytes, BC=length. Out: HL=Internet checksum, H is first wire byte.
-; Handles odd lengths. Clobbers AF/BC/DE; preserves IX/IY.
+; Handles odd lengths. Clobbers AF/BC/DE; preserves IX/IY, which since
+; ACCUMULATE stopped walking its input through IX costs no save/restore here.
 CHECKSUM
-	PUSH	IX,IY
 	LD	DE,0
 	CALL	ACCUMULATE
 	LD	A,D
@@ -27,31 +27,27 @@ CHECKSUM
 	LD	A,E
 	CPL
 	LD	L,A
-	POP	IY,IX
 	RET
 
 ; VERIFY_CHECKSUM succeeds when a complete header sums to FFFFh.
 VERIFY_CHECKSUM
-	PUSH	IX,IY
 	CALL	CHECKSUM
 	LD	A,H
 	OR	L
 	JR	NZ,VERIFY_BAD
 	XOR	A
-	POP	IY,IX
 	RET
 VERIFY_BAD
 	LD	A,NETDRV_ERR_PARAMETER
 	SCF
-	POP	IY,IX
 	RET
 
 ; UDP_IPV4_CHECKSUM
 ; In: HL=20-byte IPv4 header (no options), BC=UDP length. Returns checksum in
 ; HL. The UDP checksum field must be zero while building; with a received
-; checksum included, a valid datagram returns 0000h. Preserves IX/IY.
+; checksum included, a valid datagram returns 0000h. Preserves IX/IY for free,
+; as ACCUMULATE no longer walks its input through IX.
 UDP_IPV4_CHECKSUM
-	PUSH	IX,IY
 	LD	(UDP_IP_PTR),HL
 	LD	(UDP_LENGTH),BC
 	LD	DE,0
@@ -83,35 +79,79 @@ UDP_IPV4_CHECKSUM
 	LD	A,E
 	CPL
 	LD	L,A
-	POP	IY,IX
 	RET
 
 ; In: HL=data, BC=len, DE=ones-complement accumulator. Out: DE updated.
+; Clobbers AF, BC and HL; unlike the earlier (IX+0) walk it leaves IX intact.
+;
+; The running sum lives in HL and the source in DE, so a byte costs
+; LD A,(DE)/ADC A,r/LD r,A/INC DE -- 21 T where indexed loads cost 66 T. The
+; carry has to ripple across the whole buffer, so the loop control is built
+; only from instructions that leave CF alone: DJNZ, INC DE and 8-bit DEC.
+; Each word adds its low half first, which is what makes the carry out of one
+; word land in the next word's bit 0 -- the end-around carry of RFC 1071 --
+; rather than in its bit 8. That costs nothing but means HL holds the
+; byte-swapped sum while the loop runs, so the halves are exchanged on entry
+; and again on exit.
 ACCUMULATE
-	PUSH	HL
-	POP	IX
-.ACC_LOOP
 	LD	A,B
 	OR	C
 	RET	Z
-	LD	H,(IX+0)
-	INC	IX
-	DEC	BC
+	LD	A,C
+	AND	1
+	LD	(ACC_ODD),A		; a trailing byte pads as the high half
+	SRL	B
+	RR	C			; BC = whole 16-bit words
+	EX	DE,HL			; HL = accumulator, DE = source
+	LD	A,H
+	LD	H,L
+	LD	L,A			; enter the byte-swapped domain
+	OR	A			; CF = 0 before the ripple starts
 	LD	A,B
 	OR	C
-	JR	Z,.ACC_ODD
-	LD	L,(IX+0)
-	INC	IX
-	DEC	BC
-	JR	.ACC_ADD
-.ACC_ODD
-	LD	L,0
-.ACC_ADD
-	ADD	HL,DE
-	EX	DE,HL
-	JR	NC,.ACC_LOOP
+	JR	Z,.ACC_TAIL
+	LD	A,B			; DJNZ counts in B, so run the low half
+	LD	B,C			; inline and the high half as outer passes
+	LD	C,A
+	LD	A,B
+	OR	A
+	JR	Z,.ACC_WORDS
+	INC	C
+.ACC_WORDS
+	LD	A,(DE)
+	ADC	A,L
+	LD	L,A
 	INC	DE
-	JR	.ACC_LOOP
+	LD	A,(DE)
+	ADC	A,H
+	LD	H,A
+	INC	DE
+	DJNZ	.ACC_WORDS
+	DEC	C
+	JR	NZ,.ACC_WORDS
+.ACC_TAIL
+	LD	A,(ACC_ODD)
+	BIT	0,A			; BIT, not OR: the ripple carry is still live
+	JR	Z,.ACC_FOLD
+	LD	A,(DE)
+	ADC	A,L
+	LD	L,A
+	LD	A,0			; not XOR A, which would drop the carry
+	ADC	A,H
+	LD	H,A
+.ACC_FOLD
+	LD	BC,0
+	ADC	HL,BC			; fold the end-around carry once...
+	JR	NC,.ACC_DONE
+	INC	HL			; ...and again if FFFFh wrapped to zero
+.ACC_DONE
+	LD	A,H
+	LD	H,L
+	LD	L,A
+	EX	DE,HL
+	RET
+
+ACC_ODD		DB 0
 
 ; WRITE_BE16: HL=value, DE=destination. Advances DE by two.
 WRITE_BE16

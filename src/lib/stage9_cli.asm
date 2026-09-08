@@ -441,6 +441,7 @@ V_PUT	DB "PUT",0
 	ENDIF	; !STAGE12_LAYOUT
 
 	IFDEF STAGE12_LAYOUT
+	IFNDEF STAGE13_LAYOUT
 ; PARSE_WGET implements:
 ; WGET url [-o output] [-y|-f] [-r] [-d]
 ; Options may precede or follow the URL.  W12_FLAGS: bit 0 force, bit 1 resume,
@@ -541,6 +542,320 @@ PARSE_WGET
 	SCF
 	POP	IY,IX
 	RET
+	ENDIF
+	ENDIF
+
+	IFDEF STAGE13_LAYOUT
+; PARSE_FTP implements:
+;   FTP host[:port] path       [-l|-n] [-u user] [-p pass] [-o out] [-y|-f] [-r] [-d]
+;   FTP host[:port] PUT local  [-u user] [-p pass] [-o remote-name]
+;   FTP host[:port] [path] -l|-n ...
+;   FTP /?
+; F13_FLAGS bits: 0 force, 1 resume, 2 dots, 3 list (-l and -n both set it;
+; the image-size budget didn't leave room for NLST's own fallback, so -n
+; just lists the same as -l -- see ftp.asm), 5 has -o, 6 has -u, 7 has -p.
+; F13_MODE is left 0 (GET-or-LIST, resolved by the
+; caller once parsing is done) or set to 1 the moment the "PUT" keyword is
+; recognised. F13_POS_COUNT tracks which positional comes next: 0 host,
+; 1 verb-or-path, 2 the local file after a recognised PUT, 3 done.
+; A raw -o value is staged in F13_OUTPUT_OVERRIDE since whether it means the
+; local or the remote name depends on the mode, decided only after every
+; token is seen (and NOT in F13_REPLY_LINE: that gets overwritten by every
+; control-channel reply, all of which happen before DERIVE_ARGS's pointer to
+; it would ever be dereferenced).
+PARSE_FTP
+	PUSH	IX,IY
+	XOR	A
+	LD	(F13_FLAGS),A
+	LD	(F13_POS_COUNT),A
+	LD	(F13_MODE),A
+	LD	HL,21
+	LD	(F13_CTRL_PORT),HL
+	CALL	READER_INIT
+	JP	.F_NEXT
+.F_LOOP
+	LD	A,(CLI_TOKEN_LEN)
+	CP	2
+	JP	NZ,.F_POSITIONAL
+	LD	A,(HL)
+	CP	'-'
+	JR	Z,.F_OPT
+	CP	'/'
+	JP	NZ,.F_POSITIONAL
+.F_OPT
+	INC	HL
+	LD	A,(HL)
+	CALL	UPPER
+	CP	'H'
+	JP	Z,.F_HELP
+	CP	'?'
+	JP	Z,.F_HELP
+	CP	'U'
+	JP	Z,.F_USERFLAG
+	CP	'P'
+	JP	Z,.F_PASSFLAG
+	CP	'O'
+	JP	Z,.F_OUTPUTFLAG
+	; L/N/Y/F/R/D just OR one bit into F13_FLAGS; a small table beats six
+	; more CP/JR pairs. N shares L's bit: -n folds into -l, both send LIST
+	; (see ftp.asm) since the image-size budget has no room for NLST's own
+	; fallback.
+	LD	C,A
+	LD	HL,SIMPLE_FLAGS
+.F_SCAN
+	LD	A,(HL)
+	OR	A
+	JP	Z,.F_BAD
+	INC	HL
+	CP	C
+	JR	Z,.F_HIT
+	INC	HL
+	JR	.F_SCAN
+.F_HIT
+	LD	A,(F13_FLAGS)
+	OR	(HL)
+	LD	(F13_FLAGS),A
+	JP	.F_NEXT
+.F_USERFLAG
+	CALL	NEXT_TOKEN
+	JP	C,.F_BAD
+	LD	DE,F13_USER
+	LD	C,31
+	CALL	COPY_TOKEN
+	JP	C,.F_BAD
+	LD	A,(F13_FLAGS)
+	OR	0x40
+	LD	(F13_FLAGS),A
+	JP	.F_NEXT
+.F_PASSFLAG
+	CALL	NEXT_TOKEN
+	JP	C,.F_BAD
+	LD	DE,F13_PASS
+	LD	C,31
+	CALL	COPY_TOKEN
+	JP	C,.F_BAD
+	LD	A,(F13_FLAGS)
+	OR	0x80
+	LD	(F13_FLAGS),A
+	JP	.F_NEXT
+.F_OUTPUTFLAG
+	CALL	NEXT_TOKEN
+	JP	C,.F_BAD
+	LD	DE,F13_OUTPUT_OVERRIDE
+	LD	C,95
+	CALL	COPY_TOKEN
+	JP	C,.F_BAD
+	LD	A,(F13_FLAGS)
+	OR	0x20
+	LD	(F13_FLAGS),A
+	JP	.F_NEXT
+.F_HELP
+	CALL	NEXT_TOKEN
+	JP	NC,.F_BAD
+	LD	A,(F13_POS_COUNT)
+	OR	A
+	JP	NZ,.F_BAD
+	LD	A,(F13_FLAGS)
+	OR	A
+	JP	NZ,.F_BAD
+	LD	A,EL3_CLI_HELP
+	SCF
+	POP	IY,IX
+	RET
+.F_POSITIONAL
+	LD	A,(F13_POS_COUNT)
+	OR	A
+	JR	Z,.F_HOST
+	CP	1
+	JR	Z,.F_VERB
+	CP	2
+	JR	Z,.F_PUTFILE
+	JP	.F_BAD
+.F_HOST
+	LD	DE,F13_HOST
+	LD	C,63
+	CALL	COPY_TOKEN
+	JP	C,.F_BAD
+	CALL	SPLIT_HOST_PORT
+	JP	C,.F_BAD
+	LD	A,1
+	LD	(F13_POS_COUNT),A
+	JP	.F_NEXT
+.F_VERB
+	LD	A,(CLI_TOKEN_LEN)
+	CP	3
+	JR	NZ,.F_PATH
+	PUSH	HL
+	LD	A,(HL)
+	CALL	UPPER
+	CP	'P'
+	JR	NZ,.F_NOTPUT
+	INC	HL
+	LD	A,(HL)
+	CALL	UPPER
+	CP	'U'
+	JR	NZ,.F_NOTPUT
+	INC	HL
+	LD	A,(HL)
+	CALL	UPPER
+	CP	'T'
+	JR	NZ,.F_NOTPUT
+	POP	HL
+	LD	A,1
+	LD	(F13_MODE),A
+	LD	A,2
+	LD	(F13_POS_COUNT),A
+	JP	.F_NEXT
+.F_NOTPUT
+	POP	HL
+.F_PATH
+	LD	DE,F13_REMOTE_PATH
+	LD	C,255
+	CALL	COPY_TOKEN
+	JP	C,.F_BAD
+	LD	A,3
+	LD	(F13_POS_COUNT),A
+	JP	.F_NEXT
+.F_PUTFILE
+	LD	DE,F13_LOCAL_OUTPUT
+	LD	C,95
+	CALL	COPY_TOKEN
+	JP	C,.F_BAD
+	LD	A,3
+	LD	(F13_POS_COUNT),A
+.F_NEXT
+	CALL	NEXT_TOKEN
+	JP	NC,.F_LOOP
+	LD	A,(F13_POS_COUNT)
+	OR	A
+	JP	Z,.F_BAD
+	CP	2
+	JP	Z,.F_BAD		; saw PUT but no local filename followed
+	CP	1
+	JR	NZ,.F_HAVE_PATH
+	LD	A,(F13_FLAGS)
+	AND	0x08
+	JP	Z,.F_BAD		; bare host only valid with -l/-n
+	XOR	A
+	LD	(F13_REMOTE_PATH),A
+.F_HAVE_PATH
+	LD	A,(F13_FLAGS)
+	BIT	6,A
+	JR	NZ,.F_HAVE_U
+	LD	HL,DEFAULT_FTP_USER
+	LD	DE,F13_USER
+	CALL	COPY_Z_NUL
+.F_HAVE_U
+	LD	A,(F13_FLAGS)
+	BIT	7,A
+	JR	NZ,.F_DONE
+	BIT	6,A
+	JR	NZ,.F_EMPTY_PASS
+	LD	HL,DEFAULT_FTP_PASS
+	LD	DE,F13_PASS
+	CALL	COPY_Z_NUL
+	JR	.F_DONE
+.F_EMPTY_PASS
+	XOR	A
+	LD	(F13_PASS),A
+.F_DONE
+	XOR	A
+	POP	IY,IX
+	RET
+.F_BAD
+	LD	A,NETDRV_ERR_PARAMETER
+	SCF
+	POP	IY,IX
+	RET
+
+; SPLIT_HOST_PORT scans the just-copied F13_HOST for ':'. Absent, the
+; caller's default (21) stands. Present, it is replaced with a NUL and the
+; digits after it become F13_CTRL_PORT; trailing garbage, no digits, or a
+; literal 0 are rejected. More than 5 digits is rejected outright, but a
+; 5-digit value between 65536 and 99999 wraps mod 65536 rather than being
+; caught -- a malformed port sent to the wrong number fails to connect
+; instead of failing to parse, which is a fine trade for a CLI argument
+; nobody but the caller controls.
+SPLIT_HOST_PORT
+	LD	HL,F13_HOST
+.SCAN
+	LD	A,(HL)
+	OR	A
+	JR	Z,.DONE
+	CP	':'
+	JR	Z,.SPLIT
+	INC	HL
+	JR	.SCAN
+.SPLIT
+	XOR	A
+	LD	(HL),A
+	INC	HL
+	LD	DE,0
+	LD	B,0
+.DIGIT
+	LD	A,(HL)
+	SUB	'0'
+	JR	C,.PEND
+	CP	10
+	JR	NC,.PEND
+	LD	C,A
+	INC	B
+	LD	A,B
+	CP	6			; more than 5 digits is already > 65535
+	JR	NC,.BAD
+	PUSH	HL
+	; DE = DE*10 + C, via HL = DE*2, *4 (=DE*8), plus the two DE's and C.
+	LD	H,D
+	LD	L,E
+	ADD	HL,HL
+	ADD	HL,HL
+	ADD	HL,HL
+	ADD	HL,DE
+	ADD	HL,DE
+	LD	D,0
+	LD	E,C
+	ADD	HL,DE
+	EX	DE,HL
+	POP	HL
+	INC	HL
+	JR	.DIGIT
+.PEND
+	LD	A,B
+	OR	A
+	JR	Z,.BAD
+	LD	A,(HL)
+	OR	A
+	JR	NZ,.BAD
+	LD	A,D
+	OR	E
+	JR	Z,.BAD
+	LD	(F13_CTRL_PORT),DE
+.DONE
+	OR	A
+	RET
+.BAD
+	SCF
+	RET
+
+COPY_Z_NUL
+	LD	A,(HL)
+	LD	(DE),A
+	OR	A
+	RET	Z
+	INC	HL
+	INC	DE
+	JR	COPY_Z_NUL
+
+DEFAULT_FTP_USER DB "anonymous",0
+DEFAULT_FTP_PASS DB "anonymous@",0
+SIMPLE_FLAGS
+	DB	'L',0x08
+	DB	'N',0x08
+	DB	'Y',0x01
+	DB	'F',0x01
+	DB	'R',0x02
+	DB	'D',0x04
+	DB	0
 	ENDIF
 
 READER_INIT

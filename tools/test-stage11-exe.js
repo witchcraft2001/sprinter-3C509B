@@ -72,6 +72,8 @@ for (const size of [0, 1, 535, 536, 537, 1072, 2048, 4096]) {
   assert.strictEqual((result.output.match(/channel=/g) || []).length, 2);
   const frames = tcpFrames(result), syns = frames.filter((packet) => packet.flags === 2);
   assert.strictEqual(syns.length, 2);
+  // TCP_RECV_WINDOW (tcp.inc) is TCP_MSS here: only STAGE12_LAYOUT (WGET)
+  // reserves enough page space to buffer more than one segment per channel.
   assert.ok(syns.every((packet) => packet.window === 536));
   assert.notStrictEqual(syns[0].sourcePort, syns[1].sourcePort);
   assert.ok(frames.filter((packet) => packet.payload.length).every((packet) => packet.payload.length <= 536));

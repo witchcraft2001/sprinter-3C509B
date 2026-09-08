@@ -24,9 +24,9 @@ missing, or malformed `Location` fails without writing the response body.
 HTTP error pages are not stored. A new empty output is removed after an HTTP
 failure; a pre-existing resume file is retained unchanged.
 
-Normal progress is repainted after the first and every fourth 8 KiB flush, then
-once at completion. `-d` prints one dot per 8 KiB flush instead of the KB
-counter; the final time/rate summary is still printed. Content without a
+Normal progress is repainted after every 6 KiB disk-buffer flush, then once at
+completion. `-d` prints one dot per flush instead of the KB counter; the final
+time/rate summary is still printed. Content without a
 `Content-Length` is read until the peer closes. Esc or Ctrl+C, timeout, and a
 premature close retain already received bytes for a later `-r` run.
 

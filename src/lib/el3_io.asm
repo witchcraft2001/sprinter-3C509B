@@ -166,19 +166,37 @@ FIFO_ZERO
 	POP	IY,IX,HL,DE,BC
 	RET
 
+; FIFO_READ moves a whole received packet, so its inner loop is the one worth
+; tightening: DJNZ against a fixed port pointer costs 33 T/byte where the
+; counted 16-bit loop cost 53, shortening the copy and the DI window around it
+; by the same margin. DJNZ only counts in B, so the high half of the count runs
+; as outer passes. Unrolling four bytes per pass would buy another 10 T/byte,
+; but the WGET image has no room for it (S10_BOOTSTRAP_STACK_RESERVE,
+; memory.inc). The other three bursts stay counted: on a download FIFO_WRITE
+; only sends ACK-sized bursts, and FIFO_ZERO/FIFO_SKIP move at most three
+; padding bytes.
 FIFO_READ
 	PUSH	BC,DE,HL,IX,IY
 	CALL	OPEN_FIFO
 	JR	C,.FIFO_READ_ERROR
-.FIFO_READ_LOOP
+	; HL = fixed data port, DE = destination, BC = count.
 	LD	A,B
 	OR	C
 	JR	Z,.FIFO_READ_CLOSE
+	LD	A,B
+	LD	B,C
+	LD	C,A
+	LD	A,B
+	OR	A
+	JR	Z,.FIFO_READ_LOOP
+	INC	C
+.FIFO_READ_LOOP
 	LD	A,(HL)
 	LD	(DE),A
 	INC	DE
-	DEC	BC
-	JR	.FIFO_READ_LOOP
+	DJNZ	.FIFO_READ_LOOP
+	DEC	C
+	JR	NZ,.FIFO_READ_LOOP
 .FIFO_READ_CLOSE
 	CALL	@ISA.CLOSE
 .FIFO_READ_ERROR

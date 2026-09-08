@@ -134,9 +134,16 @@ class Responder:
                 self.event(f"HTTP target={target} range={'yes' if b'Range:' in raw else 'no'}")
         if request["flags"] & 1:
             connection["client_next"] = (connection["client_next"] + 1) & 0xFFFFFFFF
-        in_flight = (connection["server_next"] - connection["server_acked"]) & 0xFFFFFFFF
-        available = max(0, connection["window"] - in_flight)
-        if connection["pending"] and available:
+        # Fill the window the client advertised instead of answering one segment
+        # per received frame. A strictly reactive responder is a stop-and-wait
+        # pipe no matter how large a window the client offers, which made every
+        # receive-window measurement taken against it meaningless.
+        replies = []
+        while connection["pending"]:
+            in_flight = (connection["server_next"] - connection["server_acked"]) & 0xFFFFFFFF
+            available = max(0, connection["window"] - in_flight)
+            if not available:
+                break
             size = min(stage11.TCP_MSS, available, len(connection["pending"]))
             payload = bytes(connection["pending"][:size])
             del connection["pending"][:size]
@@ -146,7 +153,9 @@ class Responder:
                                       connection["client_next"], flags, payload)
             connection["server_next"] = (connection["server_next"] + size + (1 if finish else 0)) & 0xFFFFFFFF
             connection["fin"] = finish
-            return [("HTTP", reply)]
+            replies.append(("HTTP", reply))
+        if replies:
+            return replies
         if accepted or request["payload"]:
             return [("ACK", stage11.build_tcp(request, connection["server_next"],
                                                 connection["client_next"], 0x10))]

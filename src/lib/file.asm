@@ -10,8 +10,17 @@
 
 	MODULE FILE
 
+	IFDEF STAGE13_LAYOUT
+FILE_SAVED_CWD	EQU F13_SAVED_CWD
+FILE_SAVED_CWD_CAPACITY EQU 256
+FILE_DIR_BUFFER	EQU FILE_SAVED_CWD+FILE_SAVED_CWD_CAPACITY
+	ELSE
 	IFDEF STAGE12_LAYOUT
-FILE_SAVED_CWD	EQU 0x7B00
+; A literal 0x7B00 used to sit below PAGE_BASE, inside the range WGET's own
+; growing image occupies -- a bigger build would silently overlap live code
+; with no assembler error. The gap between the pending region and the TCP
+; context (memory.inc) is unused page space instead.
+FILE_SAVED_CWD	EQU PAGE_BASE + 0x2A78
 	ELSE
 FILE_SAVED_CWD	EQU STAGE9_SCRATCH
 	ENDIF
@@ -19,6 +28,10 @@ FILE_SAVED_CWD_CAPACITY EQU 256
 FILE_DIR_BUFFER	EQU FILE_SAVED_CWD+FILE_SAVED_CWD_CAPACITY
 
 	ASSERT FILE_DIR_BUFFER+96 <= STAGE9_SCRATCH+STAGE9_SCRATCH_CAPACITY
+	IFDEF STAGE12_LAYOUT
+	ASSERT FILE_DIR_BUFFER+96 <= S11_CONTEXT0
+	ENDIF
+	ENDIF
 
 ; OPEN_OUTPUT
 ; In: HL=ASCIIZ path, A=0 prompt or nonzero force overwrite.
@@ -270,7 +283,18 @@ MSG_ORC_PROMPT	DB "' exists. Overwrite/Resume/Cancel [O/R/C]? ",0
 MSG_ABORTED	DB "Aborted by user.",13,10,0
 	ENDIF
 
-	IFNDEF STAGE12_LAYOUT
+; OPEN_INPUT is needed by any app that reads a local file: plain TFTP PUT,
+; and FTP's STOR (STAGE13_LAYOUT). WGET and DLSPEED never read one and cannot
+; spare the bytes, so it stays excluded for STAGE12_LAYOUT builds that are
+; not also STAGE13_LAYOUT.
+	IFDEF STAGE12_LAYOUT
+	IFDEF STAGE13_LAYOUT
+	DEFINE FILE_NEEDS_OPEN_INPUT
+	ENDIF
+	ELSE
+	DEFINE FILE_NEEDS_OPEN_INPUT
+	ENDIF
+	IFDEF FILE_NEEDS_OPEN_INPUT
 ; OPEN_INPUT: path-aware read-only open.
 OPEN_INPUT
 	CALL	SETUP_PATH
@@ -295,6 +319,16 @@ OPEN_INPUT
 .BAD_DIRECT
 	LD	A,NETDRV_ERR_FILE_IO
 	SCF
+	RET
+
+; READ_CHUNK is a thin wrapper over DSS_READ_FILE for STOR's upload slices.
+; In: A=handle, HL=buffer, DE=capacity. Out: DE=bytes actually read (0=EOF);
+; CF/A set only on a genuine I/O error, never on a short final read.
+READ_CHUNK
+	LD	C,DSS_READ_FILE
+	RST	DSS
+	RET	C
+	XOR	A
 	RET
 	ENDIF
 

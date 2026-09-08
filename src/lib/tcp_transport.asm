@@ -10,6 +10,26 @@
 	INCLUDE "ip_icmp.inc"
 	INCLUDE "tcp.inc"
 
+	IFDEF STAGE12_LAYOUT
+; The pending buffer must hold a whole TCP_RECV_WINDOW so a burst of segments
+; arriving before the app drains via RECV can be appended rather than
+; rejected -- see PROCESS_FRAME's accept path.
+	ASSERT S11_PENDING_CAPACITY >= TCP_RECV_WINDOW
+	ENDIF
+
+; TCPX_SINGLE_CONTEXT restricts the transport to channel 0 only: RESET clears
+; just one context, SELECT_CONTEXT rejects channel 1, and PROCESS_FRAME never
+; falls through to a second context. WGET and DLSPEED want this -- one stream
+; is all either ever opens. The FTP client needs both channels live at once
+; (control + data) and defines STAGE13_LAYOUT precisely to opt back into the
+; two-channel code below despite also defining STAGE12_LAYOUT for its
+; layout/trims (deep window, standard DSS layout, own diagnostics).
+	IFDEF STAGE12_LAYOUT
+	IFNDEF STAGE13_LAYOUT
+	DEFINE TCPX_SINGLE_CONTEXT
+	ENDIF
+	ENDIF
+
 	MODULE TCPX
 
 CTX_STATE		EQU 0
@@ -28,6 +48,8 @@ CTX_EVENT		EQU 34
 CTX_REMOTE_FIN		EQU 35
 CTX_REMOTE_WINDOW	EQU 36
 CTX_RETRY_LEFT		EQU 38
+CTX_WINDOW_CLOSED	EQU 39	; bit 0: the last segment sent advertised a zero
+				; window. Fits the trailing pad byte of the context.
 
 EVENT_ACK		EQU 0x01
 EVENT_DATA		EQU 0x02
@@ -51,9 +73,11 @@ RESET
 	LD	HL,S11_CONTEXT0
 	LD	BC,S11_CONTEXT_SIZE
 	CALL	ZERO_REGION
+	IFNDEF	TCPX_SINGLE_CONTEXT
 	LD	HL,S11_CONTEXT1
 	LD	BC,S11_CONTEXT_SIZE
 	CALL	ZERO_REGION
+	ENDIF
 	LD	HL,(S11_NEXT_LOCAL_PORT)
 	LD	A,H
 	CP	0xC0
@@ -408,6 +432,17 @@ RECV
 	XOR	A
 	LD	(IX+CTX_PENDING_OFF),A
 	LD	(IX+CTX_PENDING_OFF+1),A
+	IFDEF	STAGE12_LAYOUT
+	; A multi-segment window only closes once the pending region is full,
+	; so draining it does not by itself mean the peer is blocked. Spend the
+	; extra round trip on a window update only when we really did advertise
+	; zero; SEND_SEGMENT_COMMON below clears the latch as it reopens.
+	BIT	0,(IX+CTX_WINDOW_CLOSED)
+	JP	Z,.RECV_SUCCESS
+	ELSE
+	; The one-MSS window closes on every accepted segment, so a drained
+	; pending slot always means the window just reopened from zero.
+	ENDIF
 	LD	A,TCP_FLAG_ACK
 	LD	BC,0
 	CALL	SEND_SEGMENT		; best-effort window update
@@ -421,8 +456,26 @@ RECV
 	SCF
 	JP	.RECV_RETURN
 .RECV_CLOSED
-.RECV_STATE_ERROR
 	LD	A,TCP_ERR_CLOSED
+	LD	BC,0
+	SCF
+	JP	.RECV_RETURN
+; .RECV_STATE_ERROR is reached with no pending data, no FIN seen, and the
+; context already closed. That happens for a plain orderly close (CTX_STATE
+; was cleared with nothing more specific to say -- CLEAR_CONTEXT zeroes
+; CTX_LAST_STATUS along with the rest, and no real TCP_ERR_*/NETDRV_ERR_*
+; code is ever 0) but also for a RST that HANDLE_SEGMENT's ACCEPT_RST
+; recorded and closed the context for *before* this call, e.g. one that
+; arrived while the caller was busy waiting on the other channel's own
+; WAIT_FOR_EVENT rather than this one's. Reporting a blanket TCP_ERR_CLOSED
+; either way lets a genuinely reset, truncated transfer look like an
+; orderly one; CTX_LAST_STATUS already remembers which it was.
+.RECV_STATE_ERROR
+	LD	A,(IX+CTX_LAST_STATUS)
+	OR	A
+	JR	NZ,.RECV_LAST_STATUS
+	LD	A,TCP_ERR_CLOSED
+.RECV_LAST_STATUS
 	LD	BC,0
 	SCF
 	JP	.RECV_RETURN
@@ -542,6 +595,12 @@ STATUS
 	ENDIF
 
 SELECT_CONTEXT
+	IFDEF	TCPX_SINGLE_CONTEXT
+	OR	A
+	JP	NZ,.BAD
+	LD	(S11_CHANNEL),A
+	LD	IX,S11_CONTEXT0
+	ELSE
 	CP	2
 	JP	NC,.BAD
 	LD	(S11_CHANNEL),A
@@ -550,6 +609,7 @@ SELECT_CONTEXT
 	JP	Z,.STORE
 	LD	IX,S11_CONTEXT1
 .STORE
+	ENDIF
 	PUSH	IX
 	POP	HL
 	LD	(S11_SELECTED_CONTEXT),HL
@@ -835,11 +895,60 @@ SEND_SEGMENT_COMMON
 	LD	(S11_TCP_BUILD_DESC+TCPB_PAYLOAD_LENGTH),HL
 	LD	A,(S11_BUILD_FLAGS)
 	LD	(S11_TCP_BUILD_DESC+TCPB_FLAGS),A
-	LD	HL,TCP_MSS
+	IFDEF	STAGE12_LAYOUT
+	; Advertise the room actually left in the pending region rather than the
+	; full-or-nothing value this used to send. Announcing zero the moment a
+	; single segment is queued makes every ACK for accepted data close the
+	; window, so the peer stops after one MSS and the transfer degenerates
+	; into stop-and-wait plus a second round trip for the reopening update.
+	; Free space is capacity minus the unread bytes and minus the head the
+	; reader has already consumed; RECV slides the tail down, so this stays
+	; contiguous and a segment that fits the number really does fit.
+	;
+	; Below one MSS the answer is still zero: a dribbling window is silly
+	; window syndrome, and a peer that fills it sends runts. The latch is
+	; what tells RECV such a genuine close has to be reopened explicitly.
+	; Advertise the room actually left after the unread tail, which is the
+	; same number the accept path in PROCESS_TCP tests a segment against. So
+	; every byte promised here is one that will really be taken.
+	;
+	; This replaces a full-or-nothing value that announced zero the moment a
+	; single segment was queued. That made every ACK for accepted data close
+	; the window, so the peer stopped after one MSS and the transfer became
+	; stop-and-wait -- plus a second round trip for the reopening update, and
+	; a peer persist-timer backoff whenever that best-effort update was lost.
+	;
+	; The region is linear, so the head a partial drain leaves behind is not
+	; offered again until the whole region empties. That is deliberate: it
+	; costs one window update per filled region rather than one per segment,
+	; and it keeps the promise exact without moving bytes around. Under one
+	; MSS the answer is zero -- a dribbling window is silly window syndrome --
+	; and the latch is what tells RECV such a close needs an explicit reopen.
+	LD	HL,S11_PENDING_CAPACITY
+	LD	E,(IX+CTX_PENDING_OFF)
+	LD	D,(IX+CTX_PENDING_OFF+1)
+	OR	A
+	SBC	HL,DE
+	LD	E,(IX+CTX_PENDING_LEN)
+	LD	D,(IX+CTX_PENDING_LEN+1)
+	SBC	HL,DE			; HL = free = CAPACITY - OFF - LEN
+	LD	DE,TCP_MSS
+	OR	A
+	SBC	HL,DE
+	JP	C,.WINDOW_SHUT
+	ADD	HL,DE			; restore the count the compare consumed
+	RES	0,(IX+CTX_WINDOW_CLOSED)
+	JP	.WINDOW_READY
+.WINDOW_SHUT
+	LD	HL,0
+	SET	0,(IX+CTX_WINDOW_CLOSED)
+	ELSE
+	LD	HL,TCP_RECV_WINDOW
 	LD	A,(IX+CTX_PENDING_LEN)
 	OR	(IX+CTX_PENDING_LEN+1)
 	JP	Z,.WINDOW_READY
 	LD	HL,0
+	ENDIF
 .WINDOW_READY
 	LD	(S11_TCP_BUILD_DESC+TCPB_WINDOW),HL
 	LD	HL,0
@@ -1035,9 +1144,13 @@ PROCESS_FRAME
 	LD	IX,S11_CONTEXT0
 	CALL	MATCH_CONTEXT
 	JP	Z,.MATCHED
+	IFDEF	TCPX_SINGLE_CONTEXT
+	JP	.IGNORE
+	ELSE
 	LD	IX,S11_CONTEXT1
 	CALL	MATCH_CONTEXT
 	JP	NZ,.IGNORE
+	ENDIF
 .MATCHED
 	PUSH	IX
 	POP	HL
@@ -1185,8 +1298,24 @@ HANDLE_SEGMENT
 	LD	A,EVENT_ACK
 	CALL	SET_EVENT
 .NO_ACK
+	; Use S11_SEGMENT_LENGTH, not S11_COPY_LENGTH, for this segment's payload
+	; length: HANDLE_SEGMENT runs from inside WAIT_FOR_EVENT's frame dispatch,
+	; which RECV calls *while S11_COPY_LENGTH already holds the caller's
+	; destination capacity* for the RECV_COPY step below it on the same call
+	; stack. Storing this segment's length in that same cell clobbered RECV's
+	; capacity with whatever this segment's length happened to be; when a
+	; caller requests less than one MSS per RECV (e.g. FTP's GET_LOOP, the
+	; first app to do so against this deep window), RECV_COPY then trusted
+	; the clobbered value and LDIR'd a whole segment into a smaller buffer,
+	; overrunning S11_APP_BUFFER into RUNTIME_BASE (EL3_BASE et al, packed
+	; flush right after it under STAGE13_LAYOUT) and corrupting the ISA base
+	; the very next EL3 register access uses. S11_SEGMENT_LENGTH is safe here:
+	; SEND's own use of it (CHOOSE_SEGMENT_LENGTH) never spans a call that can
+	; re-enter HANDLE_SEGMENT, and SEND_SEGMENT_COMMON's overwrite of it for
+	; the outgoing ACK below happens only after this segment's length is done
+	; being read (the RCV_NXT advance just above .ACK_CURRENT).
 	LD	HL,(S11_TCP_PARSE_DESC+TCPP_PAYLOAD_LENGTH)
-	LD	(S11_COPY_LENGTH),HL
+	LD	(S11_SEGMENT_LENGTH),HL
 	LD	A,H
 	OR	L
 	JP	Z,.CHECK_FIN
@@ -1203,24 +1332,61 @@ HANDLE_SEGMENT
 	EX	DE,HL
 	CALL	CMP4
 	JP	NZ,.ACK_CURRENT
+	IFDEF	STAGE12_LAYOUT
+	; Append after the unread tail (PENDING_OFF+PENDING_LEN) instead of
+	; requiring the slot to start empty: a multi-segment window means the
+	; next in-order segment can legitimately arrive before RECV drains the
+	; previous one. Reject (re-ACK, unmodified) only if it will not fit;
+	; the peer's own retransmit timer recovers a rejected segment.
+	LD	HL,S11_PENDING_CAPACITY
+	LD	E,(IX+CTX_PENDING_OFF)
+	LD	D,(IX+CTX_PENDING_OFF+1)
+	OR	A
+	SBC	HL,DE
+	LD	E,(IX+CTX_PENDING_LEN)
+	LD	D,(IX+CTX_PENDING_LEN+1)
+	SBC	HL,DE			; HL = available = CAPACITY - OFF - LEN
+	LD	DE,(S11_SEGMENT_LENGTH)
+	OR	A
+	SBC	HL,DE
+	JP	C,.ACK_CURRENT		; would not fit
+	CALL	PENDING_BASE
+	LD	L,(IX+CTX_PENDING_OFF)
+	LD	H,(IX+CTX_PENDING_OFF+1)
+	ADD	HL,DE
+	LD	E,(IX+CTX_PENDING_LEN)
+	LD	D,(IX+CTX_PENDING_LEN+1)
+	ADD	HL,DE			; HL = base + off + len = append point
+	EX	DE,HL
+	LD	HL,(S11_TCP_PARSE_DESC+TCPP_PAYLOAD)
+	LD	BC,(S11_SEGMENT_LENGTH)
+	LDIR
+	LD	HL,(S11_SEGMENT_LENGTH)
+	LD	E,(IX+CTX_PENDING_LEN)
+	LD	D,(IX+CTX_PENDING_LEN+1)
+	ADD	HL,DE
+	LD	(IX+CTX_PENDING_LEN),L
+	LD	(IX+CTX_PENDING_LEN+1),H
+	ELSE
 	LD	A,(IX+CTX_PENDING_LEN)
 	OR	(IX+CTX_PENDING_LEN+1)
 	JP	NZ,.ACK_CURRENT
 	CALL	PENDING_BASE
 	LD	HL,(S11_TCP_PARSE_DESC+TCPP_PAYLOAD)
-	LD	BC,(S11_COPY_LENGTH)
+	LD	BC,(S11_SEGMENT_LENGTH)
 	LDIR
-	LD	HL,(S11_COPY_LENGTH)
+	LD	HL,(S11_SEGMENT_LENGTH)
 	LD	(IX+CTX_PENDING_LEN),L
 	LD	(IX+CTX_PENDING_LEN+1),H
 	XOR	A
 	LD	(IX+CTX_PENDING_OFF),A
 	LD	(IX+CTX_PENDING_OFF+1),A
+	ENDIF
 	PUSH	IX
 	POP	HL
 	LD	DE,CTX_RCV_NXT
 	ADD	HL,DE
-	LD	DE,(S11_COPY_LENGTH)
+	LD	DE,(S11_SEGMENT_LENGTH)
 	CALL	ADD16_TO32
 	LD	A,1
 	LD	(S11_SEGMENT_ACCEPTED),A
@@ -1261,6 +1427,12 @@ HANDLE_SEGMENT
 	LD	A,(S11_SEGMENT_ACCEPTED)
 	OR	A
 	JP	Z,.DONE
+	; Every accepted segment is ACKed immediately (no deferred/coalesced
+	; ACK): an earlier attempt at a drain-or-threshold delayed ACK called
+	; @NETDRV.RX_PENDING from here, deep inside PROCESS_FRAME's own call
+	; chain from WAIT_FOR_EVENT/READ_FRAME, and corrupted receive state on
+	; long transfers (reproduced with the call present even when its
+	; result was discarded) -- not yet root-caused, so left out.
 .ACK_CURRENT
 	LD	A,TCP_FLAG_ACK
 	LD	BC,0
