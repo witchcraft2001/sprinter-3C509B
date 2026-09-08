@@ -2,6 +2,10 @@
 ; SPDX-License-Identifier: BSD-3-Clause
 
 EXE_VERSION	EQU 1
+; EL3EEP is the developer EEPROM tool and ships in the diagnostic IMG only, so
+; it carries the VALIDATE diagnostics. Every other application leaves
+; EL3_VALIDATE_DIAG undefined and is unchanged byte for byte.
+	DEFINE EL3_VALIDATE_DIAG
 	DEVICE NOSLOT64K
 	INCLUDE "version.inc"
 	INCLUDE "dss.inc"
@@ -26,6 +30,9 @@ START
 	LD	L,A
 	LD	(EL3_LAST_TICKS),HL
 	LD	(EL3_LAST_STATUS),HL
+	LD	(EL3_PRIMARY_CALC),HL
+	LD	(EL3_SECONDARY_CALC),HL
+	LD	(EL3_VALIDATE_FAIL),A
 	LD	HL,MSG_BANNER
 	CALL	@CONSOLE.LINE
 	CALL	@CLI.PARSE_EEP
@@ -33,12 +40,27 @@ START
 	LD	A,(CLI_SLOT)
 	LD	HL,(CLI_IDPORT)
 	CALL	@EL3.CONFIGURE
-	JR	C,FAIL
+	JP	C,FAIL
 	CALL	PRINT_E0
 	CALL	@EL3.DISCOVER
-	JR	C,FAIL
+	JR	C,DISCOVER_FAILED
 	CALL	PRINT_DUMP
+	LD	HL,MSG_E2
+	CALL	@CONSOLE.LINE
 	JP	SUCCESS
+
+; A rejected image is the whole point of running this on an unknown card, so
+; the words are printed exactly as they were read before the error line.
+DISCOVER_FAILED
+	LD	(FAIL_CODE),A
+	LD	A,(EL3_LAST_STAGE)
+	CP	EL3_STAGE_VALIDATE
+	JR	NZ,.NO_DUMP
+	CALL	PRINT_DUMP
+	CALL	PRINT_DIAG
+.NO_DUMP
+	LD	A,(FAIL_CODE)
+	JP	FAIL
 
 PARSE_RESULT
 	CP	EL3_CLI_HELP
@@ -49,7 +71,7 @@ PARSE_RESULT
 	LD	(FAIL_CODE),A
 	CALL	PRINT_HELP
 	LD	A,(FAIL_CODE)
-	JR	FAIL
+	JP	FAIL
 
 PRINT_E0
 	LD	HL,MSG_E0
@@ -63,34 +85,69 @@ PRINT_E0
 	LD	HL,@CONSOLE.CRLF
 	JP	@CONSOLE.STRING
 
+; Eight words per line keeps the whole EEPROM inside one screen, so a single
+; photograph of a real card carries the complete evidence.
 PRINT_DUMP
 	LD	HL,MSG_E1
 	CALL	@CONSOLE.LINE
 	LD	HL,EEPROM_BUFFER
 	LD	B,0
-.LOOP
+.ROW
 	LD	A,B
 	CALL	@CONSOLE.HEX8
 	LD	A,':'
 	CALL	@CONSOLE.CHAR
+	LD	C,8
+.WORD
 	LD	A,' '
 	CALL	@CONSOLE.CHAR
 	LD	E,(HL)
 	INC	HL
 	LD	D,(HL)
 	INC	HL
-	PUSH	HL
+	PUSH	BC,HL
 	EX	DE,HL
 	CALL	@CONSOLE.HEX16
+	POP	HL,BC
+	DEC	C
+	JR	NZ,.WORD
+	PUSH	BC,HL
 	LD	HL,@CONSOLE.CRLF
 	CALL	@CONSOLE.STRING
-	POP	HL
-	INC	B
+	POP	HL,BC
 	LD	A,B
+	ADD	A,8
+	LD	B,A
 	CP	0x40
-	JR	NZ,.LOOP
-	LD	HL,MSG_E2
-	JP	@CONSOLE.LINE
+	JR	NZ,.ROW
+	RET
+
+; Both checksum lanes are printed as EEPROM/computed in word order, so a lane
+; swap, a different word set and an unreadable EEPROM are told apart at a
+; glance instead of by a single "code=5".
+PRINT_DIAG
+	LD	HL,MSG_E3
+	CALL	@CONSOLE.STRING
+	LD	A,(EL3_VALIDATE_FAIL)
+	CALL	@CONSOLE.DEC8
+	LD	HL,MSG_PRIMARY
+	CALL	@CONSOLE.STRING
+	LD	HL,(EEPROM_BUFFER + 0x0F*2)
+	CALL	@CONSOLE.HEX16
+	LD	A,'/'
+	CALL	@CONSOLE.CHAR
+	LD	HL,(EL3_PRIMARY_CALC)
+	CALL	@CONSOLE.HEX16
+	LD	HL,MSG_SECOND
+	CALL	@CONSOLE.STRING
+	LD	HL,(EEPROM_BUFFER + 0x17*2)
+	CALL	@CONSOLE.HEX16
+	LD	A,'/'
+	CALL	@CONSOLE.CHAR
+	LD	HL,(EL3_SECONDARY_CALC)
+	CALL	@CONSOLE.HEX16
+	LD	HL,@CONSOLE.CRLF
+	JP	@CONSOLE.STRING
 
 PRINT_HELP
 	LD	HL,MSG_HELP
@@ -145,6 +202,9 @@ MSG_E0		DB "[E0] SLOT=",0
 MSG_IDPORT	DB " IDPORT=",0
 MSG_E1		DB "[E1] EEPROM WORDS 00..3F",0
 MSG_E2		DB "[E2] IDS MAC CHECKSUMS VALID",0
+MSG_E3		DB "[E3] FAIL=",0
+MSG_PRIMARY	DB " PRI=",0
+MSG_SECOND	DB " SEC=",0
 MSG_HELP	DB "Usage: EL3EEP [-s 0|1] [-p #100..#1F0]",0
 MSG_ERROR	DB "ERROR stage=",0
 MSG_CODE	DB " code=",0

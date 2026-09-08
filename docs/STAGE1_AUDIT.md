@@ -90,7 +90,7 @@ Nestor содержит GPL-код Crynwr и дополнительное уве
 
 | Word | Назначение | Проверка для 3C509B-TPO |
 |:---:|---|---|
-| `00..02` | Factory node address | Шесть MAC bytes, два последовательных network bytes на word |
+| `00..02` | Factory node address | Шесть MAC bytes; `Address(2n)` — старший байт word, `Address(2n+1)` — младший |
 | `03` | Product ID | Exact `0x9550`; семейная mask может использоваться только в диагностике |
 | `04..06` | Manufacturing data | Записать как read-only evidence |
 | `07` | Manufacturer ID | `0x6D50` |
@@ -99,13 +99,13 @@ Nestor содержит GPL-код Crynwr и дополнительное уве
 | `0A..0C` | OEM node address | Записать и сравнить с factory MAC |
 | `0D` | Software Information | Link beat policy и maximum interrupt-disable hint |
 | `0E` | Compatibility Word | Fail/warning levels |
-| `0F` | Primary checksum | High/low XOR lanes для words `00..0E` |
+| `0F` | Primary checksum | Vital lane (старший байт) — words `00..0E` кроме `08/09/0D`; configurable lane (младший) — только `08/09/0D` |
 | `10` | Capabilities | Документированный ISA default `0x2083` |
 | `11` | Reserved | Ожидается `0x0000` |
 | `12..13` | Internal Configuration | RAM size/partition и activation selection |
 | `14` | Secondary Software Information | Low nibble `1` обозначает B revision |
 | `15..16` | Reserved | Ожидается `0x0000` |
-| `17` | Secondary checksums | Vital/configurable byte-XOR lanes |
+| `17` | Secondary checksums | Обе полосы делят весь диапазон `10..3F`: configurable (младший байт) — `13..16`, vital (старший) — `10..12` и `18..3F` |
 | `18..3F` | ISA PnP resource data | Только read-only dump на этапе 3 |
 
 Primary checksum high byte — XOR обоих bytes words `00..0E`, исключая
@@ -154,6 +154,18 @@ write16: write(base + even, low)
 DSS calls, system pages и диагностика выполняются только после закрытия ISA
 window. Длинное ожидание разбивается на короткие polls с закрытием окна между
 итерациями.
+
+Обе строки про EEPROM выше — порядок байт MAC и полосы вторичной суммы —
+исправлены 2026-09-08 по дампу физической 3C509B-TPO (assembly `03-0020-002`
+rev 3, наклейка `EA=0020AF5D698B`, слот 0, ID-порт `0110`), снятому `EL3EEP`
+на реальном Sprinter. Карта отдала words `00..02` = `0020 AF5D 698B` и word
+`17` = `0205`. Предыдущее прочтение документации (`Address(2n)` в младшем
+байте, vital lane вторичной суммы с word `20`) давало для неё MAC
+`20:00:5D:AF:8B:69` и сумму `1305`, из-за чего исправная карта отвергалась с
+`EL3_ERR_CHECKSUM`. Синтетические образы проекта обе ошибки скрывали: они
+строились по тому же прочтению и держали words `18..1F` нулевыми, а на нулях
+оба варианта vital lane совпадают. Дамп зафиксирован вектором `EEPROM_CARD`
+в `tools/stage3_vectors.asm` и сценарием в `tools/test-stage3-exe.js`.
 
 ### 4.4. Register windows
 

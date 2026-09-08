@@ -113,7 +113,7 @@ RESOLVE_TARGET
 	LD	HL,NET_NEXT_HOP_IP
 	CALL	@ARP.CACHE_LOOKUP
 	RET	NC
-	LD	A,3
+	LD	A,ARP_ATTEMPTS_MAX
 	LD	(ARP_RETRY_LEFT),A
 .TRY
 	LD	DE,STAGE8_TX_BUFFER
@@ -144,8 +144,16 @@ RESOLVE_TARGET
 	XOR	A
 	RET
 
+; Same shared schedule as tcp_transport.asm RESOLVE_ROUTE: the opening attempts
+; ask again quickly instead of waiting out the documented deadline, which is
+; what put a pause in front of the first reply. See netdrv.inc.
 WAIT_ARP
-	LD	BC,2000
+	LD	A,(ARP_RETRY_LEFT)
+	CP	ARP_FAST_LEFT
+	LD	BC,ARP_FIRST_MS
+	JR	NC,.ARM
+	LD	BC,ARP_RETRY_MS
+.ARM
 	CALL	@NETTIME.START
 	RET	C
 .ARP_POLL

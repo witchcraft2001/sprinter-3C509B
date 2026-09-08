@@ -371,9 +371,12 @@ function buildIncomingEchoRequest(outgoing, options = {}) {
 
 function eepromWords(mac, base) {
   const words = new Uint16Array(64);
-  words[0] = mac[0] | (mac[1] << 8);
-  words[1] = mac[2] | (mac[3] << 8);
-  words[2] = mac[4] | (mac[5] << 8);
+  // Address(2n) is the high byte of word n, as on the physical card. Both
+  // checksum lanes XOR the two bytes of each word, so the order does not move
+  // them.
+  words[0] = (mac[0] << 8) | mac[1];
+  words[1] = (mac[2] << 8) | mac[3];
+  words[2] = (mac[4] << 8) | mac[5];
   words[3] = 0x9550;
   words[7] = 0x6d50;
   words[8] = ((base - 0x200) >> 4) & 0x1f;
@@ -388,8 +391,12 @@ function eepromWords(mac, base) {
     if (i === 8 || i === 9 || i === 13) low ^= x; else high ^= x;
   }
   words[15] = low | (high << 8);
+  // The vital lane of word 0x17 is the whole 0x10..0x3F range except the
+  // configurable words 0x13..0x16 and the checksum word itself. This image
+  // leaves 0x18..0x1F zero, so it cannot tell that partition apart from one
+  // starting at 0x20; the physical card's dump can, and does.
   high = 0; low = 0;
-  for (const i of [16, 17, 18, ...Array.from({length: 32}, (_, n) => n + 32)])
+  for (const i of [16, 17, 18, ...Array.from({length: 40}, (_, n) => n + 24)])
     high ^= (words[i] & 0xff) ^ (words[i] >> 8);
   for (const i of [19, 20, 21, 22]) low ^= (words[i] & 0xff) ^ (words[i] >> 8);
   words[23] = low | (high << 8);
@@ -405,6 +412,11 @@ class EtherLinkIII {
     this.eepromBase = scenario.eepromBase || this.base;
     this.mac = Array.from(scenario.mac || DEFAULT_MAC);
     this.eeprom = eepromWords(this.mac, this.eepromBase);
+    // eepromPatch overrides individual words after the synthetic image is
+    // built, so a card that answers correctly but fails one validation lane --
+    // what a real 3C509B-TPO does -- can be reproduced here.
+    for (const [index, value] of Object.entries(scenario.eepromPatch || {}))
+      this.eeprom[Number(index)] = value & 0xffff;
     this.active = false;
     this.window = 0;
     this.rxEnabled = false; this.txEnabled = false; this.statsEnabled = false;
@@ -492,14 +504,21 @@ class EtherLinkIII {
       if (++this.idIndex === 255) { this.idIndex = -1; this.idSelected = true; }
       return;
     }
-    if (value === 0 && !this.tagged) {
+    // The tag command this kit issues is 0xD0, which assigns tag *zero* --
+    // it leaves the adapter untagged and therefore still selectable by a
+    // later ID sequence. That is what real hardware does, and it is why two
+    // network utilities run back to back both find the card: the second one's
+    // DISCOVER re-selects an adapter the first one already activated. The
+    // model used to treat 0xD0 as "excluded from further ID sequences", which
+    // made a second DISCOVER in one process impossible to represent.
+    if (value === 0) {
       if (++this.idZeros === 2) { this.idZeros = 0; this.idIndex = 0; this.idSelected = false; }
       return;
     }
     this.idZeros = 0;
     if (!this.idSelected) throw new Error(`ID command without activation sequence: ${value.toString(16)}`);
-    if (!this.tagged && value === 0xc0) { this.resetRuntime(); return; }
-    if (value === 0xd0) { this.tagged = true; return; }
+    if (value === 0xc0) { this.resetRuntime(); this.tagged = false; return; }
+    if (value === 0xd0) { this.tagged = false; return; }
     if ((value & 0xc0) === 0x80) {
       const word = this.eeprom[value & 0x3f];
       this.serialBits = Array.from({length: 16}, (_, i) => (word >> (15 - i)) & 1);

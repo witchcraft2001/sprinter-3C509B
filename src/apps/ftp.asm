@@ -591,7 +591,11 @@ PRINT_PROGRESS
 	LD	HL,MSG_PROGRESS_KB
 	JP	@CONSOLE.STRING
 
-PRINT_KB
+; KB_OF: HL -> 32-bit little-endian byte count. Out: HL:DE = whole KB.
+; Takes bytes 1..3 (the value shifted right eight) and shifts twice more, so
+; no 32-bit shift loop is needed. TIME_REPORT divides the result by the
+; elapsed seconds, which is why this is split out of PRINT_KB.
+KB_OF
 	INC	HL
 	LD	E,(HL)
 	INC	HL
@@ -607,6 +611,10 @@ PRINT_KB
 	RR	H
 	RR	L
 	LD	D,0
+	RET
+
+PRINT_KB
+	CALL	KB_OF
 	JP	PRINT_DEC32
 
 ; RESOLVE_MODE turns PARSE_FTP's raw F13_MODE (0 unless PUT was seen) into
@@ -1372,13 +1380,47 @@ TIME_REPORT
 	LD	HL,MSG_SUMMARY_BYTES
 	CALL	@CONSOLE.STRING
 	LD	HL,(F13_ELAPSED)
-	LD	A,(F13_ELAPSED+2)
-	LD	E,A
-	LD	D,0
+	LD	DE,(F13_ELAPSED+2)	; see memory.inc: +3 is structurally zero
 	CALL	PRINT_DEC32
 	LD	HL,MSG_SUMMARY_SEC
 	CALL	@CONSOLE.STRING
+	CALL	PRINT_RATE
 	LD	HL,@CONSOLE.CRLF
+	JP	@CONSOLE.STRING
+
+; PRINT_RATE appends ", N KB/s" to the summary line, the same rate WGET
+; reports. Whole KB per whole second: the RTC resolves seconds only, so a
+; finer unit would claim precision the sample does not have. The rate is
+; simply left off when it cannot be stated honestly -- a sample shorter than
+; one RTC second, or a transfer whose KB count no longer fits 16 bits.
+PRINT_RATE
+	LD	A,(F13_ELAPSED+2)
+	OR	A
+	RET	NZ			; over 18 h: seconds no longer fit BC
+	LD	BC,(F13_ELAPSED)
+	LD	A,B
+	OR	C
+	RET	Z			; sub-second sample, as in DLSPEED
+	LD	HL,F13_TRANSFERRED
+	CALL	KB_OF
+	LD	A,E
+	OR	A
+	RET	NZ			; over 64 MB in one transfer
+	; DE is the zero left by KB_OF and becomes the quotient. The loop runs
+	; once per whole KB/s, so a few hundred iterations at most; it counts
+	; ahead of the subtraction and gives the extra one back on the borrow.
+.DIVIDE
+	INC	DE
+	OR	A
+	SBC	HL,BC
+	JR	NC,.DIVIDE
+	DEC	DE
+	LD	HL,MSG_COMMA
+	CALL	@CONSOLE.STRING
+	EX	DE,HL
+	LD	DE,0
+	CALL	PRINT_DEC32
+	LD	HL,MSG_KBPS
 	JP	@CONSOLE.STRING
 
 ; ------------------------------------------------------------------
@@ -1617,6 +1659,8 @@ MSG_PROGRESS_KB DB "KB",0
 MSG_SUMMARY_PREFIX DB "  ",0
 MSG_SUMMARY_BYTES DB " bytes in ",0
 MSG_SUMMARY_SEC DB " sec",0
+MSG_COMMA	DB ", ",0
+MSG_KBPS	DB " KB/s",0
 MSG_REGS	DB "REGS s=",0
 MSG_BASE	DB " b=",0
 MSG_STATUS	DB " st=",0

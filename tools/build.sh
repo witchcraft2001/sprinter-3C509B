@@ -53,3 +53,4 @@ build_app tcptest TCPTEST
 build_app wget WGET
 build_app ftp FTP
 build_app dlspeed DLSPEED
+build_app netprof NETPROF

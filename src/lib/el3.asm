@@ -50,12 +50,27 @@ DISCOVER
 	LD	(EL3_LAST_STAGE),A
 	CALL	ID_SEQUENCE
 	JR	C,.RETURN
+	IFDEF EL3_ATTACH_PROBE
+	; NETPROF -n. The global reset turns the adapter, and with it the
+	; 10baseT transceiver, off and on again at every program start; the
+	; switch port then needs seconds before it forwards, which is what puts
+	; a pause in front of the first frame every utility sends. Skipping it
+	; asks whether that is really the cause. Diagnostic only: without the
+	; reset there is no recovery from an adapter left in a bad state, so no
+	; shipping application defines EL3_ATTACH_PROBE.
+	LD	A,(SKIP_GLOBAL_RESET)
+	OR	A
+	JR	NZ,.TAG
+	ENDIF
 	LD	A,EL3_ID_GLOBAL_RESET
 	CALL	ID_WRITE
 	JR	C,.RETURN
 	CALL	WAIT_ONE_QUANTUM
 	CALL	ID_SEQUENCE
 	JR	C,.RETURN
+	IFDEF EL3_ATTACH_PROBE
+.TAG
+	ENDIF
 	LD	A,EL3_ID_TAG_ZERO
 	CALL	ID_WRITE
 	JR	C,.RETURN
@@ -288,10 +303,12 @@ WINDOW_EEPROM_READ
 	LD	A,EL3_ERR_PARAMETER
 	SCF
 	JR	.RETURN
-	ENDIF
 
 ; WAIT_EEPROM_READY
 ; Polls EBY with ISA closed and one CYCLES21 quantum between reads.
+; Inside the same guard as its only caller: the ID-port EEPROM path
+; (ID_READ_WORD) has its own timing, so a STAGE12 build that drops
+; WINDOW_EEPROM_READ was carrying this as dead weight.
 WAIT_EEPROM_READY
 	LD	HL,0
 	LD	(EL3_LAST_TICKS),HL
@@ -322,6 +339,7 @@ WAIT_EEPROM_READY
 	LD	A,EL3_ERR_TIMER
 	SCF
 	RET
+	ENDIF
 
 ; WAIT_ONE_QUANTUM
 ; Close-window cycle delay used after ID reset and EEPROM READ.
@@ -335,6 +353,9 @@ WAIT_ONE_QUANTUM
 SLOT			DB ISA_SLOT_1
 CURRENT_EEPROM_ADDRESS	DB 0
 ID_COMMAND		DB 0
+	IFDEF EL3_ATTACH_PROBE
+SKIP_GLOBAL_RESET	DB 0	; set by NETPROF -n; see DISCOVER
+	ENDIF
 
 	ENDMODULE
 	ENDIF

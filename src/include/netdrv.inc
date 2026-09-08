@@ -42,4 +42,36 @@ NETDRV_DLL_WIN2		EQU 2
 NETDRV_DLL_WINDOW	EQU NETDRV_DLL_NONE
 	ENDIF
 
+; WAIT_TICK loop count. Every deadline in the kit is counted in these quanta
+; against a nominal millisecond, so the count decides whether a timeout means
+; what it says. The loop is five memory accesses per iteration and the Sprinter
+; bus aligns each one to a 6 T slot in turbo, so the 26 T the 21 MHz arithmetic
+; assumes cost about 49 in practice: NETPROF measured 10000 quanta at 19 wall
+; seconds with the textbook 808, and this count is sized from that measurement.
+; Not to be confused with EL3_CYCLE_COUNT -- a CYCLES21 quantum is a documented
+; hardware *minimum* and is meant to stay long.
+NETTIME_TICK_LOOP	EQU 425
+
+; ARP attempt schedule, shared by every resolver in the kit (tcp_transport,
+; udp_transport and PING each run their own loop against the same contract).
+; NETPROF on a real Sprinter needs about five seconds before its first request
+; is answered, and answers a second cold-cache resolve in the same process
+; instantly. Retrying faster does not shorten that window -- two NETPROF runs,
+; one asking twice in five seconds and one asking five times, both resolved at
+; about the same wall time -- so it is the path, not the request, that is not
+; ready: DISCOVER global-resets the adapter at every program start, the 10baseT
+; link drops and comes back, and the switch port takes seconds to forward
+; again. The schedule therefore has to *cover* that window rather than beat it,
+; which is why the opening ARP_FAST_ATTEMPTS run out to six seconds before the
+; documented two-second attempts take over. A request is 42 bytes on a local
+; segment; asking again costs nothing worth counting.
+; Retry counters count down from ARP_ATTEMPTS_MAX, so the attempt that answered
+; is ARP_ATTEMPTS_MAX + 1 minus what is left, and an attempt is a fast one
+; while what is left is at least ARP_FAST_LEFT.
+ARP_ATTEMPTS_MAX	EQU 14
+ARP_FAST_ATTEMPTS	EQU 12
+ARP_FAST_LEFT		EQU ARP_ATTEMPTS_MAX - ARP_FAST_ATTEMPTS + 1
+ARP_FIRST_MS		EQU 500
+ARP_RETRY_MS		EQU 2000
+
 	ENDIF

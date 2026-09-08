@@ -301,10 +301,17 @@ INIT
 	LD	L,A
 	LD	(EL3_VERIFY_EXPECTED),HL
 	LD	(EL3_VERIFY_ACTUAL),HL
+	; Nothing in a STAGE12 build can ever set the loopback bit: LOOPBACK_ENABLE
+	; is compiled out of those images, and DISCOVER issues an ID-port global
+	; reset immediately before every INIT, which clears Net Diagnostic anyway.
+	; The three TCP applications are the ones living against the image ceiling,
+	; so they do not pay for undoing something that cannot have happened.
+	IFNDEF STAGE12_LAYOUT
 	CALL	LOOPBACK_DISABLE
 	JP	C,.RETURN
 	LD	A,EL3_STAGE_INIT
 	LD	(EL3_LAST_STAGE),A
+	ENDIF
 	LD	HL,EL3_CMD_SET_INTR_MASK
 	CALL	CMD_SYNC
 	JP	C,.RETURN
@@ -407,10 +414,12 @@ DONE
 	PUSH	IX,IY
 	LD	A,EL3_STAGE_DONE
 	LD	(EL3_LAST_STAGE),A
+	IFNDEF STAGE12_LAYOUT		; see INIT: nothing set the bit
 	CALL	LOOPBACK_DISABLE
 	JR	C,.RETURN
 	LD	A,EL3_STAGE_DONE
 	LD	(EL3_LAST_STAGE),A
+	ENDIF
 	LD	HL,EL3_CMD_RX_DISABLE
 	CALL	CMD_SYNC
 	JR	C,.RETURN

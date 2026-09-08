@@ -70,8 +70,8 @@ SYN_ATTEMPTS		EQU 3
 SYN_TIMEOUT_MS		EQU 1700
 DATA_ATTEMPTS		EQU 3
 FIN_TIMEOUT_MS		EQU 5000
-ARP_ATTEMPTS		EQU 3
-ARP_TIMEOUT_MS		EQU 2000
+ARP_ATTEMPTS		EQU ARP_ATTEMPTS_MAX
+ARP_TIMEOUT_MS		EQU ARP_RETRY_MS
 
 ; RESET clears both channel contexts. It does not touch NETDRV and preserves a
 ; valid ephemeral-port cursor so reconnect cannot immediately reuse its tuple.
@@ -741,7 +741,17 @@ RESOLVE_ROUTE
 	LD	HL,STAGE9_TX_BUFFER
 	CALL	@NETDRV.SEND_FRAME
 	RET	C
+	; The first request after the driver comes up is the one that gets lost:
+	; The requests a freshly initialised card sends are dropped in the path
+	; and heal within about a second, so the opening attempts ask again
+	; quickly instead of waiting out the documented deadline -- the schedule
+	; and its evidence are in netdrv.inc.
+	LD	A,(IX+CTX_RETRY_LEFT)
+	CP	ARP_FAST_LEFT
+	LD	BC,ARP_FIRST_MS
+	JR	NC,.ARP_ARM
 	LD	BC,ARP_TIMEOUT_MS
+.ARP_ARM
 	CALL	@NETTIME.START
 	RET	C
 .ARP_POLL

@@ -138,6 +138,26 @@ assert.ok(result.maxInFlight >= 5 * 536,
   `peer kept only ${result.maxInFlight} bytes in flight, expected a 5-segment window`);
 checked(result);
 
+// The same transfer with the clock left running: the summary line reports a
+// rate, the way WGET and DLSPEED already do. Every other scenario here freezes
+// the clock on its first read, so the sample is zero seconds long and the rate
+// is honestly left off -- which is what the golden transcripts pin.
+result = run('192.168.7.44 RATE.BIN', scenario({
+  fixtures: {'RATE.BIN': NEAR_WINDOW}, fixtureSizes: {'RATE.BIN': NEAR_WINDOW.length},
+}, {clockFreezeAfterReads: 1}));
+assert.strictEqual(result.exitCode, 0, result.output);
+const summary = /^ {2}(\d+) bytes in (\d+) sec, (\d+) KB\/s$/m.exec(result.output);
+assert.ok(summary, `no rate on the summary line in:\n${result.output}`);
+{
+  const [, bytes, seconds, rate] = summary.map(Number);
+  assert.strictEqual(bytes, NEAR_WINDOW.length);
+  assert.ok(seconds > 0, 'the running clock must produce a non-zero sample');
+  assert.ok(rate > 0, `a 3000-byte second should not round to zero: ${summary[0]}`);
+  // Whole KB per whole second, truncated the same way the Z80 divide does.
+  assert.strictEqual(rate, Math.floor(Math.floor(bytes / 1024) / seconds));
+}
+checked(result);
+
 // ------------------------------------------------------------------
 // Explicit -u/-p login, and a 530-on-PASS fault.
 // ------------------------------------------------------------------

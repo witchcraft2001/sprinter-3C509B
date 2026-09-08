@@ -33,7 +33,7 @@ OPEN
 	LD	HL,NET_NEXT_HOP_IP
 	CALL	@ARP.CACHE_LOOKUP
 	JR	NC,.OK
-	LD	A,3
+	LD	A,ARP_ATTEMPTS_MAX
 	LD	(ARP_RETRY_LEFT),A
 .ARP_TRY
 	LD	DE,STAGE9_TX_BUFFER
@@ -69,8 +69,15 @@ OPEN
 	POP	IY,IX
 	RET
 
+; The opening attempts ask again quickly rather than wait out the documented
+; deadline -- the shared schedule and its evidence are in netdrv.inc.
 WAIT_ARP
-	LD	BC,2000
+	LD	A,(ARP_RETRY_LEFT)
+	CP	ARP_FAST_LEFT
+	LD	BC,ARP_FIRST_MS
+	JR	NC,.ARM
+	LD	BC,ARP_RETRY_MS
+.ARM
 	CALL	@NETTIME.START
 	RET	C
 .POLL

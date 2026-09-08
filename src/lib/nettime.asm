@@ -10,12 +10,24 @@
 
 	MODULE NETTIME
 
-; WAIT_TICK is 21023 T-states (808-loop), i.e. one millisecond at the
-; supported 21 MHz Sprinter base clock. Keep timeout conversion deterministic:
-; client startup must not spend a wall-clock second measuring a value that is
-; already defined by the target timing contract.
+; WAIT_TICK is one millisecond on a real Sprinter: its loop count
+; (NETTIME_TICK_LOOP, netdrv.inc) is sized from a NETPROF measurement of the
+; machine rather than from the 21 MHz instruction timing, which the bus does
+; not deliver. Keep timeout conversion deterministic: client startup must not
+; spend a wall-clock second measuring a value the target's timing contract
+; already fixes.
 NETTIME_FIXED_QPS	EQU 1000
 NETTIME_FIXED_MS	EQU 1
+
+; How many quanta TICK lets pass between two consultations of the wall clock.
+; The wall limit is a coarse backstop against a monotonic base that has stopped
+; advancing, not the deadline itself, and it is expressed in whole seconds -- it
+; has never needed millisecond resolution. Reading it every quantum did cost
+; that much: READ_WALL is an RST into DSS, and NETPROF measures the pair
+; WAIT_TICK + READ_WALL at 348 per second on a real Sprinter against the 1000
+; the fixed base assumes, so the syscall is a large and DSS-dependent part of
+; a quantum. Must be a power of two: TICK tests the low bits of the countdown.
+NETTIME_WALL_EVERY	EQU 64
 
 	IFNDEF STAGE12_LAYOUT
 ; INIT loads the fixed 21 MHz timebase. It is idempotent and has no delay.
@@ -176,6 +188,9 @@ TICK
 	LD	A,H
 	OR	L
 	JR	Z,.EXPIRED
+	LD	A,L
+	AND	NETTIME_WALL_EVERY-1
+	JR	NZ,.LIVE		; between backstop checks
 	CALL	READ_WALL
 	LD	DE,(NETTIME_START_WALL)
 	OR	A
@@ -188,6 +203,7 @@ TICK
 	OR	A
 	SBC	HL,DE
 	JR	NC,.EXPIRED
+.LIVE
 	XOR	A
 	POP	IY,IX
 	RET

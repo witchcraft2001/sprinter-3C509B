@@ -28,6 +28,7 @@ IMG_ARTIFACTS=(
   "binary|build/WGET.EXE|WGET.EXE"
   "binary|build/FTP.EXE|FTP.EXE"
   "binary|build/DLSPEED.EXE|DLSPEED.EXE"
+  "binary|build/NETPROF.EXE|NETPROF.EXE"
   "text|docs/runtime/README_EN.txt|README.TXT"
   "text|docs/runtime/README_RU.txt|READMERU.TXT"
   "text|docs/EL3INFO.md|EL3INFO.TXT"

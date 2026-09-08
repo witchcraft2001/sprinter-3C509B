@@ -115,6 +115,7 @@ perl "$script_dir/check-stage12.pl" "$repo_root"
 "$script_dir/test-stage13-asm.sh"
 perl "$script_dir/check-stage13.pl" "$repo_root"
 node "$script_dir/test-exe-harness.js"
+node "$script_dir/test-stage3-exe.js"
 node "$script_dir/test-stage7-exe.js"
 node "$script_dir/test-stage8-exe.js"
 node "$script_dir/test-stage9-exe.js"
@@ -150,7 +151,7 @@ binary_copy="$(mktemp "${TMPDIR:-/tmp}/sprinter-509b-binary.XXXXXX")"
 trap 'rm -f "$expected_img" "$expected_zip" "$actual_names" "$text_copy" "$binary_copy"' EXIT
 
 printf '%s\n' ARP.EXE ARP.TXT CONNECT.BAT DLSPEED.EXE DLSPEED.TXT EL3EEP.EXE EL3INFO.EXE EL3INFO.TXT EL3LB.EXE EL3LB.TXT EL3REG.EXE EL3REG.TXT EL3RX.EXE EL3RX.TXT EL3TX.EXE EL3TX.TXT FTP.EXE FTP.TXT HELLO.EXE HOWTO.TXT IFUP.EXE IFUP.TXT ISAPROBE.EXE \
-  LICENSE.TXT NETCFG.EXE NETCFG.TXT NETSMPL.CFG NSLOOKUP.EXE NSLOOKUP.TXT NTP.EXE NTP.TXT PING.EXE PING.TXT PINGALT.EXE README.TXT READMERU.TXT S10TEST.TXT S11TEST.TXT S12TEST.TXT S13TEST.TXT S9TEST.TXT TCPTEST.EXE TCPTEST.TXT TESTING.TXT TFTP.EXE TFTP.TXT UDPTEST.EXE UDPTEST.TXT USAGE.TXT WGET.EXE WGET.TXT \
+  LICENSE.TXT NETCFG.EXE NETCFG.TXT NETPROF.EXE NETSMPL.CFG NSLOOKUP.EXE NSLOOKUP.TXT NTP.EXE NTP.TXT PING.EXE PING.TXT PINGALT.EXE README.TXT READMERU.TXT S10TEST.TXT S11TEST.TXT S12TEST.TXT S13TEST.TXT S9TEST.TXT TCPTEST.EXE TCPTEST.TXT TESTING.TXT TFTP.EXE TFTP.TXT UDPTEST.EXE UDPTEST.TXT USAGE.TXT WGET.EXE WGET.TXT \
   | LC_ALL=C sort > "$expected_img"
 artifact_names IMG | LC_ALL=C sort > "$actual_names"
 diff -u "$expected_img" "$actual_names"

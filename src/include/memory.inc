@@ -59,6 +59,13 @@ EL3_VERIFY_ACTUAL	EQU RUNTIME_BASE + 0x83 ; word
 EL3_LAST_RX_STATUS	EQU RUNTIME_BASE + 0x85 ; word
 EL3_LAST_TX_STATUS	EQU RUNTIME_BASE + 0x87
 EL3_RX_REQUIRED		EQU RUNTIME_BASE + 0x88 ; word
+; Written only when EL3_VALIDATE_DIAG is defined (EL3EEP). They report which
+; VALIDATE check rejected an EEPROM image and the checksum lanes it computed,
+; so a card the project refuses can be diagnosed from its own dump.
+EL3_VALIDATE_FAIL	EQU RUNTIME_BASE + 0x8A ; EL3_VFAIL_*
+EL3_PRIMARY_CALC	EQU RUNTIME_BASE + 0x8B ; word, lanes in word 0F order
+EL3_SECONDARY_CALC	EQU RUNTIME_BASE + 0x8D ; word, lanes in word 17 order
+	ASSERT EL3_SECONDARY_CALC + 2 <= RUNTIME_BASE + 0x90
 
 EL3LB_MEMORY_BLOCK	EQU RUNTIME_BASE + 0x90
 EL3LB_REMAINING		EQU RUNTIME_BASE + 0x91
@@ -605,7 +612,6 @@ F13_TOTAL_KNOWN	EQU F13_STATE_BASE + 0x15
 F13_TRANSFERRED	EQU F13_STATE_BASE + 0x16 ; four bytes LE, this session's bytes
 F13_RESUME_OFFSET	EQU F13_STATE_BASE + 0x1A ; four bytes LE
 F13_START_TIME		EQU F13_STATE_BASE + 0x1E ; three-byte seconds-of-day
-F13_ELAPSED		EQU F13_STATE_BASE + 0x21 ; three bytes
 F13_FILE_HANDLE	EQU F13_STATE_BASE + 0x24
 F13_FILE_OPEN		EQU F13_STATE_BASE + 0x25
 F13_PROGRESS_COUNT	EQU F13_STATE_BASE + 0x26
@@ -620,7 +626,11 @@ F13_BUFFER_USED	EQU F13_STATE_BASE + 0x3D ; word, bytes staged in STAGE9_FILE_BU
 F13_CHUNK_PTR		EQU F13_STATE_BASE + 0x3F ; word, APPEND_DATA cursor
 F13_CHUNK_LEN		EQU F13_STATE_BASE + 0x41 ; word, APPEND_DATA remaining
 F13_TOTAL_WRITTEN	EQU F13_STATE_BASE + 0x43 ; four bytes LE, progress display only
-; F13_STATE_BASE+0x47 .. +0x5D remains free for further scalars; +0x5E/+0x5F
+; Elapsed seconds is a three-byte quantity given a four-byte cell so that both
+; readers can take it as one 32-bit load: nothing writes +3 and the page is
+; cleared at startup, so the top byte is structurally zero.
+F13_ELAPSED		EQU F13_STATE_BASE + 0x47 ; four bytes LE, seconds
+; F13_STATE_BASE+0x4B .. +0x5D remains free for further scalars; +0x5E/+0x5F
 ; are NETDRV_FAIL_CODE/S9_EXIT_CODE (memory.inc, above).
 F13_HOST		EQU PAGE_BASE + 0x3800 ; 64 bytes
 F13_REMOTE_PATH	EQU PAGE_BASE + 0x3840 ; 256 bytes, RETR/STOR/LIST argument

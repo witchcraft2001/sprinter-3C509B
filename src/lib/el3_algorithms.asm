@@ -10,6 +10,17 @@
 
 	MODULE EL3ALG
 
+; VDIAG publishes the VALIDATE check about to run. Only EL3EEP defines
+; EL3_VALIDATE_DIAG; everywhere else the macro expands to nothing, so no
+; application pays image bytes for the diagnostic. It must not touch flags
+; that a following comparison depends on, so it only writes A.
+	MACRO VDIAG reason
+	IFDEF	EL3_VALIDATE_DIAG
+	LD	A,reason
+	LD	(EL3_VALIDATE_FAIL),A
+	ENDIF
+	ENDM
+
 	IFNDEF STAGE12_LAYOUT	; WGET maps its own statuses, and needs the bytes
 ; TO_DSS_EXIT maps a detailed EL3 status to the common DSS process-exit ABI.
 ; In: A=detailed EL3 status. Out: B=1 arguments, 2 hardware, 3 timeout/network,
@@ -123,16 +134,31 @@ BASE_ENCODE
 	RET
 
 ; COPY_MAC
-; Copies factory station bytes in EEPROM word order to EL3_MAC.
-; In the 3Com layout each word low byte is Address(2n), high is Address(2n+1).
-; Preserves AF, BC, DE, HL, IX and IY.
+; Copies the factory station address to EL3_MAC in network order.
+; In the 3Com layout a word holds Address(2n) in its high byte and Address(2n+1)
+; in its low byte, so the little-endian buffer has every pair reversed and the
+; bytes have to be swapped back. A physical 3C509B-TPO labelled EA=0020AF5D698B
+; reads 0020 AF5D 698B in words 00..02, which settles the order; the project's
+; synthetic images were built to the opposite convention and agreed with
+; themselves, so nothing local could show it.
+; VALIDATE is the only caller. It has already saved BC, DE, HL, IX and IY and
+; sets A itself, so this preserves nothing.
 COPY_MAC
-	PUSH	AF,BC,DE,HL,IX,IY
-	LD	HL,EEPROM_BUFFER
+	LD	HL,EEPROM_BUFFER + 1
 	LD	DE,EL3_MAC
-	LD	BC,6
-	LDIR
-	POP	IY,IX,HL,DE,BC,AF
+	LD	B,3
+.LOOP
+	LD	A,(HL)
+	LD	(DE),A
+	DEC	HL
+	INC	DE
+	LD	A,(HL)
+	LD	(DE),A
+	INC	HL
+	INC	HL
+	INC	HL
+	INC	DE
+	DJNZ	.LOOP
 	RET
 
 ; VALIDATE
@@ -141,23 +167,29 @@ COPY_MAC
 ; Preserves BC, DE, HL, IX and IY.
 VALIDATE
 	PUSH	BC,DE,HL,IX,IY
+	VDIAG	EL3_VFAIL_PRODUCT
 	LD	HL,(EEPROM_BUFFER + 0x03*2)
 	LD	DE,EL3_PRODUCT_3C509B_TPO
 	OR	A
 	SBC	HL,DE
 	JR	NZ,.NOT_FOUND
+	VDIAG	EL3_VFAIL_MFG
 	LD	HL,(EEPROM_BUFFER + 0x07*2)
 	LD	DE,EL3_MFG_3COM
 	OR	A
 	SBC	HL,DE
 	JR	NZ,.NOT_FOUND
+	VDIAG	EL3_VFAIL_MAC
 	CALL	VALIDATE_MAC
 	JR	C,.RETURN
+	VDIAG	EL3_VFAIL_PRIMARY
 	CALL	VALIDATE_PRIMARY
 	JR	C,.RETURN
+	VDIAG	EL3_VFAIL_SECONDARY
 	CALL	VALIDATE_SECONDARY
 	JR	C,.RETURN
 	CALL	COPY_MAC
+	VDIAG	EL3_VFAIL_NONE
 	XOR	A
 .RETURN
 	POP	IY,IX,HL,DE,BC
@@ -172,8 +204,10 @@ VALIDATE
 VALIDATE_MAC
 	PUSH	BC,DE,HL,IX,IY
 	LD	HL,EEPROM_BUFFER
-	BIT	0,(HL)
+	INC	HL			; the group bit lives in Address(0), the
+	BIT	0,(HL)			; high byte of word 00
 	JR	NZ,.BAD
+	DEC	HL
 	LD	B,6
 	LD	C,0
 	LD	D,0xFF
@@ -240,6 +274,12 @@ VALIDATE_PRIMARY
 	INC	HL
 	INC	C
 	DJNZ	.LOOP
+	IFDEF	EL3_VALIDATE_DIAG
+	LD	A,E
+	LD	(EL3_PRIMARY_CALC),A
+	LD	A,D
+	LD	(EL3_PRIMARY_CALC+1),A
+	ENDIF
 	LD	A,(EEPROM_BUFFER + 0x0F*2 + 1)
 	CP	D
 	JR	NZ,.BAD
@@ -256,7 +296,14 @@ VALIDATE_PRIMARY
 	RET
 
 ; VALIDATE_SECONDARY
-; Word 17 high lane covers 10..12 and 20..3F; low lane covers 13..16.
+; The two lanes of word 17 partition the whole 10..3F range: the configurable
+; lane is exactly 13..16, the vital lane is everything else except word 17
+; itself, so 10..12 and 18..3F. An earlier reading of the documentation had the
+; vital lane start at 20; a physical 3C509B-TPO (assembly 03-0020-002 rev 3,
+; MAC 00:20:AF:5D:69:8B) stores 0205 in word 17 and that lane assignment
+; computed 1305 for it, differing by exactly the XOR of words 18..1F. The
+; project's own synthetic images could not expose this: their words 18..1F are
+; zero, which leaves both readings identical.
 VALIDATE_SECONDARY
 	PUSH	BC,DE,HL,IX,IY
 	LD	D,0
@@ -264,12 +311,18 @@ VALIDATE_SECONDARY
 	LD	HL,EEPROM_BUFFER + 0x10*2
 	LD	B,3
 	CALL	XOR_WORD_BYTES_D
-	LD	HL,EEPROM_BUFFER + 0x20*2
-	LD	B,32
+	LD	HL,EEPROM_BUFFER + 0x18*2
+	LD	B,40
 	CALL	XOR_WORD_BYTES_D
 	LD	HL,EEPROM_BUFFER + 0x13*2
 	LD	B,4
 	CALL	XOR_WORD_BYTES_E
+	IFDEF	EL3_VALIDATE_DIAG
+	LD	A,E
+	LD	(EL3_SECONDARY_CALC),A
+	LD	A,D
+	LD	(EL3_SECONDARY_CALC+1),A
+	ENDIF
 	LD	A,(EEPROM_BUFFER + 0x17*2 + 1)
 	CP	D
 	JR	NZ,.BAD
