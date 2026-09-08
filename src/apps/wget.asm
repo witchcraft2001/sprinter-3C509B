@@ -12,6 +12,14 @@ EXE_VERSION	EQU 1
 	DEFINE STAGE10_DNS
 	DEFINE STAGE11_LAYOUT
 	DEFINE STAGE12_LAYOUT
+	; Image headroom to spare, so take the unrolled FIFO burst (el3_io.asm).
+	DEFINE FAST_DATAPATH
+	; Round-2 throughput: driver primitives must never be called from inside
+	; PROCESS_FRAME/HANDLE_SEGMENT's own call chain (tcp_transport.asm), so
+	; the ACK a segment earns is deferred to .WAIT_LOOP instead of sent
+	; in-line. FTP does not define this and keeps the byte-identical old
+	; behavior -- its image has no room to spare for this yet.
+	DEFINE TCPX_DIRECT_RX
 
 	DEVICE NOSLOT64K
 	INCLUDE "version.inc"

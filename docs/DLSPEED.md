@@ -27,6 +27,23 @@ not trusted as a rate — the result explicitly flags it as too short instead
 of printing a number rounded from too little data. Use a file of at least a
 few hundred KB for a stable measurement.
 
+## What to expect
+
+Against the MAME 3C509B model with the stage 13 responder, a 512 KiB download
+currently reports about **128 KB/s**. Earlier builds of the same test are
+useful as a sanity range: 38–42 KB/s before any receive-path work, 46 KB/s
+with the unrolled FIFO and checksum loops, 56 KB/s once the driver did one
+ISA-window session per receive step. A number far below the current figure
+means something on the receive path fell back to the slow path — check the
+responder's pcap for retransmits and for ACKs arriving one per segment rather
+than one per two.
+
+DLSPEED receives into a 6 KiB buffer and the transport delivers segments into
+it directly, so one `RECV` call normally takes about eleven segments. The body
+is counted, not inspected: a corrupted byte that somehow passed the TCP
+checksum would not be noticed here. Use WGET with a known sha256 when the
+question is integrity rather than speed.
+
 DLSPEED does not follow redirects and only accepts a `2xx` response; anything
 else fails with the HTTP status line printed. Exit classes: 0 success,
 1 arguments (missing/malformed URL), 2 hardware (including a stalled RTC),

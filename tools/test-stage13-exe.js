@@ -559,4 +559,70 @@ for (const key of ['escape', 'ctrl-c']) {
   speedChecked(result);
 }
 
+// A large multi-segment download exercises the same wire path the round-2
+// throughput work targets, and gives the harness-side memoryAccesses/
+// isaSessions counters (tools/exe-harness/harness.js) a realistic baseline
+// to compare across steps instead of only the small fixed-size scenarios
+// above. 256 KiB is 512 MSS segments -- enough that a per-segment regression
+// is visible in the accesses-per-byte ratio, not lost in fixed overhead.
+const LARGE_BODY = Buffer.alloc(262144, 0x5a);
+result = runExe(speedExe, 'http://192.168.7.44/BIG.BIN', speedScenario({
+  response: {status: '200 OK', body: LARGE_BODY, headers: {}, closeDelimited: false},
+}, {stepLimit: 4_000_000_000}));
+assert.strictEqual(result.exitCode, 0, result.output);
+assert.match(result.output, new RegExp(`Received: ${LARGE_BODY.length} bytes`));
+assert.ok(result.memoryAccesses > 0, 'harness did not report memoryAccesses');
+assert.ok(result.isaSessions > 0, 'harness did not report isaSessions');
+speedChecked(result);
+
+// Round-2's two-phase receive (see the throughput plan) only fast-paths a
+// clean, in-order, single-context ACK+PSH segment; everything below must
+// keep falling through to the unmodified slow path and still deliver the
+// exact bytes requested. These six TCPTEST fault options (originally
+// exercised only against TCPTEST/UDPTEST in test-stage11-exe.js) are read
+// generically by respondTcp/drainConnectionSendQueue regardless of
+// options.mode, so they apply unchanged to an http-mode download.
+const FAULT_BODY = Buffer.alloc(5000, 0x5a);
+// corruptDataOnce is the negative control for the fused checksum: one
+// byte-damaged copy of a segment arrives ahead of the good one, carrying the
+// undamaged segment's checksum. FAST_RECEIVE must reject it (commit nothing,
+// send no ACK) and accept the good copy behind it, so the body still arrives
+// whole. Offset 9 is the first digit of the status code in "HTTP/1.0 200 OK":
+// DLSPEED discards the body, so only a corruption inside the header it does
+// parse is observable at all -- accepting the damaged copy makes it print
+// "[E] HTTP/1.0 <garbage>00 OK" and fail, which is what makes this control
+// bite rather than pass either way.
+for (const tcp of [{duplicateData: true}, {outOfOrderBeforeData: true},
+  {outOfOrderFinAfterData: true}, {resetOnData: true}, {zeroWindowProbes: 2},
+  {corruptDataOnce: 9}]) {
+  result = runExe(speedExe, 'http://192.168.7.44/FAULT.BIN', speedScenario({
+    response: {status: '200 OK', body: FAULT_BODY, headers: {}, closeDelimited: false}, ...tcp,
+  }));
+  if (tcp.resetOnData) {
+    // A mid-transfer RST is a real transfer failure, not a fault the
+    // download recovers from -- DLSPEED must report it, not hang or
+    // silently under-report bytes.
+    assert.notStrictEqual(result.exitCode, 0, `${JSON.stringify(tcp)}: ${result.output}`);
+  } else {
+    assert.strictEqual(result.exitCode, 0, `${JSON.stringify(tcp)}: ${result.output}`);
+    assert.match(result.output, new RegExp(`Received: ${FAULT_BODY.length} bytes`),
+      `${JSON.stringify(tcp)}: ${result.output}`);
+  }
+  speedChecked(result);
+}
+
+// remoteFinAfterData attaches FIN to the *next* chunk drainConnectionSendQueue
+// sends regardless of queue depth (see harness.js), so it only mirrors
+// TCPTEST's "FIN on the one and only reply" case when the whole body fits in
+// a single MSS; a multi-segment body would make this a premature-close fault
+// instead, which is a different scenario from the one being ported here.
+const FIN_BODY = Buffer.alloc(400, 0x5a);
+result = runExe(speedExe, 'http://192.168.7.44/FIN.BIN', speedScenario({
+  response: {status: '200 OK', body: FIN_BODY, headers: {}, closeDelimited: false},
+  remoteFinAfterData: true,
+}));
+assert.strictEqual(result.exitCode, 0, result.output);
+assert.match(result.output, new RegExp(`Received: ${FIN_BODY.length} bytes`));
+speedChecked(result);
+
 console.log(`Stage 13 actual EXE: ${cases} FTP CLI/control-dialog/GET/PUT/LIST/resume/fault and DLSPEED scenarios passed`);

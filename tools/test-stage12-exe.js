@@ -347,4 +347,51 @@ result = run('http://192.168.7.44/MIDNIGHT.BIN -y', scenario({
 assert.match(result.output, /  8 bytes in [1-9][0-9]* sec, [0-9]+ B\/s\r\n/);
 assert.doesNotMatch(result.output, /bytes in [0-9]{5,} sec/); checked(result);
 
+// Round-2's two-phase receive (see the throughput plan) only fast-paths a
+// clean, in-order, single-context ACK+PSH segment; everything below must
+// keep falling through to the unmodified slow path and still land the exact
+// bytes on disk. These six TCPTEST fault options (originally exercised only
+// against TCPTEST/UDPTEST in test-stage11-exe.js) are read generically by
+// respondTcp/drainConnectionSendQueue regardless of options.mode, so they
+// apply unchanged to an http-mode download. WGET's disk write makes this a
+// sha256 check rather than DLSPEED's byte-count-only one.
+const FAULT_BODY = Buffer.from(Array.from({length: 5000}, (_, i) => (i * 13 + 5) & 0xff));
+// corruptDataOnce sends one byte-damaged copy of a segment ahead of the good
+// one, still carrying the undamaged segment's checksum: the receive checksum
+// has to reject it and take the good copy behind it. WGET is still on the
+// unmodified slow path (it does not define EL3_SESSION_RX yet), so here this
+// guards @TCP.PARSE's own verification; the sha256 below is what makes it
+// bite, since a damaged byte that got through would land in the file.
+for (const tcp of [{duplicateData: true}, {outOfOrderBeforeData: true},
+  {outOfOrderFinAfterData: true}, {resetOnData: true}, {zeroWindowProbes: 2},
+  {corruptDataOnce: 9}]) {
+  result = run('http://192.168.7.44/FAULT.BIN -y', scenario({
+    response: response('200 OK', FAULT_BODY), ...tcp,
+  }));
+  if (tcp.resetOnData) {
+    // A mid-transfer RST is a real transfer failure, not a fault the
+    // download recovers from -- WGET must report it, not hang or silently
+    // write a truncated file as if it were complete.
+    assert.notStrictEqual(result.exitCode, 0, `${JSON.stringify(tcp)}: ${result.output}`);
+  } else {
+    assert.strictEqual(result.exitCode, 0, `${JSON.stringify(tcp)}: ${result.output}`);
+    assert.strictEqual(sha256(outputFile(result, 'fault.bin')), sha256(FAULT_BODY),
+      `${JSON.stringify(tcp)}: ${result.output}`);
+  }
+  checked(result);
+}
+
+// remoteFinAfterData attaches FIN to the *next* chunk drainConnectionSendQueue
+// sends regardless of queue depth (see harness.js), so it only mirrors
+// TCPTEST's "FIN on the one and only reply" case when the whole body fits in
+// a single MSS; a multi-segment body would make this a premature-close fault
+// instead, which is a different scenario from the one being ported here.
+const FIN_BODY = Buffer.from(Array.from({length: 400}, (_, i) => (i * 13 + 5) & 0xff));
+result = run('http://192.168.7.44/FIN.BIN -y', scenario({
+  response: response('200 OK', FIN_BODY), remoteFinAfterData: true,
+}));
+assert.strictEqual(result.exitCode, 0, result.output);
+assert.strictEqual(sha256(outputFile(result, 'fin.bin')), sha256(FIN_BODY));
+checked(result);
+
 console.log(`Stage 12 actual EXE: ${cases} CLI/golden/HTTP/file/resume/fault scenarios passed`);

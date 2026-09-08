@@ -979,6 +979,22 @@ class EtherLinkIII {
       const reply = buildTcpReply(template, {sequence: connection.serverNext,
         acknowledgement: connection.clientNext, flags: remoteFin ? 0x19 : 0x18, payload,
         window: connection.advertisedWindow, mac: options.mac, ip: options.ip});
+      // Negative control for the fused receive checksum (tcp_transport.asm's
+      // FAST_RECEIVE reads and checksums a payload in one pass, so a bug
+      // there could silently accept corruption): send one byte-damaged copy
+      // of a segment ahead of the good one, still carrying the undamaged
+      // segment's checksum. The client must reject it and accept the good
+      // copy that follows at the same sequence number, so the transfer still
+      // completes byte-exact. No retransmit modelling is needed for that
+      // ordering. The value is the offset into the payload to damage (true
+      // means 0); pick one whose corruption the client under test would
+      // actually notice if it were accepted, or the control proves nothing.
+      if (options.corruptDataOnce !== undefined && !connection.corruptSent && payload.length) {
+        connection.corruptSent = true;
+        const damaged = reply.slice();
+        damaged[54 + (options.corruptDataOnce === true ? 0 : options.corruptDataOnce)] ^= 0xff;
+        queue(damaged);
+      }
       queue(reply);
       if (options.mode === 'http') this.httpBytesSent += size;
       if (options.duplicateData) queue(reply.slice());
@@ -1457,6 +1473,11 @@ function runExe(exePath, args = '', inputScenario = {}) {
   const card = new EtherLinkIII(scenario);
   let page3 = 3, systemIsa = false, isaOpen = false, selectedSlot = 0;
   let win1 = null, win2 = null, nextBlock = 16;
+  // memoryAccesses matches MAME's do_mem_wait cost currency (every rd/wr is a
+  // padded bus slot in turbo); isaSessions counts distinct ISA-window opens,
+  // i.e. each 0x9fbd mapping sequence below. Round-2 throughput gates read
+  // both from the harness result instead of re-deriving them from a trace.
+  let memoryAccessCount = 0, isaSessionCount = 0;
   const pages = new Map(), allocations = new Map();
   const allocated = (id) => pages.has(id);
   const environment = scenario.environment || {};
@@ -1487,6 +1508,7 @@ function runExe(exePath, args = '', inputScenario = {}) {
   };
   const rd = (address) => {
     address &= 0xffff;
+    memoryAccessCount++;
     if (address >= 0xc000 && isaOpen) {
       const port = cardPort(address);
       if (!assertCardSlot()) return 0xff;
@@ -1500,6 +1522,7 @@ function runExe(exePath, args = '', inputScenario = {}) {
   };
   const wr = (address, value) => {
     address &= 0xffff; value &= 0xff;
+    memoryAccessCount++;
     if (address >= 0xc000 && isaOpen) {
       const port = cardPort(address);
       if (!assertCardSlot()) return;
@@ -1539,6 +1562,7 @@ function runExe(exePath, args = '', inputScenario = {}) {
       if (port === 0x9fbd) {
         if (!systemIsa || value !== 0) throw new Error('invalid ISA mapping sequence');
         isaOpen = true;
+        isaSessionCount++;
         return;
       }
       throw new Error(`unknown I/O write ${port.toString(16)}=${value.toString(16)}`);
@@ -1883,6 +1907,8 @@ function runExe(exePath, args = '', inputScenario = {}) {
       tcp: card.tcpRequestCount,
     },
     maxInFlight: card.maxInFlight,
+    memoryAccesses: memoryAccessCount,
+    isaSessions: isaSessionCount,
     setTimeCalls,
     ...(scenario.traceDss ? {dssEvents} : {}),
     ...(scenario.dumpMemory ? {memory: Object.fromEntries(scenario.dumpMemory.map(([start, length]) => [

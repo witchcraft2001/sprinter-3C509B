@@ -11,11 +11,9 @@ TCP_MSS			EQU 536
 
 ; Receive window advertised while a channel is not backpressured: a whole
 ; multiple of TCP_MSS, since a non-multiple stalls the pipe on every window
-; exhaustion (observed on the sibling RTL8019A kit's TCP stack). Every
-; accepted segment is still ACKed immediately (no delayed/coalesced ACK: an
-; attempt at one had to be backed out, see tcp_transport.asm's ACK_IF_DATA);
-; the win here is letting the peer keep more than one segment in flight
-; instead of stopping and waiting for each one's ACK.
+; exhaustion (observed on the sibling RTL8019A kit's TCP stack). The win here
+; is letting the peer keep more than one segment in flight instead of stopping
+; and waiting for each one's ACK.
 ; TCP_RECV_SEGMENTS is capped by S11_PENDING_CAPACITY (memory.inc), which must
 ; hold a whole TCP_RECV_WINDOW so a burst can be appended, not just one MSS.
 ; STAGE12_LAYOUT is the key for that page space: WGET and DLSPEED reserve it
@@ -32,6 +30,16 @@ TCP_RECV_SEGMENTS	EQU 5
 TCP_RECV_SEGMENTS	EQU 1
 	ENDIF
 TCP_RECV_WINDOW		EQU TCP_RECV_SEGMENTS * TCP_MSS
+
+; Segments a directly-delivered stream may accumulate before an ACK goes out
+; (RFC 1122's "at least every second segment"). Only the two-phase receive
+; path coalesces: a segment that lands in the pending slot, a FIN, an RST, a
+; duplicate and a closed window are all still ACKed the moment they are seen,
+; and the debt is settled in full before RECV returns or the card runs dry, so
+; nothing waits on a timer that does not exist here. An earlier attempt at a
+; delayed ACK had to be backed out because it called the driver from inside
+; PROCESS_FRAME's own call chain; this one sends from .WAIT_LOOP instead.
+TCP_ACK_EVERY		EQU 2
 
 TCP_FLAG_FIN		EQU 0x01
 TCP_FLAG_SYN		EQU 0x02

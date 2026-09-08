@@ -102,6 +102,20 @@ ACCUMULATE
 	LD	(ACC_ODD),A		; a trailing byte pads as the high half
 	SRL	B
 	RR	C			; BC = whole 16-bit words
+	IFDEF FAST_DATAPATH
+	; Four words per DJNZ pass instead of one. The split is computed here,
+	; before the OR A below arms the ripple, because SRL/RR write CF: once
+	; the ripple is live nothing may touch the carry, which is also why the
+	; tail count is re-tested with INC B/DEC B rather than OR A further
+	; down.
+	LD	A,C
+	AND	3
+	LD	(ACC_TAIL_WORDS),A	; 0..3 words left over after the groups
+	SRL	B
+	RR	C
+	SRL	B
+	RR	C			; BC = whole four-word groups
+	ENDIF
 	EX	DE,HL			; HL = accumulator, DE = source
 	LD	A,H
 	LD	H,L
@@ -109,7 +123,7 @@ ACCUMULATE
 	OR	A			; CF = 0 before the ripple starts
 	LD	A,B
 	OR	C
-	JR	Z,.ACC_TAIL
+	JR	Z,.ACC_AFTER_GROUPS
 	LD	A,B			; DJNZ counts in B, so run the low half
 	LD	B,C			; inline and the high half as outer passes
 	LD	C,A
@@ -118,6 +132,8 @@ ACCUMULATE
 	JR	Z,.ACC_WORDS
 	INC	C
 .ACC_WORDS
+	IFDEF FAST_DATAPATH
+	DUP 4
 	LD	A,(DE)
 	ADC	A,L
 	LD	L,A
@@ -126,9 +142,38 @@ ACCUMULATE
 	ADC	A,H
 	LD	H,A
 	INC	DE
+	EDUP
+	ELSE
+	LD	A,(DE)
+	ADC	A,L
+	LD	L,A
+	INC	DE
+	LD	A,(DE)
+	ADC	A,H
+	LD	H,A
+	INC	DE
+	ENDIF
 	DJNZ	.ACC_WORDS
 	DEC	C
 	JR	NZ,.ACC_WORDS
+.ACC_AFTER_GROUPS
+	IFDEF FAST_DATAPATH
+	LD	A,(ACC_TAIL_WORDS)
+	LD	B,A
+	INC	B
+	DEC	B			; Z iff no tail words; leaves CF alone
+	JR	Z,.ACC_TAIL
+.ACC_TAIL_LOOP
+	LD	A,(DE)
+	ADC	A,L
+	LD	L,A
+	INC	DE
+	LD	A,(DE)
+	ADC	A,H
+	LD	H,A
+	INC	DE
+	DJNZ	.ACC_TAIL_LOOP
+	ENDIF
 .ACC_TAIL
 	LD	A,(ACC_ODD)
 	BIT	0,A			; BIT, not OR: the ripple carry is still live
@@ -152,6 +197,9 @@ ACCUMULATE
 	RET
 
 ACC_ODD		DB 0
+	IFDEF FAST_DATAPATH
+ACC_TAIL_WORDS	DB 0		; words the four-word group loop did not cover
+	ENDIF
 
 ; WRITE_BE16: HL=value, DE=destination. Advances DE by two.
 WRITE_BE16

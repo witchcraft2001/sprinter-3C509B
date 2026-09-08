@@ -213,20 +213,41 @@ WAIT_LINK_UP
 
 ; SELECT_WINDOW
 ; In: A=window 0..6. Out: explicit status. Preserve IX and IY.
+;
+; The selected window is cached, because only we ever change it: of the three
+; resets only Global Reset returns the card to window 0, and RESET_COMMAND
+; invalidates the cache for that. Re-selecting the window the card already
+; holds is not free -- CMD_SYNC costs two Sprinter ISA open/close pairs, each
+; a DI, an MMU3 page swap and an EI -- and the receive path pays it three
+; times per segment (RX_PENDING from the poll loop, RX_PENDING again inside
+; READ_FRAME, and SEND_FRAME for the ACK). Skipping those removes six of the
+; twenty ISA windows a received segment used to open. The cache lives in the
+; image rather than in the page so it reads 0xFF (unknown) from the first
+; instruction, with no dependency on who zeroes runtime storage first.
 SELECT_WINDOW
 	PUSH	IX,IY
 	CP	7
 	JR	NC,.BAD
+	LD	HL,CURRENT_WINDOW
+	CP	(HL)
+	JR	Z,.CACHED
+	LD	(HL),A
 	LD	L,A
 	LD	H,0
 	LD	DE,EL3_CMD_SELECT_WINDOW
 	ADD	HL,DE
 	CALL	CMD_SYNC
-	POP	IY,IX
-	RET
+	JR	NC,.RETURN
+	LD	HL,CURRENT_WINDOW	; LD (HL),n leaves CF from CMD_SYNC intact
+	LD	(HL),0xFF
+	JR	.RETURN
 .BAD
 	LD	A,EL3_ERR_BAD_WINDOW
 	SCF
+	JR	.RETURN
+.CACHED
+	XOR	A
+.RETURN
 	POP	IY,IX
 	RET
 
@@ -257,6 +278,8 @@ RESET_TX
 	RET
 
 RESET_COMMAND
+	LD	A,0xFF			; a Global Reset returns the card to window 0
+	LD	(CURRENT_WINDOW),A
 	CALL	CMD_SYNC
 	RET	C
 	LD	HL,EL3_COUNT_RESET
@@ -794,6 +817,7 @@ INC_WORD
 	RET
 
 INIT_ACTIVE		DB 0
+CURRENT_WINDOW		DB 0xFF		; unknown until the first SELECT_WINDOW
 	IFNDEF STAGE12_LAYOUT
 SNAP_POINTER		DW 0
 SNAP_LAST_COMMAND	DW 0

@@ -521,8 +521,43 @@ S11_DIAG_STAGE		EQU S11_STATE_BASE + 0x69
 S11_SEQUENCE_OVERRIDE	EQU S11_STATE_BASE + 0x6A
 S11_NEXT_LOCAL_PORT	EQU S11_STATE_BASE + 0x6B ; 49152..65535
 S11_WAIT_ALL		EQU S11_STATE_BASE + 0x6D
+; Set by HANDLE_SEGMENT (round-2 throughput: driver primitives must not be
+; called from inside PROCESS_FRAME/HANDLE_SEGMENT's own call chain, so the
+; ACK a segment earns is deferred and sent from .WAIT_LOOP once PROCESS_FRAME
+; has returned) instead of sending immediately from .ACK_CURRENT. Reset at
+; HANDLE_SEGMENT entry and again once .WAIT_LOOP has consumed it, so a frame
+; that never reaches .ACK_CURRENT (ARP, an ignored segment) cannot replay a
+; stale send. The context to send it on is S11_MATCH_CONTEXT, still valid:
+; nothing overwrites it between HANDLE_SEGMENT setting this flag and
+; .WAIT_LOOP consuming it one frame later.
+S11_ACK_NOW		EQU S11_STATE_BASE + 0x6E
+; Directly-delivered segments acknowledged in one go (TCP_ACK_EVERY): counted
+; up by .SESSION_FAST and cleared by SEND_OWED_ACK, which sends whenever
+; either this or S11_ACK_NOW is set. Kept apart from S11_ACK_NOW precisely
+; because HANDLE_SEGMENT clears that one at entry -- a slow-path frame
+; arriving mid-drain must not swallow a debt the fast path still owes.
+S11_ACK_OWED		EQU S11_STATE_BASE + 0x6F
 S11_IPV4_BUILD_DESC	EQU S11_STATE_BASE + 0x70
-S11_IPV4_PARSE_DESC	EQU S11_STATE_BASE + 0x80
+S11_IPV4_PARSE_DESC	EQU S11_STATE_BASE + 0x80 ; IP4P_DESC_LENGTH = 18 bytes
+; Two-phase receive (tcp_transport.asm's FAST_RECEIVE): the payload length the
+; predicate accepted, and how many segments the fused checksum rejected. These
+; sit in the gap between the parse descriptor above and W12_/F13_STATE_BASE at
+; S11_STATE_BASE+0xA0, which is the only slack the state block still has.
+S11_FAST_LENGTH		EQU S11_STATE_BASE + 0x92 ; word
+S11_FAST_BADSUM		EQU S11_STATE_BASE + 0x94 ; word, diagnostic counter
+; Direct-delivery window. RECV opens it around its own WAIT_FOR_EVENT and
+; closes it again the moment that call returns, so it is non-zero only while a
+; RECV is genuinely waiting with room in the caller's buffer: everywhere else
+; (SEND, CLOSE, OPEN, the handshake) S11_RX_FREE is zero and FAST_RECEIVE
+; falls back to the pending slot. RESET clears it.
+S11_RX_DEST		EQU S11_STATE_BASE + 0x96 ; word, caller's buffer
+S11_RX_FREE		EQU S11_STATE_BASE + 0x98 ; word, its capacity, 0 = closed
+S11_RX_DELIVERED	EQU S11_STATE_BASE + 0x9A ; word, written into it so far
+S11_FAST_DEST		EQU S11_STATE_BASE + 0x9C ; word, this segment's target
+S11_FAST_DIRECT		EQU S11_STATE_BASE + 0x9E ; non-zero: target is the caller
+S11_WAIT_PROGRESS	EQU S11_STATE_BASE + 0x9F ; polls that found a frame and
+					; so skipped NETTIME.TICK, counting down
+	ASSERT S11_WAIT_PROGRESS + 1 <= S11_STATE_BASE + 0xA0
 S11_REMOTE_TEXT		EQU PAGE_BASE + 0x3700
 
 	IFDEF STAGE13_LAYOUT

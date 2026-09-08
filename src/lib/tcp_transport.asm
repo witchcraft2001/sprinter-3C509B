@@ -58,6 +58,14 @@ EVENT_RST		EQU 0x08
 EVENT_SYN_ACK		EQU 0x10
 EVENT_WINDOW		EQU 0x20
 
+; Ethernet + fixed IPv4 + fixed TCP header. The two-phase receive reads
+; exactly this much of a frame before deciding what to do with the rest.
+TCPX_RX_PREFIX		EQU 14 + IPV4_HEADER_LENGTH + TCP_HEADER_LENGTH
+; How many productive polls in a row .WAIT_PROGRESS may skip NETTIME.TICK for
+; before spending one anyway. 64 segments is well inside any single RECV's
+; deadline yet still bounds a flood of frames that never raise an event.
+WAIT_PROGRESS_QUANTA	EQU 64
+
 SYN_ATTEMPTS		EQU 3
 SYN_TIMEOUT_MS		EQU 1700
 DATA_ATTEMPTS		EQU 3
@@ -95,6 +103,13 @@ RESET
 .PORT_READY
 	LD	HL,1
 	LD	(S11_IP_ID),HL
+	IFDEF	EL3_SESSION_RX
+	LD	HL,0
+	LD	(S11_RX_FREE),HL	; no RECV is waiting: direct delivery off
+	LD	(S11_RX_DELIVERED),HL
+	XOR	A
+	LD	(S11_ACK_OWED),A
+	ENDIF
 	XOR	A
 	POP	IY,IX
 	RET
@@ -389,7 +404,35 @@ RECV
 	LD	(S11_DIAG_STAGE),A
 	POP	AF
 	LD	BC,(S11_TIMEOUT_MS)
+	IFDEF	EL3_SESSION_RX
+	; Open the direct-delivery window around this one wait: an in-order
+	; segment that fits goes straight into the caller's buffer instead of
+	; the pending slot, which saves copying it back out again. None of the
+	; stores below touch A (the event mask) or BC (the timeout).
+	LD	HL,(S11_SEND_POINTER)
+	LD	(S11_RX_DEST),HL
+	LD	HL,0
+	LD	(S11_RX_DELIVERED),HL
+	LD	HL,(S11_COPY_LENGTH)
+	LD	(S11_RX_FREE),HL
 	CALL	WAIT_FOR_EVENT
+	PUSH	AF
+	LD	HL,0
+	LD	(S11_RX_FREE),HL
+	LD	BC,(S11_RX_DELIVERED)
+	LD	(S11_RX_DELIVERED),HL	; HL is still 0: the count is consumed
+	LD	A,B
+	OR	C
+	JR	Z,.RECV_NO_DIRECT
+	POP	AF			; bytes already in the caller's buffer
+	XOR	A			; outrank the wait's own status: a close,
+	JP	.RECV_RETURN		; a reset or a timeout is still there to
+					; be found by the next call, they are not
+.RECV_NO_DIRECT
+	POP	AF
+	ELSE
+	CALL	WAIT_FOR_EVENT
+	ENDIF
 	JP	C,.RECV_RETURN
 	BIT	3,A
 	JP	NZ,.RECV_RESET
@@ -1026,6 +1069,12 @@ WAIT_FOR_ALL_EVENTS
 	POP	AF
 WAIT_START
 	LD	(S11_WAIT_MASK),A
+	IFDEF	EL3_SESSION_RX
+	PUSH	AF
+	LD	A,WAIT_PROGRESS_QUANTA
+	LD	(S11_WAIT_PROGRESS),A
+	POP	AF
+	ENDIF
 	CALL	@NETTIME.START
 	RET	C
 .WAIT_LOOP
@@ -1034,8 +1083,63 @@ WAIT_START
 	POP	IX
 	CALL	CHECK_WAIT_EVENTS
 	JP	C,.EVENT_READY
+	IFDEF	EL3_SESSION_RX
+	LD	HL,(S11_RX_DELIVERED)
+	LD	A,H
+	OR	L
+	JR	NZ,.WAIT_NO_CANCEL	; mid-drain: DSS_SCANKEY consumes the key,
+	ENDIF				; and returning data would lose the cancel
 	CALL	CHECK_CANCEL
 	RET	C
+	IFDEF	EL3_SESSION_RX
+.WAIT_NO_CANCEL
+	ENDIF
+	IFDEF	EL3_SESSION_RX
+	; Two-phase receive. RX_BEGIN pulls only the 54-byte header prefix and
+	; leaves the payload in the card's FIFO; FAST_RECEIVE then decides where
+	; the rest of it should go. A plain in-order data segment for the
+	; context the caller is waiting on goes straight into the pending slot
+	; with its TCP checksum accumulated in the same pass (one walk over the
+	; bytes instead of read-then-checksum-then-copy). Everything else is
+	; pulled into STAGE9_RX_BUFFER behind the header and handled by
+	; PROCESS_FRAME exactly as before.
+	; RX_PENDING/READ_FRAME themselves are untouched throughout and still
+	; serve every other caller (ARP, DNS/UDP, FTP).
+	LD	HL,STAGE9_RX_BUFFER
+	LD	BC,TCPX_RX_PREFIX
+	CALL	@EL3IO.RX_BEGIN
+	JP	C,.READ_ERROR
+	LD	A,B
+	OR	C			; EL3_OK is also 0, so "nothing queued" (CF=0,
+	JP	Z,.WAIT_IDLE		; BC=0) must be told apart by BC, not A.
+	LD	(S11_FRAME_LENGTH),BC
+	LD	HL,STAGE9_RX_CAPACITY
+	OR	A
+	SBC	HL,BC
+	JR	C,.SESSION_TOO_BIG	; capacity < length: the rest would not fit
+					; behind the header; nothing is discarded
+					; yet -- match READ_FRAME's own
+					; EL3_ERR_FRAME_SIZE contract exactly.
+	CALL	FAST_RECEIVE
+	JR	NC,.SESSION_SLOW
+	OR	A
+	JP	NZ,.READ_ERROR
+	JP	.SESSION_FAST
+.SESSION_TOO_BIG
+	CALL	@EL3IO.RX_DROP
+	JP	C,.READ_ERROR
+	JP	.WAIT_TICK
+.SESSION_SLOW
+	LD	HL,(S11_FRAME_LENGTH)
+	LD	BC,TCPX_RX_PREFIX
+	OR	A
+	SBC	HL,BC			; always >0: a frame is at least 60 bytes
+	LD	B,H
+	LD	C,L
+	LD	DE,STAGE9_RX_BUFFER+TCPX_RX_PREFIX
+	CALL	@EL3IO.RX_PAYLOAD
+	JP	C,.READ_ERROR
+	ELSE
 	CALL	@NETDRV.RX_PENDING
 	RET	C
 	OR	A
@@ -1045,14 +1149,78 @@ WAIT_START
 	CALL	@NETDRV.READ_FRAME
 	JP	C,.READ_ERROR
 	LD	(S11_FRAME_LENGTH),BC
+	ENDIF
 	CALL	PROCESS_FRAME
 	RET	C
+	IFDEF	EL3_SESSION_RX
+.SESSION_HANDLED
+	ENDIF
+	IFDEF	TCPX_DIRECT_RX
+	CALL	SEND_OWED_ACK
+	RET	C
+	ENDIF
 	LD	HL,(S11_SELECTED_CONTEXT)
 	PUSH	HL
 	POP	IX
 	CALL	CHECK_WAIT_EVENTS
 	JP	C,.EVENT_READY
 	JP	.WAIT_TICK
+	IFDEF	EL3_SESSION_RX
+; A segment delivered straight into the caller's buffer does not end the wait
+; by itself: RECV reports S11_RX_DELIVERED, not an event, so the loop keeps
+; draining while another whole MSS still fits there. That is what turns one
+; RECV per segment into one RECV per bufferful -- the DSS clock read and key
+; scan RECV makes are then paid once per eleven segments, not once per one.
+; The wait ends when the buffer can no longer take a full segment, when a poll
+; finds the card empty, or on any event the slow path raises (FIN, RST, a
+; segment that had to go to pending).
+.SESSION_FAST
+	LD	A,(S11_FAST_DIRECT)
+	OR	A
+	JP	Z,.SESSION_HANDLED	; landed in pending: unchanged behaviour
+	LD	HL,S11_ACK_OWED
+	INC	(HL)
+	LD	A,(HL)
+	CP	TCP_ACK_EVERY
+	JR	C,.SESSION_FAST_ROOM	; still under the threshold, stay quiet
+	CALL	SEND_OWED_ACK
+	RET	C
+.SESSION_FAST_ROOM
+	LD	HL,(S11_RX_FREE)
+	LD	DE,(S11_RX_DELIVERED)
+	OR	A
+	SBC	HL,DE
+	LD	DE,TCP_MSS
+	OR	A
+	SBC	HL,DE
+	JP	NC,.WAIT_PROGRESS	; another whole segment still fits
+	CALL	SEND_OWED_ACK		; settle the debt before handing the
+	RET	C			; bufferful back to RECV
+	XOR	A
+	RET
+; A poll that came back with a frame is progress, not idling, so it must not
+; pay NETTIME.TICK's price: that is a 1 ms busy-wait plus a DSS_SYSTIME read
+; (nettime.asm's TICK -> S7APP.WAIT_TICK and READ_WALL), and on a saturated
+; download the loop polls once per segment. Spending it every segment cost
+; more than reading the segment did. The deadline is an idle timeout, so
+; skipping it while frames keep coming is right -- but the skip is bounded, so
+; a peer that floods us with frames we never act on still runs the wait out.
+.WAIT_PROGRESS
+	LD	HL,S11_WAIT_PROGRESS
+	DEC	(HL)
+	JP	NZ,.WAIT_LOOP
+	LD	(HL),WAIT_PROGRESS_QUANTA
+	JP	.WAIT_TICK
+.WAIT_IDLE
+	LD	HL,(S11_RX_DELIVERED)
+	LD	A,H
+	OR	L
+	JP	Z,.WAIT_TICK
+	CALL	SEND_OWED_ACK		; card empty and bytes already delivered:
+	RET	C			; settle the debt and hand them back
+	XOR	A
+	RET
+	ENDIF
 .READ_ERROR
 	CP	EL3_ERR_RX_ERROR
 	JP	Z,.WAIT_TICK
@@ -1077,6 +1245,296 @@ WAIT_START
 	AND	C
 	OR	A
 	RET
+
+	IFDEF	TCPX_DIRECT_RX
+; Sends the ACK HANDLE_SEGMENT deferred instead of sending itself (see
+; .ACK_CURRENT in HANDLE_SEGMENT): no driver call happens from inside
+; PROCESS_FRAME's own call chain any more, only from here in .WAIT_LOOP,
+; after PROCESS_FRAME has returned. S11_MATCH_CONTEXT is still the context
+; that earned the ACK -- nothing else writes it in between. Kept as its own
+; routine (not inlined into .WAIT_LOOP) so the CALL PROCESS_FRAME .. JP
+; .WAIT_TICK span check-stage11.pl anchors on stays short.
+; Out: CF set on send failure, propagated to WAIT_LOOP's caller.
+SEND_OWED_ACK
+	LD	A,(S11_ACK_NOW)
+	IFDEF	EL3_SESSION_RX
+	LD	HL,S11_ACK_OWED		; either flag is reason enough to send,
+	OR	(HL)			; and settling one settles both
+	LD	(HL),0
+	ENDIF
+	OR	A
+	RET	Z
+	XOR	A
+	LD	(S11_ACK_NOW),A
+	LD	HL,(S11_MATCH_CONTEXT)
+	PUSH	HL
+	POP	IX
+	LD	A,TCP_FLAG_ACK
+	LD	BC,0
+	JP	SEND_SEGMENT
+	ENDIF
+
+	IFDEF	EL3_SESSION_RX
+; FAST_RECEIVE -- second half of the two-phase receive.
+;
+; RX_BEGIN has copied only the TCPX_RX_PREFIX-byte header; the payload is
+; still in the card's FIFO and the frame is still queued. If this is a plain
+; in-order data segment for the context the caller is waiting on, read the
+; payload straight into the pending slot with the TCP checksum accumulated in
+; the same pass, then commit. Anything else -- ARP, ICMP, a handshake or FIN
+; or RST segment, a duplicate or out-of-order one, a segment for the other
+; channel, one that will not fit -- is left exactly as RX_BEGIN left it, and
+; WAIT_LOOP's slow path reads the rest into STAGE9_RX_BUFFER and runs
+; PROCESS_FRAME on the whole frame the way it always has. The predicate below
+; therefore only ever *reads* state: nothing is committed, and no driver call
+; is made, until every one of its conditions holds.
+;
+; In: header at STAGE9_RX_BUFFER, (S11_FRAME_LENGTH)=whole frame length.
+; Out: CF=0 -- not handled; nothing was read and the frame is still queued.
+;      CF=1 with A=0 -- handled; the payload was read and the frame discarded
+;      (whether or not the checksum matched: a bad one leaves the bytes past
+;      the pending tail uncommitted and lets the peer retransmit).
+;      CF=1 with A<>0 -- driver error, A is the EL3 status.
+; Clobbers AF, BC, DE, HL, IX.
+FAST_RECEIVE
+	LD	HL,(S11_SELECTED_CONTEXT)
+	LD	A,H
+	OR	L
+	RET	Z			; nobody is waiting on a context
+	PUSH	HL
+	POP	IX
+	LD	A,(IX+CTX_STATE)
+	CP	TCP_STATE_ESTABLISHED
+	JR	Z,.FAST_STATE_OK
+	CP	TCP_STATE_FIN_WAIT
+	JR	Z,.FAST_STATE_OK
+.SLOW
+	OR	A			; CF=0: WAIT_LOOP takes the slow path
+	RET
+.FAST_STATE_OK
+	LD	A,(STAGE9_RX_BUFFER+12)
+	CP	0x08
+	JR	NZ,.SLOW
+	LD	A,(STAGE9_RX_BUFFER+13)
+	OR	A
+	JR	NZ,.SLOW		; ethertype must be 0800
+	LD	A,(STAGE9_RX_BUFFER+14)
+	CP	0x45
+	JR	NZ,.SLOW		; IPv4, no options
+	LD	A,(STAGE9_RX_BUFFER+20)
+	AND	0xBF			; only DF may be set -- same rule as
+	JR	NZ,.SLOW		; @IPV4.PARSE's own fragment check
+	LD	A,(STAGE9_RX_BUFFER+21)
+	OR	A
+	JR	NZ,.SLOW
+	LD	A,(STAGE9_RX_BUFFER+23)
+	CP	TCP_PROTOCOL
+	JR	NZ,.SLOW
+	LD	DE,STAGE9_RX_BUFFER+30
+	LD	HL,NET_LOCAL_IP
+	CALL	CMP4
+	JR	NZ,.SLOW
+	LD	HL,STAGE9_RX_BUFFER+14
+	LD	BC,IPV4_HEADER_LENGTH
+	CALL	@ETHERNET.VERIFY_CHECKSUM
+	JR	C,.SLOW
+	LD	A,(STAGE9_RX_BUFFER+16)
+	LD	H,A
+	LD	A,(STAGE9_RX_BUFFER+17)
+	LD	L,A			; HL = IP total length
+	LD	DE,IPV4_HEADER_LENGTH+TCP_HEADER_LENGTH
+	OR	A
+	SBC	HL,DE
+	JR	C,.SLOW
+	JR	Z,.SLOW			; no payload: a pure ACK or window probe
+	LD	(S11_FAST_LENGTH),HL
+	LD	DE,TCP_MSS+1
+	OR	A
+	SBC	HL,DE
+	JR	NC,.SLOW		; oversized: .PROTOCOL handles it
+	LD	HL,(S11_FAST_LENGTH)
+	LD	DE,TCPX_RX_PREFIX
+	ADD	HL,DE
+	EX	DE,HL			; DE = 14 + IP total length
+	LD	HL,(S11_FRAME_LENGTH)
+	OR	A
+	SBC	HL,DE
+	JR	C,.SLOW			; frame shorter than the IP header claims
+	LD	A,(STAGE9_RX_BUFFER+46)
+	CP	0x50
+	JR	NZ,.SLOW		; TCP options present
+	LD	A,(STAGE9_RX_BUFFER+47)
+	AND	~(TCP_FLAG_ACK|TCP_FLAG_PSH)
+	JR	NZ,.SLOW		; SYN/FIN/RST/URG: slow path, unchanged
+	LD	A,(STAGE9_RX_BUFFER+47)
+	AND	TCP_FLAG_ACK
+	JP	Z,.SLOW
+	; The four-tuple has to be the selected context's. MATCH_CONTEXT reads
+	; the source address and the TCP header through the parse descriptor,
+	; so point those two fields at this frame first; @IPV4.PARSE rewrites
+	; both on the slow path, so borrowing them here changes nothing.
+	LD	HL,STAGE9_RX_BUFFER+26
+	LD	(S11_IPV4_PARSE_DESC+IP4P_SOURCE),HL
+	LD	HL,STAGE9_RX_BUFFER+34
+	LD	(S11_IPV4_PARSE_DESC+IP4P_DATA),HL
+	CALL	MATCH_CONTEXT
+	JP	NZ,.SLOW
+	LD	HL,STAGE9_RX_BUFFER+38
+	PUSH	IX
+	POP	DE
+	LD	BC,CTX_RCV_NXT
+	EX	DE,HL
+	ADD	HL,BC
+	EX	DE,HL
+	CALL	CMP4
+	JP	NZ,.SLOW		; duplicate or out of order
+	; Where does it go? Straight into the caller's buffer while a RECV is
+	; waiting with room left there, otherwise into the pending slot if it
+	; fits. Neither -- slow path, which re-ACKs and lets the peer retry.
+	LD	HL,(S11_RX_FREE)
+	LD	A,H
+	OR	L
+	JR	Z,.FAST_TRY_PENDING
+	LD	DE,(S11_RX_DELIVERED)
+	OR	A
+	SBC	HL,DE			; room left in the caller's buffer
+	LD	DE,(S11_FAST_LENGTH)
+	OR	A
+	SBC	HL,DE
+	JR	C,.FAST_TRY_PENDING
+	LD	HL,(S11_RX_DEST)
+	LD	DE,(S11_RX_DELIVERED)
+	ADD	HL,DE
+	LD	(S11_FAST_DEST),HL
+	LD	A,1
+	LD	(S11_FAST_DIRECT),A
+	JR	.FAST_DEST_READY
+.FAST_TRY_PENDING
+	LD	HL,S11_PENDING_CAPACITY
+	LD	E,(IX+CTX_PENDING_OFF)
+	LD	D,(IX+CTX_PENDING_OFF+1)
+	OR	A
+	SBC	HL,DE
+	LD	E,(IX+CTX_PENDING_LEN)
+	LD	D,(IX+CTX_PENDING_LEN+1)
+	SBC	HL,DE			; HL = CAPACITY - OFF - LEN
+	LD	DE,(S11_FAST_LENGTH)
+	OR	A
+	SBC	HL,DE
+	JP	C,.SLOW			; would not fit; the slow path re-ACKs
+	CALL	PENDING_BASE
+	LD	L,(IX+CTX_PENDING_OFF)
+	LD	H,(IX+CTX_PENDING_OFF+1)
+	ADD	HL,DE
+	LD	E,(IX+CTX_PENDING_LEN)
+	LD	D,(IX+CTX_PENDING_LEN+1)
+	ADD	HL,DE			; base + off + len = append point
+	LD	(S11_FAST_DEST),HL
+	XOR	A
+	LD	(S11_FAST_DIRECT),A
+.FAST_DEST_READY
+	; Accepted. Seed the checksum with the pseudo-header and the TCP header,
+	; both of which start at an even offset, so the payload continues the
+	; same word parity RX_COPY_SUM assumes.
+	LD	DE,0
+	LD	HL,STAGE9_RX_BUFFER+26
+	LD	BC,8			; source and destination address
+	CALL	@ETHERNET.ACCUMULATE
+	LD	HL,TCP_PROTOCOL
+	CALL	@TCP.ADD_ACCUMULATOR
+	LD	HL,(S11_FAST_LENGTH)
+	LD	BC,TCP_HEADER_LENGTH
+	ADD	HL,BC
+	CALL	@TCP.ADD_ACCUMULATOR
+	LD	HL,STAGE9_RX_BUFFER+34
+	LD	BC,TCP_HEADER_LENGTH
+	CALL	@ETHERNET.ACCUMULATE
+	EX	DE,HL
+	LD	(@EL3IO.RXS_SUM),HL
+	LD	DE,(S11_FAST_DEST)
+	LD	BC,(S11_FAST_LENGTH)
+	CALL	@EL3IO.RX_PAYLOAD_SUM
+	RET	C			; A/CF already the driver's own status
+	LD	HL,(@EL3IO.RXS_SUM)
+	LD	A,H
+	AND	L
+	INC	A			; FFFFh means every word summed clean
+	JR	Z,.FAST_COMMIT
+	LD	HL,(S11_FAST_BADSUM)
+	INC	HL
+	LD	(S11_FAST_BADSUM),HL	; nothing committed: the bytes sit past
+	XOR	A			; the pending tail and the peer will
+	SCF				; retransmit over them
+	RET
+.FAST_COMMIT
+	LD	DE,(S11_FAST_LENGTH)
+	LD	A,(S11_FAST_DIRECT)
+	OR	A
+	JR	Z,.FAST_COMMIT_PENDING
+	LD	HL,(S11_RX_DELIVERED)
+	ADD	HL,DE
+	LD	(S11_RX_DELIVERED),HL
+	JR	.FAST_COMMIT_SEQUENCE
+.FAST_COMMIT_PENDING
+	LD	L,(IX+CTX_PENDING_LEN)
+	LD	H,(IX+CTX_PENDING_LEN+1)
+	ADD	HL,DE
+	LD	(IX+CTX_PENDING_LEN),L
+	LD	(IX+CTX_PENDING_LEN+1),H
+.FAST_COMMIT_SEQUENCE
+	PUSH	IX
+	POP	HL
+	LD	BC,CTX_RCV_NXT
+	ADD	HL,BC
+	CALL	ADD16_TO32		; DE is still the payload length
+	LD	A,(S11_FAST_DIRECT)
+	OR	A
+	JR	NZ,.FAST_NO_EVENT	; direct delivery is reported by
+	LD	A,EVENT_DATA		; S11_RX_DELIVERED instead; raising the
+	CALL	SET_EVENT		; event would end the drain after one
+.FAST_NO_EVENT				; segment
+
+	; A data segment also carries the peer's acknowledgement and window;
+	; taking them in here is what HANDLE_SEGMENT's .NO_ACK path does, and
+	; skipping it would strand the next SEND on a stale window.
+	LD	A,(STAGE9_RX_BUFFER+49)
+	LD	(S11_TCP_PARSE_DESC+TCPP_WINDOW),A
+	LD	A,(STAGE9_RX_BUFFER+48)
+	LD	(S11_TCP_PARSE_DESC+TCPP_WINDOW+1),A
+	LD	HL,STAGE9_RX_BUFFER+42
+	PUSH	IX
+	POP	DE
+	LD	BC,CTX_SND_NXT
+	EX	DE,HL
+	ADD	HL,BC
+	EX	DE,HL
+	CALL	CMP4
+	JR	NZ,.FAST_ACK_OWED
+	LD	HL,STAGE9_RX_BUFFER+42
+	PUSH	IX
+	POP	DE
+	LD	BC,CTX_SND_UNA
+	EX	DE,HL
+	ADD	HL,BC
+	EX	DE,HL
+	CALL	COPY4
+	CALL	UPDATE_REMOTE_WINDOW
+	LD	A,EVENT_ACK
+	CALL	SET_EVENT
+.FAST_ACK_OWED
+	PUSH	IX
+	POP	HL
+	LD	(S11_MATCH_CONTEXT),HL
+	LD	A,(S11_FAST_DIRECT)
+	OR	A
+	JR	NZ,.FAST_OWED_COUNTED	; .SESSION_FAST counts the debt instead,
+	LD	A,1			; so it can coalesce across segments
+	LD	(S11_ACK_NOW),A		; WAIT_LOOP sends it once we return
+.FAST_OWED_COUNTED
+	XOR	A
+	SCF
+	RET
+	ENDIF
 
 CHECK_WAIT_EVENTS
 	LD	A,(IX+CTX_EVENT)
@@ -1233,6 +1691,9 @@ MATCH_CONTEXT
 HANDLE_SEGMENT
 	XOR	A
 	LD	(S11_SEGMENT_ACCEPTED),A
+	IFDEF	TCPX_DIRECT_RX
+	LD	(S11_ACK_NOW),A
+	ENDIF
 	LD	A,(S11_TCP_PARSE_DESC+TCPP_FLAGS)
 	BIT	2,A
 	JP	Z,.NOT_RST
@@ -1427,16 +1888,27 @@ HANDLE_SEGMENT
 	LD	A,(S11_SEGMENT_ACCEPTED)
 	OR	A
 	JP	Z,.DONE
-	; Every accepted segment is ACKed immediately (no deferred/coalesced
-	; ACK): an earlier attempt at a drain-or-threshold delayed ACK called
+.ACK_CURRENT
+	IFDEF	TCPX_DIRECT_RX
+	; Every accepted segment earns an ACK (still sent every time here, not
+	; yet coalesced), but HANDLE_SEGMENT no longer sends it itself: an
+	; earlier attempt at a drain-or-threshold delayed ACK called
 	; @NETDRV.RX_PENDING from here, deep inside PROCESS_FRAME's own call
 	; chain from WAIT_FOR_EVENT/READ_FRAME, and corrupted receive state on
 	; long transfers (reproduced with the call present even when its
-	; result was discarded) -- not yet root-caused, so left out.
-.ACK_CURRENT
+	; result was discarded) -- not yet root-caused. So no driver call is
+	; made from this depth at all any more: .WAIT_LOOP sends the ACK for
+	; S11_MATCH_CONTEXT (still valid -- nothing else writes it before
+	; .WAIT_LOOP reads it) once PROCESS_FRAME has returned.
+	LD	A,1
+	LD	(S11_ACK_NOW),A
+	XOR	A
+	RET
+	ELSE
 	LD	A,TCP_FLAG_ACK
 	LD	BC,0
 	JP	SEND_SEGMENT
+	ENDIF
 .PROTOCOL
 	LD	A,NETDRV_ERR_PROTOCOL
 	CALL	FAIL_CONTEXT

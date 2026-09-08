@@ -20,6 +20,19 @@ EXE_VERSION	EQU 1
 	DEFINE STAGE10_DNS
 	DEFINE STAGE11_LAYOUT
 	DEFINE STAGE12_LAYOUT
+	; Image headroom to spare, so take the unrolled FIFO burst (el3_io.asm).
+	DEFINE FAST_DATAPATH
+	; Round-2 throughput: driver primitives must never be called from inside
+	; PROCESS_FRAME/HANDLE_SEGMENT's own call chain (tcp_transport.asm), so
+	; the ACK a segment earns is deferred to .WAIT_LOOP instead of sent
+	; in-line. FTP does not define this and keeps the byte-identical old
+	; behavior -- its image has no room to spare for this yet.
+	DEFINE TCPX_DIRECT_RX
+	; One ISA-window session per receive step (el3_io.asm's RX_BEGIN/
+	; RX_PAYLOAD/RX_DROP) instead of the several RX_PENDING/READ_FRAME used
+	; apart. Additive only: RX_PENDING/READ_FRAME themselves are untouched,
+	; so ARP/DNS/other non-TCP traffic on this same EXE is unaffected.
+	DEFINE EL3_SESSION_RX
 
 	DEVICE NOSLOT64K
 	INCLUDE "version.inc"
@@ -114,14 +127,21 @@ START
 	JP	C,TCP_SEND_FAIL
 	CALL	RESET_HTTP_STATE
 
+; One RECV per bufferful instead of one per segment: with direct delivery
+; (tcp_transport.asm's FAST_RECEIVE) the transport writes segments straight
+; into this buffer and only returns once it can no longer take a whole MSS, so
+; the DSS clock read and key scan RECV makes are paid once per eleven segments
+; here rather than once each. STAGE9_FILE_BUFFER is otherwise unused -- DLSPEED
+; discards the body, and PROCESS_CHUNK parses out of whatever buffer it is
+; handed.
 .RX_LOOP
 	XOR	A
-	LD	HL,S11_APP_BUFFER
-	LD	BC,TCP_MSS
+	LD	HL,STAGE9_FILE_BUFFER
+	LD	BC,STAGE9_FILE_CAPACITY
 	LD	DE,HTTP_IDLE_MS
 	CALL	@TCPX.RECV
 	JR	C,.RX_END_OR_FAIL
-	LD	HL,S11_APP_BUFFER
+	LD	HL,STAGE9_FILE_BUFFER
 	CALL	PROCESS_CHUNK
 	LD	A,(W12_HOP_DONE)
 	OR	A

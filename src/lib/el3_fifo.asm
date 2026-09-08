@@ -34,7 +34,16 @@ SEND_FRAME
 	JP	C,.SEND_RETURN
 	CALL	TX_WAIT_FREE
 	JR	C,.SEND_TIMEOUT_OR_IO
+	IFDEF	EL3_SESSION_RX
+	; TX_BURST (el3_io.asm) writes preamble+frame+both pad regions in one ISA
+	; session instead of TX_WRITE_PACKET's four separate FIFO_WRITE/FIFO_ZERO
+	; opens; TX_WRITE_PACKET itself stays compiled (FTP does not define
+	; EL3_SESSION_RX and still calls it here). Same completion wait as
+	; before -- this only shrinks the write, not the TX_WAIT_COMPLETE below.
+	CALL	@EL3IO.TX_BURST
+	ELSE
 	CALL	TX_WRITE_PACKET
+	ENDIF
 	JP	C,.SEND_RETURN
 	CALL	TX_WAIT_COMPLETE
 	JR	C,.SEND_TIMEOUT_OR_IO
@@ -393,6 +402,11 @@ TX_WAIT_FREE
 	JR	NC,.TX_FREE_POLL
 	RET
 
+; Compiled out under EL3_SESSION_RX: .SEND_ATTEMPT above calls
+; @EL3IO.TX_BURST instead, which does the same work in one ISA session. The
+; source stays here regardless -- check-stage5.pl anchors the preamble formula
+; and the FIFO_WRITE/FIFO_ZERO calls on it.
+	IFNDEF	EL3_SESSION_RX
 TX_WRITE_PACKET
 	LD	HL,(TX_EFFECTIVE_LENGTH)
 	LD	A,L
@@ -426,6 +440,7 @@ TX_WRITE_PACKET
 	LD	C,A
 	LD	B,0
 	JP	@EL3IO.FIFO_ZERO
+	ENDIF
 
 TX_WAIT_COMPLETE
 	LD	HL,0

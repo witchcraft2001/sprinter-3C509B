@@ -497,6 +497,12 @@ TEST_DONE
 RESET_MOCK
 	XOR	A
 	LD	(MOCK_WINDOW),A
+	; Returning the mock card to window 0 is what a Global Reset does, so
+	; the driver's cached window has to go with it -- SELECT_WINDOW skips
+	; the command when it believes the card already holds that window.
+	LD	A,0xFF
+	LD	(@EL3.CURRENT_WINDOW),A
+	XOR	A
 	LD	(MOCK_CIP_REMAIN),A
 	LD	(COMMAND_COUNT),A
 	LD	(IO_TRACE_LENGTH),A
