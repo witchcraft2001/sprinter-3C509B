@@ -355,5 +355,6 @@ NETCFG_EXIT_CODE DB DSS_EXIT_LOCAL
 	INCLUDE "el3.asm"
 	INCLUDE "netdrv.asm"
 	INCLUDE "netparse.asm"
+	INCLUDE "netparse_file.asm"
 	INCLUDE "netenv.asm"
 	INCLUDE "stage7_app.asm"

@@ -357,4 +357,5 @@ CONFIG_END
 	INCLUDE "../src/lib/arp.asm"
 	INCLUDE "dhcp.asm"
 	INCLUDE "netparse.asm"
+	INCLUDE "netparse_file.asm"
 	INCLUDE "el3_algorithms.asm"
