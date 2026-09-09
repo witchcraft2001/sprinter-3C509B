@@ -75,7 +75,7 @@ const environment = {NET_IP: 'stale', NET_LEASE_SEC: 'stale'};
 let result = run('NETCFG', '-i -v', cfgScenario(dhcpConfig, {environment}));
 assert.strictEqual(result.exitCode, 0); assert.match(result.output, /warnings=0/);
 assert.deepStrictEqual(environment, {
-  NET: '509B', NET_HW: 'AUTO', NET_IDPORT: '#110', NET_MAC: '02:60:8C:12:34:56',
+  NET: '509B', NET_HW: '1/#300', NET_IDPORT: '#110', NET_MAC: '02:60:8C:12:34:56',
   NET_IP_SRC: 'DHCP', NET_NTP: 'pool.ntp.org', NET_TZ: '+4',
 }); cleanup(result);
 
@@ -97,6 +97,7 @@ const staticEnv = {};
 result = run('NETCFG', '-i', cfgScenario(staticConfig, {environment: staticEnv, slot: 1}));
 assert.strictEqual(result.exitCode, 0);
 assert.strictEqual(result.card.base, 0x320); assert.strictEqual(result.card.station, '021122334455');
+assert.deepStrictEqual(result.probedSlots, [1], 'a matching pin must not scan the other slot');
 assert.deepStrictEqual(staticEnv, {
   NET: '509B', NET_HW: '1/#320', NET_IDPORT: '#110', NET_MAC: '02:11:22:33:44:55',
   NET_IP_SRC: 'STATIC', NET_IP: '192.168.7.2', NET_MASK: '255.255.255.0',
@@ -108,7 +109,20 @@ const slot0Env = {};
 const slot0Config = staticConfig.replace('HW=1/#320', 'HW=0/#200').replace('MAC=02:11:22:33:44:55', 'MAC=');
 result = run('NETCFG', '-i -v', cfgScenario(slot0Config, {environment: slot0Env, slot: 0}));
 assert.strictEqual(result.exitCode, 0); assert.strictEqual(result.card.base, 0x200);
+assert.deepStrictEqual(result.probedSlots, [0], 'a matching pin must not scan the other slot');
 assert.strictEqual(slot0Env.NET_HW, '0/#200'); assert.strictEqual(slot0Env.NET_MAC, '02:60:8C:12:34:56');
+cleanup(result);
+
+// A pin naming a slot the card is not in falls back to auto-probing (the
+// other slot first) and republishes the card's true location with a warning,
+// instead of failing outright.
+const staleEnv = {};
+const staleConfig = staticConfig.replace('HW=1/#320', 'HW=0/#300').replace('MAC=02:11:22:33:44:55', 'MAC=');
+result = run('NETCFG', '-i', cfgScenario(staleConfig, {environment: staleEnv, slot: 1}));
+assert.strictEqual(result.exitCode, 0, result.output);
+assert.deepStrictEqual(result.probedSlots, [0, 1]);
+assert.match(result.output, /\[W\] HW=0\/#300 not usable, probed 1\/#300/);
+assert.strictEqual(staleEnv.NET_HW, '1/#300');
 cleanup(result);
 
 const duplicate = staticConfig.replace('IP=192.168.7.2', 'IP=10.0.0.1\nUNKNOWN=x\nIP=192.168.7.2');
@@ -144,6 +158,63 @@ assert.strictEqual(result.exitCode, 0); assert.deepStrictEqual(rollbackEnv, {});
 // Static IFUP and hardware/link/config failures.
 result = run('IFUP', '', {environment: baseStaticEnv()});
 assert.strictEqual(result.exitCode, 0); assert.match(result.output, /STATIC IP=192\.168\.7\.2/); cleanup(result);
+
+// A pin matching the card's actual slot skips the other slot entirely, and a
+// stale pin falls back to auto-probing and republishes the true location --
+// the same self-healing NETCFG -i gets from RECORD_HW.
+result = run('IFUP', '', {environment: {...baseStaticEnv(), NET_HW: '1/#300'}});
+assert.strictEqual(result.exitCode, 0);
+assert.deepStrictEqual(result.probedSlots, [1], 'a matching pin must not scan the other slot');
+cleanup(result);
+
+const ifupStaleEnv = {...baseStaticEnv(), NET_HW: '0/#300'};
+result = run('IFUP', '', {environment: ifupStaleEnv});
+assert.strictEqual(result.exitCode, 0, result.output);
+assert.deepStrictEqual(result.probedSlots, [0, 1]);
+assert.match(result.output, /\[W\] HW=0\/#300 not usable, probed 1\/#300/);
+assert.strictEqual(ifupStaleEnv.NET_HW, '1/#300');
+cleanup(result);
+
+// A pin still fails when no card answers either slot: the fallback is bounded
+// by the same two probes AUTO makes and reports EL3_ERR_NOT_FOUND, not a hang.
+result = run('IFUP', '', {environment: {...baseStaticEnv(), NET_HW: '0/#300'},
+  cardPresent: false});
+assert.strictEqual(result.exitCode, 2);
+assert.match(result.output, /RESULT FAIL code=3/);
+assert.deepStrictEqual(result.probedSlots, [0, 1]);
+cleanup(result);
+
+// The static republish touches nothing but NET_HW, except that it drops a
+// lease left over from an earlier DHCP run -- inert once NET_IP_SRC=STATIC,
+// and exactly what NETCFG -i does. Absent optionals stay absent.
+const ifupStaticEnv = {...baseStaticEnv(), NET_DHCP_SRV: '192.168.7.1', NET_LEASE_SEC: '86400'};
+result = run('IFUP', '', {environment: ifupStaticEnv});
+assert.strictEqual(result.exitCode, 0, result.output);
+assert.deepStrictEqual(ifupStaticEnv, {...baseStaticEnv(), NET_HW: '1/#300'});
+cleanup(result);
+
+const ifupBareEnv = {
+  NET: '509B', NET_HW: 'AUTO', NET_IDPORT: '#110', NET_MAC: '02:60:8C:12:34:56',
+  NET_IP_SRC: 'STATIC', NET_IP: '192.168.7.2', NET_MASK: '255.255.255.0',
+};
+result = run('IFUP', '', {environment: ifupBareEnv});
+assert.strictEqual(result.exitCode, 0, result.output);
+assert.deepStrictEqual(Object.keys(ifupBareEnv).sort(), [
+  'NET', 'NET_HW', 'NET_IDPORT', 'NET_IP', 'NET_IP_SRC', 'NET_MAC', 'NET_MASK',
+]);
+cleanup(result);
+
+// Refreshing NET_HW is best effort: a static interface that is genuinely up
+// must not start failing because the environment cannot be written, and
+// PUBLISH's rollback must leave the old values byte for byte.
+const ifupEnvFail = baseStaticEnv();
+const ifupEnvBefore = {...ifupEnvFail};
+result = run('IFUP', '', {environment: ifupEnvFail, envFailAt: 3});
+assert.strictEqual(result.exitCode, 0, result.output);
+assert.match(result.output, /STATIC IP=192\.168\.7\.2/);
+assert.deepStrictEqual(ifupEnvFail, ifupEnvBefore);
+cleanup(result);
+
 result = run('IFUP', '', {environment: baseStaticEnv(), link: false});
 assert.strictEqual(result.exitCode, 3);
 assert.match(result.output, /TIMEOUT stage=LINK elapsed_waitq=#[0-9A-F]{4} slot=1 base=#0300 status=#[0-9A-F]{4}/);
@@ -177,7 +248,7 @@ assert.strictEqual(discover.readUInt16BE(34), 68); assert.strictEqual(discover.r
 assert.ok(discover.includes(Buffer.from([53, 1, 1]))); assert.ok(request.includes(Buffer.from([53, 1, 3])));
 assert.ok(request.includes(Buffer.from([50, 4, 192, 168, 7, 100])));
 assert.deepStrictEqual(dhcpEnv, {
-  ...baseDhcpEnv(), NET_IP: '192.168.7.100', NET_MASK: '255.255.255.0',
+  ...baseDhcpEnv(), NET_HW: '1/#300', NET_IP: '192.168.7.100', NET_MASK: '255.255.255.0',
   NET_GW: '192.168.7.1', NET_DNS1: '1.1.1.1', NET_DNS2: '8.8.8.8',
   NET_DHCP_SRV: '192.168.7.1', NET_LEASE_SEC: '86400',
 }); cleanup(result);

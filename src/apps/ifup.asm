@@ -89,6 +89,7 @@ START
 	JP	NZ,HARDWARE_FAIL
 	JP	RELEASE_CLEAR		; lease removal does not depend on the card
 .DRIVER_OK
+	CALL	@S7APP.RECORD_HW
 	LD	BC,10000
 	CALL	@NETDRV.WAIT_LINK_UP
 	JR	NC,.LINK_OK
@@ -137,7 +138,55 @@ STATIC_OK
 	CALL	PRINT_IP
 	LD	HL,@CONSOLE.CRLF
 	CALL	@CONSOLE.STRING
+	CALL	PREPARE_STATIC_DESIRED
+	LD	HL,DESIRED_TABLE
+	CALL	@NETENV.PUBLISH		; best effort, see below
 	JP	SUCCESS
+
+; PREPARE_STATIC_DESIRED extends the shared base table with the static
+; address fields LOAD_ENV_CONFIG already loaded into NCV_* (NCV_IP_SRC=STATIC
+; is guaranteed whenever this is called), exactly as NETCFG's own
+; PREPARE_DESIRED does for a non-DHCP file. The base table already carries
+; NET/HW/IDPORT/MAC/IP_SRC/NTP/TZ and clears the two lease variables, which
+; is what a static run wants: no lease exists to keep. Republishing it is
+; how a successful static IFUP records the driver's true slot/base, the same
+; way DHCP's PUBLISH_LEASE already does.
+;
+; The publish is deliberately best effort: it refreshes values the
+; environment already holds, and the only new one, NET_HW, is a probe hint
+; that NETDRV.INIT recovers from on its own. PUBLISH restores every variable
+; on failure, so a full or failing environment leaves the previous, complete
+; configuration in place -- failing an interface that is genuinely up would
+; be the worse answer, and would abort CONNECT.BAT for nothing.
+PREPARE_STATIC_DESIRED
+	CALL	PREPARE_EMPTY_DESIRED
+	LD	HL,NCV_IP
+	LD	(DESIRED_TABLE+5*2),HL
+	LD	HL,NCV_MASK
+	LD	(DESIRED_TABLE+6*2),HL
+	LD	HL,NCV_GW
+	LD	DE,DESIRED_TABLE+7*2
+	CALL	STORE_TEXT_OPTIONAL
+	LD	HL,NCV_DNS1
+	LD	DE,DESIRED_TABLE+8*2
+	CALL	STORE_TEXT_OPTIONAL
+	LD	HL,NCV_DNS2
+	LD	DE,DESIRED_TABLE+9*2
+	JR	STORE_TEXT_OPTIONAL	; tail call: its RET ends this routine
+
+; STORE_TEXT_OPTIONAL: HL -> field, DE -> table slot. An empty field stores a
+; zero pointer, which PUBLISH turns into a deletion.
+STORE_TEXT_OPTIONAL
+	LD	A,(HL)
+	OR	A
+	JR	NZ,.STORE
+	LD	HL,0
+.STORE
+	EX	DE,HL
+	LD	(HL),E
+	INC	HL
+	LD	(HL),D
+	RET
 
 ; LOAD_ACTIVE_LEASE uses only the public environment. It returns A=1 for the
 ; exact active-lease contract (DHCP source plus nonzero IP/server/lease), A=0

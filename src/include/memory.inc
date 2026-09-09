@@ -629,8 +629,9 @@ F13_POS_COUNT		EQU F13_STATE_BASE + 0x38 ; PARSE_FTP's positional-argument curso
 F13_LOCAL_ARG_PTR	EQU F13_STATE_BASE + 0x39 ; word, resolved local file path
 F13_REMOTE_ARG_PTR	EQU F13_STATE_BASE + 0x3B ; word, resolved RETR/STOR/LIST argument
 F13_BUFFER_USED	EQU F13_STATE_BASE + 0x3D ; word, bytes staged in STAGE9_FILE_BUFFER
-F13_CHUNK_PTR		EQU F13_STATE_BASE + 0x3F ; word, APPEND_DATA cursor
-F13_CHUNK_LEN		EQU F13_STATE_BASE + 0x41 ; word, APPEND_DATA remaining
+; F13_STATE_BASE+0x3F/+0x40 is free (GET_LOOP's direct RECV into
+; STAGE9_FILE_BUFFER retired the APPEND_DATA cursor that lived here).
+F13_CHUNK_LEN		EQU F13_STATE_BASE + 0x41 ; word, PUT_LOOP's staged send length
 F13_TOTAL_WRITTEN	EQU F13_STATE_BASE + 0x43 ; four bytes LE, progress display only
 ; Elapsed seconds is a three-byte quantity given a four-byte cell so that both
 ; readers can take it as one 32-bit load: nothing writes +3 and the page is

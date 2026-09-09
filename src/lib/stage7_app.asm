@@ -53,6 +53,71 @@ INIT_DRIVER
 	POP	IY,IX
 	RET
 
+; RECORD_HW
+; Formats the driver's actual NETDRV_SELECTED_SLOT/NETDRV_SELECTED_BASE as
+; "S/#HHH" (PARSE_HW's own explicit form) and copies it into NCV_HW when it
+; differs from the value INIT_DRIVER was given -- an AUTO placeholder, or an
+; explicit pin the probe had to bypass (NETDRV.INIT's own fallback, see
+; netdrv.asm). Only NCV_HW is updated here; the caller republishes it (e.g.
+; via NETENV.PUBLISH) same as any other parsed field. A replaced non-AUTO
+; pin prints one warning line so a stale NET.CFG/environment value is visible
+; instead of silently drifting.
+; In: none (reads NETDRV_SELECTED_SLOT/BASE and NCV_HW).
+; Out: A=0/CF=0 on every path, including the no-change one. Clobbers AF/BC/
+; DE/HL; preserves IX/IY (CONSOLE brackets its own DSS calls, and neither
+; FORMAT_NIBBLE nor STR_EQ_CI/COPY_Z touch the index registers), so unlike
+; the other public S7APP entry points this one needs no PUSH IX,IY.
+RECORD_HW
+	LD	DE,RECORD_HW_BUF
+	LD	A,(NETDRV_SELECTED_SLOT)
+	ADD	A,'0'
+	LD	(DE),A
+	INC	DE
+	LD	A,'/'
+	LD	(DE),A
+	INC	DE
+	LD	A,'#'
+	LD	(DE),A
+	INC	DE
+	LD	HL,(NETDRV_SELECTED_BASE)
+	LD	A,H
+	CALL	@NETENV.FORMAT_NIBBLE
+	LD	A,L
+	RRCA
+	RRCA
+	RRCA
+	RRCA
+	CALL	@NETENV.FORMAT_NIBBLE
+	LD	A,L
+	CALL	@NETENV.FORMAT_NIBBLE
+	XOR	A
+	LD	(DE),A
+	LD	HL,NCV_HW
+	LD	DE,RECORD_HW_BUF
+	CALL	@NETPARSE.STR_EQ_CI
+	JR	NZ,.CHANGED
+	XOR	A			; unchanged: publish the same text again
+	RET
+.CHANGED
+	LD	HL,NCV_HW
+	LD	DE,@NETPARSE.DEFAULT_HW
+	CALL	@NETPARSE.STR_EQ_CI
+	JR	Z,.REPLACE
+	LD	HL,MSG_HW_PROBED_PRE
+	CALL	@CONSOLE.STRING
+	LD	HL,NCV_HW
+	CALL	@CONSOLE.STRING
+	LD	HL,MSG_HW_PROBED_MID
+	CALL	@CONSOLE.STRING
+	LD	HL,RECORD_HW_BUF
+	CALL	@CONSOLE.LINE
+.REPLACE
+	LD	HL,RECORD_HW_BUF
+	LD	DE,NCV_HW
+	CALL	@NETPARSE.COPY_Z
+	XOR	A
+	RET
+
 ; CLEANUP
 ; In A=primary status. DONE and FREEMEM are both attempted; the first error is
 ; returned. No DSS call occurs until NETDRV has closed the ISA window.
@@ -388,6 +453,9 @@ VALUE_DHCP_LOCAL DB "DHCP",0
 VALUE_STATIC_LOCAL DB "STATIC",0
 S7APP_ENV_DEST DW 0
 S7APP_ENV_CAPACITY DB 0
+RECORD_HW_BUF	DS 8,0
+MSG_HW_PROBED_PRE DB "[W] HW=",0
+MSG_HW_PROBED_MID DB " not usable, probed ",0
 
 	ENDMODULE
 	ENDIF

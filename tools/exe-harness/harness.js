@@ -1497,6 +1497,7 @@ function runExe(exePath, args = '', inputScenario = {}) {
   // i.e. each 0x9fbd mapping sequence below. Round-2 throughput gates read
   // both from the harness result instead of re-deriving them from a trace.
   let memoryAccessCount = 0, isaSessionCount = 0;
+  const probedSlots = new Set();
   const pages = new Map(), allocations = new Map();
   const allocated = (id) => pages.has(id);
   const environment = scenario.environment || {};
@@ -1530,6 +1531,7 @@ function runExe(exePath, args = '', inputScenario = {}) {
     memoryAccessCount++;
     if (address >= 0xc000 && isaOpen) {
       const port = cardPort(address);
+      if (!card.active && port === (scenario.idPort || 0x110)) probedSlots.add(selectedSlot);
       if (!assertCardSlot()) return 0xff;
       if (!card.active && port === (scenario.idPort || 0x110)) return card.idRead();
       if (card.active && port >= card.base && port < card.base + 0x10) return card.readByte(port - card.base);
@@ -1544,6 +1546,7 @@ function runExe(exePath, args = '', inputScenario = {}) {
     memoryAccessCount++;
     if (address >= 0xc000 && isaOpen) {
       const port = cardPort(address);
+      if (!card.active && port === (scenario.idPort || 0x110)) probedSlots.add(selectedSlot);
       if (!assertCardSlot()) return;
       if (!card.active && port === (scenario.idPort || 0x110)) return card.idWrite(value);
       if (card.active && port >= card.base && port < card.base + 0x10) return card.writeByte(port - card.base, value);
@@ -1926,6 +1929,7 @@ function runExe(exePath, args = '', inputScenario = {}) {
       tcp: card.tcpRequestCount,
     },
     maxInFlight: card.maxInFlight,
+    probedSlots: [...probedSlots].sort(),
     memoryAccesses: memoryAccessCount,
     isaSessions: isaSessionCount,
     setTimeCalls,

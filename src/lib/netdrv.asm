@@ -14,6 +14,10 @@
 ; INIT
 ; In: HL -> versioned NETDRV config. Out: stable A/CF status.
 ; Clobbers AF/BC/DE/HL; preserves IX/IY. AUTO probes slots 0 then 1 only.
+; EXPLICIT probes only the configured slot; a pinned slot whose DISCOVER
+; finds no adapter falls back to the AUTO probe, hinted with the pinned slot
+; (so a one-off glitch is retried before the other slot gets its turn). A
+; rejected slot/ID-port or a failed ACTIVATE keeps its own status.
 INIT
 	PUSH	IX,IY
 	LD	(NETDRV_SAVED_IX),HL
@@ -39,13 +43,22 @@ INIT
 	CALL	@EL3.CONFIGURE
 	JP	C,.RETURN
 	CALL	@EL3.DISCOVER
-	JP	C,.RETURN
+	JR	C,.AUTO
 	LD	L,(IX+NETDRV_CFG_BASE)
 	LD	H,(IX+NETDRV_CFG_BASE+1)
 	LD	A,1
 	CALL	@EL3.ACTIVATE
 	JP	C,.ACTIVATE_FAILED
 	JR	.ACTIVE
+; Only DISCOVER decides that a pinned slot missed: it is the one step that
+; asks the hardware whether an adapter answers there, so its failure falls
+; back to the same probe AUTO uses, hinted with the pinned slot (a card that
+; only glitched is retried once before the other slot gets its turn).
+; CONFIGURE validates slot/ID-port and touches no hardware, so its
+; EL3_ERR_PARAMETER is returned as-is -- probing would repeat the identical
+; rejection on both slots and report the bad ID port as "card not found".
+; A failed ACTIVATE is not a missed pin either: the card answered ID, so a
+; bad base is reported as-is via .ACTIVATE_FAILED.
 .AUTO
 	LD	A,(IX+NETDRV_CFG_SLOT)
 	CP	2

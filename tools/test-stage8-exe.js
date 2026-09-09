@@ -99,6 +99,21 @@ let result = run('PING', '-n 1 192.168.7.1', routed());
 assert.strictEqual(result.exitCode, 0); assert.match(result.output, /Reply from 192\.168\.7\.1/);
 checked(result);
 
+// An explicit HW pin naming the card's real slot never touches the other
+// slot's ID port; a pin naming the wrong slot still succeeds by falling back
+// to the auto probe instead of failing outright (NETDRV.INIT, not NETCFG/
+// IFUP's own RECORD_HW republish -- a plain consumer like PING never writes
+// the environment back).
+result = run('PING', '-n 1 192.168.7.1', routed({environment: {...staticEnv(), NET_HW: '1/#300'}}));
+assert.strictEqual(result.exitCode, 0);
+assert.deepStrictEqual(result.probedSlots, [1], 'a matching pin must not scan the other slot');
+checked(result);
+
+result = run('PING', '-n 1 192.168.7.1', routed({environment: {...staticEnv(), NET_HW: '0/#300'}}));
+assert.strictEqual(result.exitCode, 0, result.output);
+assert.deepStrictEqual(result.probedSlots, [0, 1]);
+checked(result);
+
 // Payload/TTL boundaries and exact wire checksums.
 for (const size of [0, 1, 32, 1472]) {
   const ttl = size === 0 ? 1 : 255;
