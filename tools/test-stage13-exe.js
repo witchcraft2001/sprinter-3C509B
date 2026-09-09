@@ -308,6 +308,44 @@ assert.ok(result.tcpResetPorts.includes(result.ftpDataPort),
 checked(result);
 
 // ------------------------------------------------------------------
+// STOR send window. TCPX.SEND used to keep exactly one segment outstanding and
+// wait for its acknowledgement before touching the next, which is the one
+// pattern RFC 1122's "acknowledge at least every second full-sized segment"
+// rule cannot rescue: the peer holds its delayed-ACK timer on every segment.
+// On real hardware that showed as 12 KB/s uploading against 31 KB/s
+// downloading over the same connection, while the harness put the upload's
+// cost per byte within 7% of the download's -- the missing time was idle.
+// Byte-exactness alone would not catch a silent fall back to one segment, so
+// the depth is asserted directly: maxClientInFlight is the peak the model saw
+// the client put on the wire before reading an acknowledgement for it.
+// ------------------------------------------------------------------
+const BULK = Buffer.from(Array.from({length: 9 * 536 + 71}, (_, i) => (i * 7 + (i >> 8)) & 0xff));
+result = run('192.168.7.44 PUT BULK.BIN', scenario({}, {files: {'BULK.BIN': BULK}}));
+assert.strictEqual(result.exitCode, 0, result.output);
+assert.deepStrictEqual(result.ftpUploads, BULK, 'bulk upload is not byte-exact');
+assert.strictEqual(result.maxClientInFlight, 2 * 536,
+  `STOR kept only ${result.maxClientInFlight} bytes on the wire, expected a two-segment window`);
+checked(result);
+
+// A peer window too small for two whole segments must fall back to one, and
+// the upload must still arrive byte for byte.
+result = run('192.168.7.44 PUT BULK.BIN', scenario({dataWindow: 700}, {files: {'BULK.BIN': BULK}}));
+assert.strictEqual(result.exitCode, 0, result.output);
+assert.deepStrictEqual(result.ftpUploads, BULK, 'window-limited upload is not byte-exact');
+assert.strictEqual(result.maxClientInFlight, 536,
+  `a ${700}-byte window must not carry two segments (saw ${result.maxClientInFlight})`);
+checked(result);
+
+// Under two full segments of payload there is no pair to form.
+const SHORT = BULK.subarray(0, 900);
+result = run('192.168.7.44 PUT SHORT.BIN', scenario({}, {files: {'SHORT.BIN': SHORT}}));
+assert.strictEqual(result.exitCode, 0, result.output);
+assert.deepStrictEqual(result.ftpUploads, SHORT);
+assert.strictEqual(result.maxClientInFlight, 536,
+  `a ${SHORT.length}-byte upload has no second whole segment to pair (saw ${result.maxClientInFlight})`);
+checked(result);
+
+// ------------------------------------------------------------------
 // -o rename, both directions. Regression test for a bug found and fixed
 // during Stage 13 test-infra review: DERIVE_ARGS (ftp.asm) used to point
 // F13_LOCAL_ARG_PTR/F13_REMOTE_ARG_PTR straight at F13_REPLY_LINE on the

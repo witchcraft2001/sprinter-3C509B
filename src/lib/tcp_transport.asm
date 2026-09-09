@@ -30,6 +30,22 @@
 	ENDIF
 	ENDIF
 
+; TCPX_WAIT_PROGRESS builds the bounded tick skip in .WAIT_LOOP. Only the
+; builds that actually land on that branch carry it: the session receive path
+; reaches it after delivering a segment straight to the caller, and the burst
+; sender reaches it on the acknowledgement of a pair's first segment, which
+; HANDLE_SEGMENT deliberately ignores. WGET and TCPTEST reach it never --
+; measured, not assumed, with the harness's delayLoops counter -- so they keep
+; the plain tick and the image bytes.
+	IFDEF EL3_SESSION_RX
+	DEFINE TCPX_WAIT_PROGRESS
+	ENDIF
+	IFDEF TCPX_SEND_BURST
+	IFNDEF TCPX_WAIT_PROGRESS
+	DEFINE TCPX_WAIT_PROGRESS
+	ENDIF
+	ENDIF
+
 	MODULE TCPX
 
 CTX_STATE		EQU 0
@@ -65,6 +81,12 @@ TCPX_RX_PREFIX		EQU 14 + IPV4_HEADER_LENGTH + TCP_HEADER_LENGTH
 ; before spending one anyway. 64 segments is well inside any single RECV's
 ; deadline yet still bounds a flood of frames that never raise an event.
 WAIT_PROGRESS_QUANTA	EQU 64
+
+; S11_SEQUENCE_OVERRIDE selects where SEND_SEGMENT_COMMON reads the outgoing
+; sequence number from when it may not come from the context itself.
+SEQUENCE_FROM_CONTEXT	EQU 0	; ordinary segment: SND.UNA or SND.NXT
+SEQUENCE_FROM_TARGET	EQU 1	; window probe: SND.NXT-1, staged in TARGET_ACK
+SEQUENCE_FROM_BURST	EQU 2	; burst's second segment: SND.UNA + first length
 
 SYN_ATTEMPTS		EQU 3
 SYN_TIMEOUT_MS		EQU 1700
@@ -227,7 +249,10 @@ OPEN_SAFE
 ; SEND
 ; In: A=channel, HL=buffer, BC=length. Out: DE=cumulatively ACKed bytes.
 ; Length zero is a successful no-op on an open channel; longer calls are
-; segmented internally.
+; segmented internally. Under TCPX_SEND_BURST a round trip carries two
+; segments instead of one whenever the buffer and the peer's window allow it
+; (CHOOSE_BURST); either way the wait below is for one cumulative
+; acknowledgement covering everything that went out.
 ; Clobbers AF/BC/HL; preserves IX/IY.
 SEND
 	PUSH	IX,IY
@@ -262,6 +287,9 @@ SEND
 	JP	C,.SEND_FAIL
 	LD	A,TCP_STAGE_DATA
 	LD	(S11_DIAG_STAGE),A
+	IFDEF	TCPX_SEND_BURST
+	CALL	CHOOSE_BURST
+	ELSE
 	CALL	CHOOSE_SEGMENT_LENGTH
 	LD	HL,(S11_SEGMENT_LENGTH)
 	LD	(S11_ACTIVE_LENGTH),HL
@@ -269,12 +297,25 @@ SEND
 	LD	DE,STAGE9_TX_BUFFER+14+IPV4_HEADER_LENGTH+TCP_HEADER_LENGTH
 	LD	BC,(S11_ACTIVE_LENGTH)
 	LDIR
+	ENDIF
 	PUSH	IX
 	POP	HL
 	LD	DE,CTX_SND_NXT
 	ADD	HL,DE
 	LD	DE,S11_TARGET_ACK
 	CALL	COPY4
+	IFDEF	TCPX_SEND_BURST
+	; SND.NXT still equals SND.UNA here -- .DATA_EVENT only advances on an
+	; acknowledgement of everything outstanding -- so the copy just made is
+	; the burst's first sequence number, and the second segment's is one
+	; segment further on. Built once per burst rather than per retransmission.
+	LD	HL,S11_TARGET_ACK
+	LD	DE,S11_BURST_SEQ
+	CALL	COPY4
+	LD	HL,S11_BURST_SEQ
+	LD	DE,(S11_BURST_FIRST)
+	CALL	ADD16_TO32
+	ENDIF
 	LD	HL,S11_TARGET_ACK
 	LD	DE,(S11_ACTIVE_LENGTH)
 	CALL	ADD16_TO32
@@ -290,9 +331,13 @@ SEND
 	LD	A,(IX+CTX_EVENT)
 	AND	~(EVENT_ACK|EVENT_RST|EVENT_FIN)
 	LD	(IX+CTX_EVENT),A
+	IFDEF	TCPX_SEND_BURST
+	CALL	SEND_BURST
+	ELSE
 	LD	A,TCP_FLAG_PSH|TCP_FLAG_ACK
 	LD	BC,(S11_ACTIVE_LENGTH)
 	CALL	SEND_SEGMENT
+	ENDIF
 	JP	C,.SEND_FAIL
 	LD	A,(IX+CTX_RETRY_LEFT)
 	CP	3
@@ -827,6 +872,92 @@ CHOOSE_SEGMENT_LENGTH
 	LD	(S11_SEGMENT_LENGTH),HL
 	RET
 
+	IFDEF	TCPX_SEND_BURST
+; CHOOSE_BURST picks how much of the caller's buffer this round trip carries:
+; one segment, or two whole ones back to back.
+;
+; One segment in flight is one segment per round trip, and on a LAN the round
+; trip is not the wire, it is the peer's delayed-ACK timer: RFC 1122 lets a
+; receiver hold an acknowledgement and only obliges it to answer at once "at
+; least every second full-sized segment". A sender that never has two full
+; segments outstanding can never satisfy that clause, so it pays the timer on
+; every segment. Measured on real hardware against a NAS, upload sat at 12
+; KB/s while a download over the same connection ran at 31 KB/s -- and the
+; harness put the upload's cost per byte within 7% of the download's, so the
+; missing time was idle, not work.
+;
+; The pair is deliberately all-or-nothing: two whole segments or one. A pair
+; whose halves differ in length would need a second length to carry around,
+; and the only round trip it would save is the last one of a transfer.
+; In: IX=context, S11_SEND_REMAINING, S11_SEND_POINTER.
+; Out: S11_ACTIVE_LENGTH=bytes this round trip must have acknowledged,
+; S11_BURST_FIRST=first segment's length, S11_BURST_PAIR set when a second
+; whole segment follows it. Clobbers AF/DE/HL.
+CHOOSE_BURST
+	CALL	CHOOSE_SEGMENT_LENGTH
+	LD	(S11_ACTIVE_LENGTH),HL
+	LD	(S11_BURST_FIRST),HL
+	XOR	A
+	LD	(S11_BURST_PAIR),A	; also leaves CF clear for the compare
+	LD	DE,TCP_MSS		; below; neither store touches the flags
+	SBC	HL,DE
+	RET	NZ			; a short first segment ends the buffer or
+					; rides a squeezed window: send it alone
+	LD	HL,(S11_SEND_REMAINING)
+	LD	DE,TCP_MSS*2
+	OR	A
+	SBC	HL,DE
+	RET	C			; fewer than two whole segments left
+	; The peer must be able to hold both at once. Testing the high byte alone
+	; rounds that requirement up to the next 256 bytes, which costs nothing
+	; real: a window between two MSS and that boundary simply keeps the old
+	; one-segment behaviour, and no peer advertises one.
+	LD	A,(IX+CTX_REMOTE_WINDOW+1)
+	CP	(TCP_MSS*2+255)/256
+	RET	C
+	LD	A,1
+	LD	(S11_BURST_PAIR),A
+	LD	HL,TCP_MSS*2
+	LD	(S11_ACTIVE_LENGTH),HL
+	RET
+
+; SEND_BURST copies and transmits the burst CHOOSE_BURST picked. Both segments
+; are rebuilt from the caller's buffer every time, so a retransmission after a
+; timeout resends exactly the same bytes; the one TX buffer serves both because
+; NETDRV.SEND_FRAME has already handed the first frame to the card by the time
+; the second is built.
+; An acknowledgement of the first segment alone is ignored rather than acted
+; on: HANDLE_SEGMENT takes an ACK only when it matches SND.NXT exactly, and
+; SND.NXT covers the whole burst. So .DATA_EVENT still sees exactly one
+; cumulative acknowledgement per round trip, and a pair whose second half is
+; lost is retransmitted whole -- go-back-N, on the same retry ladder as before.
+; In: IX=context, S11_SEND_POINTER, S11_BURST_FIRST, S11_BURST_PAIR,
+; S11_BURST_SEQ (built by SEND, once per burst).
+; Out: CF set with A=driver status on failure. Clobbers AF/BC/DE/HL.
+SEND_BURST
+	LD	HL,(S11_SEND_POINTER)
+	LD	DE,STAGE9_TX_BUFFER+14+IPV4_HEADER_LENGTH+TCP_HEADER_LENGTH
+	LD	BC,(S11_BURST_FIRST)
+	LDIR
+	PUSH	HL			; LDIR left it on the second segment's bytes
+	LD	BC,(S11_BURST_FIRST)
+	LD	A,TCP_FLAG_PSH|TCP_FLAG_ACK
+	CALL	SEND_SEGMENT
+	POP	HL
+	RET	C
+	LD	A,(S11_BURST_PAIR)
+	OR	A
+	RET	Z			; single segment: CF is clear, A is zero
+	LD	DE,STAGE9_TX_BUFFER+14+IPV4_HEADER_LENGTH+TCP_HEADER_LENGTH
+	LD	BC,TCP_MSS
+	LDIR
+	LD	A,SEQUENCE_FROM_BURST
+	LD	(S11_SEQUENCE_OVERRIDE),A
+	LD	A,TCP_FLAG_PSH|TCP_FLAG_ACK
+	LD	BC,TCP_MSS
+	JP	SEND_SEGMENT_COMMON
+	ENDIF
+
 WAIT_REMOTE_WINDOW
 	LD	A,(IX+CTX_REMOTE_WINDOW)
 	OR	(IX+CTX_REMOTE_WINDOW+1)
@@ -885,7 +1016,7 @@ SEND_WINDOW_PROBE
 	CALL	COPY4
 	LD	HL,S11_TARGET_ACK
 	CALL	DEC32
-	LD	A,1
+	LD	A,SEQUENCE_FROM_TARGET
 	LD	(S11_SEQUENCE_OVERRIDE),A
 	LD	A,TCP_FLAG_ACK
 	LD	BC,1
@@ -895,7 +1026,7 @@ SEND_WINDOW_PROBE
 ; In: IX=context, A=flags, BC=payload length already at TX+54.
 SEND_SEGMENT
 	PUSH	AF
-	XOR	A
+	XOR	A			; SEQUENCE_FROM_CONTEXT
 	LD	(S11_SEQUENCE_OVERRIDE),A
 	POP	AF
 SEND_SEGMENT_COMMON
@@ -936,6 +1067,11 @@ SEND_SEGMENT_COMMON
 	ADD	HL,DE
 	JP	.SEQUENCE_READY
 .USE_OVERRIDE
+	IFDEF	TCPX_SEND_BURST
+	CP	SEQUENCE_FROM_BURST
+	LD	HL,S11_BURST_SEQ
+	JP	Z,.SEQUENCE_READY
+	ENDIF
 	LD	HL,S11_TARGET_ACK
 .SEQUENCE_READY
 	LD	(S11_TCP_BUILD_DESC+TCPB_SEQUENCE),HL
@@ -1079,7 +1215,7 @@ WAIT_FOR_ALL_EVENTS
 	POP	AF
 WAIT_START
 	LD	(S11_WAIT_MASK),A
-	IFDEF	EL3_SESSION_RX
+	IFDEF	TCPX_WAIT_PROGRESS
 	PUSH	AF
 	LD	A,WAIT_PROGRESS_QUANTA
 	LD	(S11_WAIT_PROGRESS),A
@@ -1174,7 +1310,11 @@ WAIT_START
 	POP	IX
 	CALL	CHECK_WAIT_EVENTS
 	JP	C,.EVENT_READY
+	IFDEF	TCPX_WAIT_PROGRESS
+	JP	.WAIT_PROGRESS
+	ELSE
 	JP	.WAIT_TICK
+	ENDIF
 	IFDEF	EL3_SESSION_RX
 ; A segment delivered straight into the caller's buffer does not end the wait
 ; by itself: RECV reports S11_RX_DELIVERED, not an event, so the loop keeps
@@ -1208,19 +1348,6 @@ WAIT_START
 	RET	C			; bufferful back to RECV
 	XOR	A
 	RET
-; A poll that came back with a frame is progress, not idling, so it must not
-; pay NETTIME.TICK's price: that is a 1 ms busy-wait plus a DSS_SYSTIME read
-; (nettime.asm's TICK -> S7APP.WAIT_TICK and READ_WALL), and on a saturated
-; download the loop polls once per segment. Spending it every segment cost
-; more than reading the segment did. The deadline is an idle timeout, so
-; skipping it while frames keep coming is right -- but the skip is bounded, so
-; a peer that floods us with frames we never act on still runs the wait out.
-.WAIT_PROGRESS
-	LD	HL,S11_WAIT_PROGRESS
-	DEC	(HL)
-	JP	NZ,.WAIT_LOOP
-	LD	(HL),WAIT_PROGRESS_QUANTA
-	JP	.WAIT_TICK
 .WAIT_IDLE
 	LD	HL,(S11_RX_DELIVERED)
 	LD	A,H
@@ -1239,6 +1366,24 @@ WAIT_START
 	CP	EL3_ERR_NO_FRAME
 	JP	Z,.WAIT_TICK
 	RET
+; A poll that came back with a frame is progress, not idling, so it must not
+; pay NETTIME.TICK's price: that is a 1 ms busy-wait plus a DSS_SYSTIME read
+; (nettime.asm's TICK -> S7APP.WAIT_TICK and READ_WALL), and on a saturated
+; transfer the loop polls once per segment. Spending it every segment cost
+; more than reading the segment did. The deadline is an idle timeout, so
+; skipping it while frames keep coming is right -- but the skip is bounded, so
+; a peer that floods us with frames we never act on still runs the wait out.
+; This applies to both receive paths: the session build reaches it from
+; .SESSION_FAST_ROOM after a direct delivery, every build reaches it after a
+; frame that PROCESS_FRAME handled without raising the awaited event -- which
+; is what every FTP data segment does while its own RECV is the one waiting.
+	IFDEF	TCPX_WAIT_PROGRESS
+.WAIT_PROGRESS
+	LD	HL,S11_WAIT_PROGRESS
+	DEC	(HL)
+	JP	NZ,.WAIT_LOOP
+	LD	(HL),WAIT_PROGRESS_QUANTA
+	ENDIF
 .WAIT_TICK
 	CALL	@NETTIME.TICK
 	JP	NC,.WAIT_LOOP

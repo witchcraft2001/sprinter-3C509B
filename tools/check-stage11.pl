@@ -59,8 +59,17 @@ die "TCP bounded retry/window policy is incomplete\n"
         && $transport =~ /TCP_ERR_WINDOW/ && $transport =~ /CTX_RETRY_LEFT/
         && $transport =~ /^SEND_WINDOW_PROBE\s*$/m
         && $transport =~ /S11_SEQUENCE_OVERRIDE/ && $transport =~ /^DEC32\s*$/m;
+# A poll that produced a frame skips NETTIME.TICK rather than paying its 1 ms
+# busy-wait plus DSS clock read, so the dispatch reaches .WAIT_PROGRESS instead
+# of .WAIT_TICK. The deadline is still inescapable, and that is what the second
+# check pins: the skip counts a quantum down and, when it runs out, reloads and
+# falls straight through into .WAIT_TICK.
 die "TCP receive dispatch can evade its deadline under continuous traffic\n"
-    unless $transport =~ /CALL\s+PROCESS_FRAME[\s\S]{0,300}?JP\s+\.WAIT_TICK/;
+    unless $transport =~ /CALL\s+PROCESS_FRAME[\s\S]{0,300}?JP\s+\.WAIT_(?:TICK|PROGRESS)/;
+die "TCP productive-poll tick skip is unbounded\n"
+    unless $transport =~ /^\.WAIT_PROGRESS\s*\n\s*LD\s+HL,S11_WAIT_PROGRESS\s*\n
+        \s*DEC\s+\(HL\)\s*\n\s*JP\s+NZ,\.WAIT_LOOP\s*\n
+        \s*LD\s+\(HL\),WAIT_PROGRESS_QUANTA\s*\n(?:\s*ENDIF\s*\n)?\.WAIT_TICK\s*\n/mx;
 die "TCP FIN acceptance reuses a stale queued-data event\n"
     unless $transport =~ /S11_SEGMENT_ACCEPTED/
         && $transport !~ /AND\s+EVENT_DATA[\s\S]{0,120}?\.ACCEPT_FIN/;

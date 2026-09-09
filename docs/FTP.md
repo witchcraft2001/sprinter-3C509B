@@ -57,7 +57,10 @@ Exit classes match WGET: 0 success, 1 arguments, 2 hardware, 3 network/timeout,
   `Opening data...`, `Done. N bytes recv.`) — the full-length strings did not
   fit under the image-size ceiling. `tools/test-fixtures/stage13-ftp-golden.json`
   pins the exact transcripts.
-- **`PUT` is stop-and-wait.** `SEND` on this backend keeps at most one MSS in
-  flight per call, so uploads do not benefit from the same deep receive
-  window that makes `GET` fast. This is a known, documented limitation, not a
-  bug — see `specs.md`.
+- **`PUT` keeps two segments in flight, not more.** A pair is what obliges the
+  receiver to acknowledge at once instead of holding its delayed-ACK timer,
+  which is what made uploads slow when only one segment was ever outstanding.
+  A deeper window would have to hold several unacknowledged payloads and
+  handle partial acknowledgements, and the image-size ceiling has no room for
+  that. A tail shorter than two whole segments, and a peer window that cannot
+  hold two, still go one segment at a time — see `specs.md`.

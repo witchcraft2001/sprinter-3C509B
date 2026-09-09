@@ -18,6 +18,11 @@ EXE_VERSION	EQU 1
 	DEFINE STAGE11_LAYOUT
 	DEFINE STAGE12_LAYOUT
 	DEFINE STAGE13_LAYOUT
+; STOR is the only bulk upload in the kit, so it is the only image that pays
+; for the two-segment send window (tcp_transport.asm's CHOOSE_BURST). WGET and
+; DLSPEED send nothing but a request line and would carry the code for
+; nothing.
+	DEFINE TCPX_SEND_BURST
 
 	DEVICE NOSLOT64K
 	INCLUDE "version.inc"

@@ -510,6 +510,21 @@ S11_STATE_BASE		EQU PAGE_BASE + 0x2600
 	ENDIF
 S11_CONTEXT_SIZE	EQU 40
 S11_TCP_BUILD_DESC	EQU S11_STATE_BASE + 0x00
+; Send burst (tcp_transport.asm's CHOOSE_BURST/SEND_BURST, TCPX_SEND_BURST
+; builds only). The build descriptor above is TCPB_DESC_LENGTH = 23 bytes long
+; and is padded to 32, so these live in its tail rather than past
+; S11_WAIT_PROGRESS, where the block is already flush against F13_STATE_BASE.
+; BURST_SEQ is the second segment's sequence number, kept as its own four bytes
+; because S11_TARGET_ACK is simultaneously holding the burst's end. A pair is
+; always two whole segments, so the second one needs no length of its own.
+S11_BURST_SEQ		EQU S11_STATE_BASE + 0x17 ; four bytes, network order
+S11_BURST_FIRST		EQU S11_STATE_BASE + 0x1B ; word, first segment's length
+S11_BURST_PAIR		EQU S11_STATE_BASE + 0x1D ; non-zero: a second segment
+						; of one whole MSS follows
+	ASSERT S11_BURST_SEQ >= S11_TCP_BUILD_DESC + 23	; TCPB_DESC_LENGTH, spelled
+							; out because tcp.inc is
+							; included after this file
+	ASSERT S11_BURST_PAIR + 1 <= S11_STATE_BASE + 0x20
 S11_TCP_PARSE_DESC	EQU S11_STATE_BASE + 0x20
 S11_PARSE_SEQUENCE	EQU S11_STATE_BASE + 0x40
 S11_PARSE_ACK		EQU S11_STATE_BASE + 0x44

@@ -477,8 +477,28 @@ class EtherLinkIII {
     // the depth of the receive pipe, and the one number that says whether an
     // advertised window is actually keeping segments in flight.
     this.maxInFlight = 0;
+    // The mirror of the above for the other direction: peak bytes the client
+    // put on the wire before it had read an acknowledgement for them. One MSS
+    // means the send path is strict stop-and-wait; a deeper number means its
+    // send window really is deeper, which is the only thing that lets a peer
+    // answer without waiting out its delayed-ACK timer. Measured here rather
+    // than inferred from timing, so a transport that quietly falls back to one
+    // segment fails the assertion instead of merely getting slower.
+    this.maxClientInFlight = 0;
     this.delayed = [];
     this.generated = [];
+  }
+
+  // Called when the client pops a frame out of the RX FIFO: whatever that
+  // frame acknowledges has stopped being in flight from the client's side.
+  creditClientAck(frame) {
+    const segment = tcpSegment(Buffer.isBuffer(frame) ? frame : Buffer.from(frame));
+    if (!segment || !(segment.flags & 0x10)) return;
+    const connection = this.tcpConnections.get(
+      `${segment.destination.join('.')}:${segment.destinationPort}/${segment.sourcePort}`);
+    if (!connection) return;
+    const left = (connection.clientNext - segment.acknowledgement) >>> 0;
+    connection.clientInFlight = left > 0x7fffffff ? 0 : left;
   }
 
   resetRuntime() {
@@ -570,7 +590,7 @@ class EtherLinkIII {
       case 0x2800: this.rxEnabled = false; this.rxQueue = []; break;
       case 0x4000:
         if (!this.rxQueue.length) throw new Error('RX_DISCARD on empty queue');
-        this.rxQueue.shift();
+        this.creditClientAck(this.rxQueue.shift().frame);
         break;
       case 0x4800: this.txEnabled = true; break;
       case 0x5000: this.txEnabled = false; break;
@@ -876,6 +896,8 @@ class EtherLinkIII {
         return;
       }
       connection.clientNext = (connection.clientNext + segment.payload.length) >>> 0;
+      connection.clientInFlight = (connection.clientInFlight || 0) + segment.payload.length;
+      this.maxClientInFlight = Math.max(this.maxClientInFlight, connection.clientInFlight);
       if (options.onData) {
         // FTP mode owns both directions of the connection itself (command
         // parsing on control, upload capture on data), so it replaces the
@@ -1517,6 +1539,10 @@ function runExe(exePath, args = '', inputScenario = {}) {
   let clockReads = 0, scanCount = 0, keyDelivered = false;
   const dssEvents = [];
   let stdout = '', exitCode = null, steps = 0, minimumSp = stack, minimumPageSp = 0x10000;
+  // Times the bounded polling yield above was collapsed: one per NETTIME.TICK,
+  // and a tick is 1.9 ms of busy-wait on a real Sprinter (NETPROF measured).
+  // The step counter cannot show this, precisely because the loop is collapsed.
+  let delayLoops = 0;
   const setTimeCalls = [];
   const pcTrace = [];
 
@@ -1890,6 +1916,7 @@ function runExe(exePath, args = '', inputScenario = {}) {
           rd(delay.pc + 2) === 0xb1 && rd(delay.pc + 3) === 0x20 &&
           rd(delay.pc + 4) === 0xfb && ((delay.b << 8) | delay.c) > 1) {
         delay.b = 0; delay.c = 1; cpu.setState(delay);
+        delayLoops++;
       }
       if (cpu.getState().pc === 0x0010) dss(); else cpu.run_instruction();
       if (++steps > limit) throw new Error(`step limit at PC=${cpu.getState().pc.toString(16)} SP=${cpu.getState().sp.toString(16)} trace=${pcTrace.map((v) => v.toString(16)).join(',')}`);
@@ -1929,9 +1956,15 @@ function runExe(exePath, args = '', inputScenario = {}) {
       tcp: card.tcpRequestCount,
     },
     maxInFlight: card.maxInFlight,
+    maxClientInFlight: card.maxClientInFlight,
     probedSlots: [...probedSlots].sort(),
     memoryAccesses: memoryAccessCount,
     isaSessions: isaSessionCount,
+    // DSS_SYSTIME reads, and the polling yields that go with them. A yield is
+    // 1.9 ms of busy-wait on a real Sprinter, so delayLoops is the count that
+    // says how much wall time a wait loop spent standing still.
+    clockReads,
+    delayLoops,
     setTimeCalls,
     ...(scenario.traceDss ? {dssEvents} : {}),
     ...(scenario.dumpMemory ? {memory: Object.fromEntries(scenario.dumpMemory.map(([start, length]) => [
