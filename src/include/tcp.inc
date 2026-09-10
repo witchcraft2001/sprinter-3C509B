@@ -24,10 +24,17 @@ TCP_MSS			EQU 536
 ; is busy elsewhere -- flushing its disk buffer, say -- and until READ_FRAME
 ; runs again it all has to sit in the 3C509B's own RX FIFO. Five segments plus
 ; framing is about 3 KiB against a FIFO of several, so a burst still fits.
+	IFDEF UNET_DLL
+; The DLL's pending queue is one real TCP_MSS per channel (BSS_PEND0/1,
+; unet509b_bss.inc) regardless of STAGE12_LAYOUT's deep-window request above --
+; there is no 16 KiB page to spend on a five-segment reserve here.
+TCP_RECV_SEGMENTS	EQU 1
+	ELSE
 	IFDEF STAGE12_LAYOUT
 TCP_RECV_SEGMENTS	EQU 5
 	ELSE
 TCP_RECV_SEGMENTS	EQU 1
+	ENDIF
 	ENDIF
 TCP_RECV_WINDOW		EQU TCP_RECV_SEGMENTS * TCP_MSS
 
@@ -52,6 +59,8 @@ TCP_STATE_SYN_SENT	EQU 1
 TCP_STATE_ESTABLISHED	EQU 2
 TCP_STATE_CLOSE_WAIT	EQU 3
 TCP_STATE_FIN_WAIT	EQU 4
+TCP_STATE_LISTEN	EQU 5
+TCP_STATE_SYN_RECEIVED	EQU 6
 
 TCP_ERR_TIMEOUT		EQU 30
 TCP_ERR_RESET		EQU 31
@@ -59,6 +68,9 @@ TCP_ERR_CLOSED		EQU 32
 TCP_ERR_WINDOW		EQU 33
 TCP_ERR_SEQUENCE	EQU 34
 TCP_ERR_STATE		EQU 35
+; SEND suspended: the link was silent for one UNET_OPT_SENDSLICE quantum
+; within the current attempt's budget. TCPX_ASYNCSEND only.
+TCP_ERR_AGAIN		EQU 36
 
 ; Stable diagnostic stages published by TCPX for the application error line.
 TCP_STAGE_LINK		EQU 0

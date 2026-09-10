@@ -6,6 +6,11 @@
 	DEFINE	_DSS_INC
 
 DSS		EQU 0x10
+; Sprinter BIOS RST entry (Bios.* functions, e.g. EMM_FN0..7). UNET_DLL's cold
+; overlay uses BIOS_EMM_FN4 to resolve a DSS_GETMEM block into a physical page
+; number without going through DSS.
+BIOS		EQU 0x08
+BIOS_EMM_FN4	EQU 0xC4	; A=block_id, B=index -> A=phys page
 
 DSS_EXIT	EQU 0x41
 DSS_PUTCHAR	EQU 0x5B
@@ -27,6 +32,8 @@ DSS_SETTIME	EQU 0x22
 DSS_SCANKEY	EQU 0x31
 DSS_SETWIN1	EQU 0x39	; A=block, B=page index
 DSS_SETWIN2	EQU 0x3A	; same, for a program whose image already owns WIN1
+DSS_SETWIN3	EQU 0x3B	; same, for WIN3 (UNET_DLL's cold-overlay loader only:
+				; staging into WIN3 happens before ISA.OPEN ever runs)
 DSS_GETMEM	EQU 0x3D
 DSS_FREEMEM	EQU 0x3E
 DSS_ENVIRON	EQU 0x46

@@ -5,10 +5,13 @@ This repository develops a polling-only network kit for the Sprinter DSS and a
 
 Version 0.0.1 contains read-only 3C509B discovery and diagnostics, polling
 `NETDRV`, DHCP acquire/renew/release, ARP, IPv4/ICMP `PING`, DNS,
-`NSLOOKUP`, NTP clock setup, UDP/TFTP GET and PUT with hostname support, and a
-two-channel client TCP transport. `PINGALT`, `UDPTEST` and `TCPTEST` are
-developer-IMG diagnostics. `UNET509B.DLL` remains a future stage. No EEPROM write
-or Sprinter IRQ route is implemented.
+`NSLOOKUP`, NTP clock setup, UDP/TFTP GET and PUT with hostname support, a
+two-channel client TCP transport with FTP/DLSPEED and HTTP `WGET`, and
+`UNET509B.DLL` — a libman 1.3/L1 network backend (TCP, UDP, RESOLVE, PING,
+two channels, LISTEN, ASYNCSEND) for third-party applications, exercised by
+`UNETTEST.EXE`. `PINGALT`, `UDPTEST`, `TCPTEST` and `UNETTEST` are
+developer-IMG diagnostics. No EEPROM write or Sprinter IRQ route is
+implemented.
 
 ## Build
 

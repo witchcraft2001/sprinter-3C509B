@@ -69,7 +69,9 @@ LFSR_NEXT
 	XOR	EL3_LFSR_POLY
 	RET
 
-; BASE_DECODE
+; BASE_DECODE: only ACTIVATE's EEPROM-base branch calls this, and that
+; branch is unreachable for UNET_DLL (see el3.asm's own comment on why).
+	IFNDEF	UNET_DLL
 ; In: A = base index 00..1E. Out: HL = 0200..03E0, CF=0.
 ; Invalid index returns EL3_ERR_BASE and CF=1.
 ; Preserves BC, DE, IX and IY.
@@ -90,6 +92,7 @@ BASE_DECODE
 	LD	A,EL3_ERR_BASE
 	SCF
 	RET
+	ENDIF
 
 ; BASE_ENCODE
 ; In: HL = 0200..03E0 aligned to 10h. Out: A = index 00..1E, CF=0.

@@ -180,6 +180,33 @@ assert.match(result.output, /Redirect: HTTP\/1\.0 302 Found/);
 assert.deepStrictEqual(outputFile(result, 'redirected.bin'), Buffer.from('arrived'));
 assert.strictEqual(result.httpRequests.length, 2); checked(result);
 
+// Response framing against a server that does NOT close the connection.
+// "Connection: close" is only a request, and HTTP/1.1 keep-alive is the
+// default for common servers (Python's http.server among them). Until this
+// was fixed, WGET treated the peer's FIN as the sole end-of-body marker, so a
+// download that arrived complete and byte-exact still sat idle for
+// HTTP_IDLE_MS and then reported "TCP recv failed, code 0x1E" with a failing
+// exit code -- while the fully correct file sat on disk. The harness only
+// withholds its FIN when keepOpen says so, which is why every scenario above
+// missed this.
+const KEEPALIVE_BODY = Buffer.alloc(4000, 0x5a);
+result = run('http://192.168.7.44/keep.bin -y', scenario({
+  response: response('200 OK', KEEPALIVE_BODY), keepOpen: true}));
+assert.strictEqual(result.exitCode, 0, result.output);
+assert.deepStrictEqual(outputFile(result, 'keep.bin'), KEEPALIVE_BODY);
+assert.doesNotMatch(result.output, /TCP recv failed/, result.output);
+assert.match(result.output, /RESULT OK/); checked(result);
+
+// The same framing rule has to end a discarded hop, or a redirect from a
+// keep-alive server stalls before the request that actually matters is sent.
+result = run('http://192.168.7.44/hop -y -o hopped.bin', scenario({responses: {
+  '/hop': response('302 Found', 'discarded', {Location: '/landing'}),
+  '/landing': response('200 OK', 'arrived'),
+}, keepOpen: true}));
+assert.strictEqual(result.exitCode, 0, result.output);
+assert.deepStrictEqual(outputFile(result, 'hopped.bin'), Buffer.from('arrived'));
+assert.strictEqual(result.httpRequests.length, 2); checked(result);
+
 result = run('http://192.168.7.44/original.bin -y', scenario({responses: {
   '/original.bin': response('302 Found', '', {Location: '/failed.bin'}),
   '/failed.bin': response('404 Not Found', 'not written'),

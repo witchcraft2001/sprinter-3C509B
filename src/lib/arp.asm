@@ -8,6 +8,9 @@
 
 	INCLUDE "memory.inc"
 	INCLUDE "netdrv.inc"
+	IFDEF	UNET_DLL
+	INCLUDE "coldctx.inc"
+	ENDIF
 
 	MODULE ARP
 
@@ -22,6 +25,42 @@ ARP_ENTRY_IP		EQU 1
 ARP_ENTRY_MAC		EQU 5
 ARP_ENTRY_TIME		EQU 11
 ARP_ENTRY_ORDER		EQU 13
+
+	IFDEF	UNET_DLL
+; BUILD_REQUEST/BUILD_REPLY/PARSE read/write NET_LOCAL_IP, NET_TARGET_IP,
+; NET_NEXT_HOP_IP, NET_RESULT_MAC and NETDRV_STATION_MAC directly -- all
+; RUNTIME_BASE-relative addresses in THIS image, fine for a normal EXE but
+; meaningless to the separately-assembled, non-relocated cold blob (see
+; unet509b_cold.asm's header). Their bodies move there, rewritten to
+; reach the same fields through the COLD_CTX pointer block (coldctx.inc)
+; instead of a fixed address; what stays here is a trampoline with the
+; SAME calling convention, plus IX = &COLD_CTX for the cold side to use.
+; UNET_COLD_CTX is defined by memory_dll.inc once BSS_UNET is linked.
+BUILD_REQUEST
+	PUSH	IX
+	LD	IX,UNET_COLD_CTX
+	LD	A,CFN_ARP_BUILD_REQUEST
+	CALL	@COLD.RUN
+	POP	IX
+	RET
+
+BUILD_REPLY
+	PUSH	IX
+	LD	IX,UNET_COLD_CTX
+	LD	A,CFN_ARP_BUILD_REPLY
+	CALL	@COLD.RUN
+	POP	IX
+	RET
+
+PARSE
+	PUSH	IX
+	LD	IX,UNET_COLD_CTX
+	LD	A,CFN_ARP_PARSE
+	CALL	@COLD.RUN
+	POP	IX
+	RET
+
+	ELSE
 
 ; CLEAR_CACHE initializes all nonpersistent entries.
 CLEAR_CACHE
@@ -285,6 +324,8 @@ DEST_FOR_US
 	DJNZ	.BROADCAST
 	RET
 
+	ENDIF	; UNET_DLL (BUILD_REQUEST/BUILD_REPLY/PARSE trampolines above)
+
 ; SELECT_NEXT_HOP
 ; In: HL=target IP. Copies target to NET_TARGET_IP and chosen address to
 ; NET_NEXT_HOP_IP. Limited/subnet broadcast returns FF:FF:FF:FF:FF:FF in
@@ -385,6 +426,11 @@ SELECT_NEXT_HOP
 	POP	IY,IX
 	RET
 
+	IFNDEF	UNET_DLL
+; The DLL runs one ARP exchange per CONNECT/UDPOPEN/RESOLVE/PING and keeps
+; no cache (decision recorded in the plan): CACHE_LOOKUP/CACHE_INSERT and
+; the entry table they walk are never linked in, saving the whole
+; ARP_CACHE_COUNT * ARP_CACHE_ENTRY_SIZE reservation plus this code.
 ; CACHE_LOOKUP
 ; In: HL=IP, BC=now seconds. Out: NET_RESULT_MAC and CF=0 on live hit.
 CACHE_LOOKUP
@@ -497,7 +543,9 @@ CACHE_INSERT
 	XOR	A
 	POP	IY,IX
 	RET
+	ENDIF	; UNET_DLL (CACHE_LOOKUP/CACHE_INSERT)
 
+	IFNDEF	UNET_DLL
 FIXED_REQUEST	DB 0,1,0x08,0,6,4,0,ARP_OP_REQUEST
 FIXED_REPLY	DB 0,1,0x08,0,6,4,0,ARP_OP_REPLY
 ; EtherType + ARP htype/ptype/hlen/plen. Opcode is checked separately.
@@ -507,6 +555,7 @@ ARP_MAC_PTR	DW 0
 ARP_INPUT_PTR	DW 0
 ARP_OUTPUT_PTR	DW 0
 ARP_OLDEST_AGE	DW 0
+	ENDIF
 ARP_MASK_BYTE	DB 0
 ARP_HOST_BYTE	DB 0
 ARP_HOST_BITS	DB 0

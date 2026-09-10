@@ -7,6 +7,9 @@
 	INCLUDE "dss.inc"
 	INCLUDE "memory.inc"
 	INCLUDE "netdrv.inc"
+	IFDEF	UNET_DLL
+	INCLUDE "coldctx.inc"
+	ENDIF
 
 	MODULE S9APP
 
@@ -316,6 +319,22 @@ UPPER
 	RET
 
 PARSE_HW
+	IFDEF	UNET_DLL
+; Moved to the cold overlay (unet509b_cold.asm, CFN_PARSE_HW) along with
+; its own copy of @EL3ALG.BASE_ENCODE (hot-only, so duplicated rather than
+; called across the cold/hot boundary). This stub keeps the NETDRV_CONFIG
+; writes, since those are fixed hot addresses cold code cannot reference.
+	LD	HL,S9_ENV_BUFFER
+	LD	A,CFN_PARSE_HW
+	CALL	@COLD.RUN
+	RET	C
+	LD	(NETDRV_CONFIG+NETDRV_CFG_SLOT),A
+	LD	(NETDRV_CONFIG+NETDRV_CFG_BASE),HL
+	LD	A,NETDRV_MODE_EXPLICIT
+	LD	(NETDRV_CONFIG+NETDRV_CFG_MODE),A
+	OR	A
+	RET
+	ELSE
 	LD	HL,S9_ENV_BUFFER
 	LD	A,(HL)
 	CP	'0'
@@ -347,10 +366,19 @@ PARSE_HW
 .HW_BAD
 	SCF
 	RET
+	ENDIF
 
 PARSE_HASH
 	LD	HL,S9_ENV_BUFFER
 PARSE_HASH_AT
+	IFDEF	UNET_DLL
+; Moved to the cold overlay (unet509b_cold.asm's PARSE_U16, CFN_PARSE_U16)
+; -- pure register logic, only S9_ENV_BUFFER's address (a plain literal,
+; not a fixed-address dependency inside the parser itself) ties it to the
+; hot image, and that lives in the PARSE_HASH stub above, not here.
+	LD	A,CFN_PARSE_U16
+	JP	@COLD.RUN
+	ELSE
 	LD	A,(HL)
 	CP	'#'
 	JR	NZ,.HASH_BAD
@@ -393,7 +421,9 @@ PARSE_HASH_AT
 	EX	DE,HL
 	OR	A
 	RET
+	ENDIF
 
+	IFNDEF	UNET_DLL
 HEX_NIBBLE
 	CP	'0'
 	JR	C,.NIB_BAD
@@ -414,8 +444,16 @@ HEX_NIBBLE
 .NIB_BAD
 	SCF
 	RET
+	ENDIF
 
+; PARSE_MAC: HL=hex string (colon-separated), DE=6-byte output.
 PARSE_MAC
+	IFDEF	UNET_DLL
+; Moved to the cold overlay (unet509b_cold.asm, CFN_PARSE_MAC) -- pure
+; register logic, no memory.inc dependency of its own.
+	LD	A,CFN_PARSE_MAC
+	JP	@COLD.RUN
+	ELSE
 	LD	B,6
 .MAC_BYTE
 	LD	A,(HL)
@@ -448,9 +486,20 @@ PARSE_MAC
 .MAC_BAD
 	SCF
 	RET
+	ENDIF
 
 ; Strict dotted IPv4. Rejects missing fields, overflow and trailing bytes.
+; HL=ASCIIZ text, DE=4-byte output.
 PARSE_IPV4
+	IFDEF	UNET_DLL
+; Moved to the cold overlay (unet509b_cold.asm, CFN_PARSE_IPV4): the ORIGINAL
+; body below uses S9_FLAGS/S9_PRIMARY_ERROR/S9_RX_LENGTH as scratch, all
+; fixed hot addresses a cold function cannot reference, so the cold copy
+; reworks that scratch onto IX/IY (see its own header comment) instead --
+; same algorithm, byte-identical accept/reject behaviour.
+	LD	A,CFN_PARSE_IPV4
+	JP	@COLD.RUN
+	ELSE
 	LD	B,4
 .IP_FIELD
 	LD	C,0
@@ -507,6 +556,7 @@ PARSE_IPV4
 .IP_BAD
 	SCF
 	RET
+	ENDIF
 
 E_NET		DB "NET",0
 E_HW		DB "NET_HW",0

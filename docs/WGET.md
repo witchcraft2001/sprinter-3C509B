@@ -26,9 +26,16 @@ failure; a pre-existing resume file is retained unchanged.
 
 Normal progress is repainted after every 6 KiB disk-buffer flush, then once at
 completion. `-d` prints one dot per flush instead of the KB counter; the final
-time/rate summary is still printed. Content without a
-`Content-Length` is read until the peer closes. Esc or Ctrl+C, timeout, and a
-premature close retain already received bytes for a later `-r` run.
+time/rate summary is still printed. Esc or Ctrl+C, timeout, and a premature
+close retain already received bytes for a later `-r` run.
+
+A response carrying `Content-Length` is finished the moment that many body
+bytes have arrived: the request asks for `Connection: close`, but a server is
+free to ignore that and hold the socket open, as HTTP/1.1 servers do by
+default, so waiting for a close would stall a download that already completed.
+Content without a `Content-Length` is read until the peer closes, which is the
+only end-of-body marker such a response has. A connection that closes before a
+declared `Content-Length` is reached is reported as a truncated transfer.
 
 Exit classes are: 0 success, 1 arguments, 2 hardware, 3 network/timeout,
 4 configuration, 5 local file error, 6 HTTP/server error, and 7 cancellation.

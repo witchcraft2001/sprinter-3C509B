@@ -1,0 +1,2257 @@
+; ======================================================
+; UNETTEST - backend-neutral smoke test for the UNET network DLL.
+;
+;   UNETTEST [-d FILE.DLL] [-u UDPPORT [SIZE]] [-2 DATAPORT]
+;            [-l LISTENPORT] [-a] [HOST [PORT]]
+;
+; Loads a UNET DLL (default UNET509B.DLL) via libman into window 1, then walks
+; the API: l_info, GETCAPS, SETOPT, STATUS, NETINIT, GETINFO, RESOLVE, PING,
+; CONNECT, SEND (HTTP HEAD), a short RECV loop, CLOSE, NETDONE, l_free.
+; -u replaces TCP with a UDP echo test.  SIZE is optional (default: a fixed
+; 21-byte string); given, it sends a generated i&0xFF pattern of that many
+; bytes instead, pair with tools/dev/udp_echo.py on the host (recvfrom(2048)
+; already covers it) -- up to 1472 this exercises the standard-MTU zero-copy
+; TX path end to end, and above 1472 it exercises the backend's own
+; NERR_PARAM rejection.  -2 replaces it with a simultaneous two-channel TCP
+; exercise: control on PORT and data on DATAPORT.  -l exercises passive open
+; (LISTEN/UNLISTEN, UNET_CAP_LISTEN): arms LISTENPORT, accepts and serves two
+; peers in a row on the SAME channel to prove CLOSE re-arms it automatically,
+; then UNLISTENs; pair with tools/dev/unettest_listen_client.py (or plain
+; `nc`) run twice.  -a exercises non-blocking SEND (ASYNCSEND,
+; UNET_CAP_ASYNCSEND / UNET_OPT_SENDSLICE): CONNECTs to HOST:PORT, then SENDs
+; a multi-chunk payload against a peer that stalls its TCP receive window
+; (tools/dev/unettest_asyncsend_stall.py) so at least one NERR_AGAIN resume
+; is exercised end to end.
+; Because the whole exercise goes through the DLL, the SAME binary tests any
+; backend - point -d at UNETESP.DLL to exercise the Wi-Fi card instead.
+;
+; This is a diagnostic tool (excluded from the ZIP package). It lives at
+; ORG 0x8100 (window 2) so the DLL can own window 1; the stack and all buffers
+; stay in window 2, below 0xC000 and outside the DLL's window.
+;
+; Exit codes: 0 ok, 1 usage, 2 hardware not found, 3 comm/protocol error,
+;             4 network not configured, 5 a check inside the run failed.
+;
+; Code 5 exists because the exercises above are checks, not just prints: a
+; missing UDP echo, a mismatched payload, a TCP request that draws no reply
+; are all failures the API itself reports as success (a RECV timeout is
+; DE=0, not an error status). Every such verdict calls MARK_FAIL, and the
+; common tail exits with it, so RESULT OK/FAIL stays the single unambiguous
+; signal CLAUDE.md requires instead of something a reader has to infer from
+; the transcript above it.
+; ======================================================
+
+EXE_VERSION	EQU 1
+
+	DEVICE NOSLOT64K
+
+	INCLUDE "version.inc"
+	INCLUDE "dss.inc"
+	INCLUDE "unet.inc"
+
+	MODULE MAIN
+
+	ORG 0x8080
+
+EXE_HEADER
+	DB "EXE"
+	DB EXE_VERSION
+	DW 0x0080			; code file offset
+	DW 0
+	DW 0
+	DW 0
+	DW 0
+	DW 0
+	DW START			; load address
+	DW START			; entry point
+	DW STACK_TOP			; initial stack
+	DS 106, 0
+
+	ORG 0x8100
+
+START
+	; DSS passes the command-line buffer pointer in IX at entry.
+	LD	(CMDLINE_PTR),IX
+	LD	SP,STACK_TOP
+	XOR	A			; BSS here is EQU space, not zero-filled
+	LD	(PHASE_FAIL),A
+	LD	(TCP_GOT_DATA),A
+
+	LD	HL,MSG_BANNER
+	CALL	PUTS_LN
+
+	CALL	PARSE_ARGS
+
+	; --- resolve + load the DLL into window 1 ---
+	CALL	RESOLVE_DLL_PATH		; HL -> first candidate
+	CALL	SAY_LOADING			; "Loading <HL>" (preserves HL)
+	LD	A,1				; window 1
+	CALL	LIBMAN.l_load
+	JR	NC,.LOADED
+	; EXE-dir candidate could not be OPENED? Retry the bare name in cwd.
+	LD	A,(USED_EXEDIR)
+	OR	A
+	JP	Z,ERR_LOAD			; bare name already tried
+	LD	A,(LIBMAN.l_reason)
+	CP	LIBMAN.LR_OPEN
+	JP	NZ,ERR_LOAD			; real load error - report it as-is
+	LD	HL,DLL_NAME
+	CALL	SAY_LOADING
+	LD	A,1
+	CALL	LIBMAN.l_load
+	JP	C,ERR_LOAD
+.LOADED
+	LD	(HANDLE),HL
+
+	; --- l_info: print name + version ---
+	LD	HL,(HANDLE)
+	LD	DE,INFO_BUF
+	CALL	LIBMAN.l_info
+	JP	C,ERR_INFO
+	LD	HL,MSG_DLL
+	CALL	PUTS
+	LD	HL,INFO_BUF + 16		; header name field
+	CALL	PUTS
+	LD	HL,MSG_VER
+	CALL	PUTS
+	LD	A,(INFO_BUF + 15)		; version high (major)
+	CALL	PUT_DEC_A
+	LD	A,'.'
+	CALL	PUT_CHAR
+	LD	A,(INFO_BUF + 14)		; version low (minor)
+	CALL	PUT_DEC_A
+	CALL	CRLF
+
+	; Take a read-only snapshot of the relocated image before the first public
+	; call.  Apart from making loader failures diagnosable on real DSS, this
+	; avoids blindly jumping through a damaged export table.
+	CALL	SNAPSHOT_DLL
+	JP	C,ERR_SNAPSHOT
+
+	; --- GETCAPS ---
+	LD	B,UNET_FN_GETCAPS
+	CALL	DO_CALL				; -> DE=caps, IX=abi
+	LD	(CAPS),DE
+	PUSH	IX
+	POP	HL
+	LD	(ABI_VERSION),HL
+	LD	HL,MSG_CAPS
+	CALL	PUTS
+	LD	DE,(CAPS)
+	CALL	PUT_HEX16
+	CALL	CRLF
+	LD	HL,MSG_ABI
+	CALL	PUTS
+	LD	DE,(ABI_VERSION)
+	CALL	PUT_HEX16
+	CALL	CRLF
+
+	; ABI 1.x requires TCP support.  A different ABI or a capability mask
+	; without TCP means GETCAPS did not execute the loaded UNET entry point.
+	; Stop here: calling SETOPT through the same damaged table can hang DSS.
+	LD	A,(ABI_VERSION + 1)		; accept any compatible ABI 1.x
+	CP	HIGH UNET_ABI_VERSION
+	JP	NZ,ERR_BAD_IMAGE
+	LD	A,(CAPS)
+	AND	UNET_CAP_TCP
+	JP	Z,ERR_BAD_IMAGE
+
+	; --- SETOPT CANCELKEYS=1 (allow Esc/Ctrl+Z to abort blocking calls) ---
+	LD	A,UNET_OPT_CANCELKEYS
+	LD	DE,1
+	LD	B,UNET_FN_SETOPT
+	CALL	DO_CALL
+
+	; --- STATUS 0xFF: network state without touching hardware ---
+	LD	A,0xFF
+	LD	B,UNET_FN_STATUS
+	CALL	DO_CALL				; -> A, DE=bits
+	LD	HL,MSG_NETSTAT
+	CALL	PUTS				; preserves DE (the status bits)
+	CALL	PRINT_STATUS_BITS
+	CALL	CRLF
+
+	; --- NETINIT ---
+	LD	B,UNET_FN_NETINIT
+	CALL	DO_CALL
+	OR	A
+	JP	NZ,ERR_NETINIT
+	LD	HL,MSG_NETUP
+	CALL	PUTS_LN
+
+	; --- GETINFO: station IP ---
+	XOR	A
+	LD	(STR_BUF),A			; never print stale DSS RAM on an API error
+	LD	A,UNET_IF_IP
+	LD	DE,STR_BUF
+	LD	IX,STR_BUF_SIZE
+	LD	B,UNET_FN_GETINFO
+	CALL	DO_CALL
+	LD	(API_STATUS),A
+	LD	HL,MSG_IP
+	CALL	PUTS
+	LD	A,(API_STATUS)
+	OR	A
+	JR	NZ,.ip_failed
+	LD	HL,STR_BUF
+	CALL	PUTS_LN
+	JR	.after_ip
+.ip_failed
+	LD	HL,MSG_FAILED
+	CALL	PUTS_LN
+	CALL	MARK_FAIL
+.after_ip
+
+	; --- RESOLVE host (optional; degrades to unsupported) ---
+	LD	HL,MSG_RESOLVE
+	CALL	PUTS
+	XOR	A
+	LD	(STR_BUF),A
+	LD	DE,HOST_BUFF
+	LD	IX,STR_BUF
+	LD	B,UNET_FN_RESOLVE
+	CALL	DO_CALL
+	CP	NERR_OK
+	JR	NZ,.res_bad
+	LD	HL,STR_BUF
+	CALL	PUTS_LN
+	JR	.after_resolve
+.res_bad
+	CP	NERR_NOTSUP
+	JR	NZ,.res_err
+	LD	HL,MSG_UNSUP
+	CALL	PUTS_LN
+	JR	.after_resolve
+.res_err
+	LD	HL,MSG_FAILED
+	CALL	PUTS_LN
+	CALL	MARK_FAIL
+.after_resolve
+
+	; --- PING host ---
+	LD	HL,MSG_PING
+	CALL	PUTS
+	LD	DE,HOST_BUFF
+	LD	IY,3000
+	LD	B,UNET_FN_PING
+	CALL	DO_CALL				; -> A, DE=ms
+	OR	A
+	JR	NZ,.ping_bad
+	LD	(TMP16),DE
+	LD	DE,(TMP16)
+	PUSH	DE
+	POP	HL
+	CALL	PUT_DEC_HL
+	LD	HL,MSG_MS
+	CALL	PUTS_LN
+	JR	.after_ping
+.ping_bad
+	LD	HL,MSG_FAILED
+	CALL	PUTS_LN
+	CALL	MARK_FAIL
+.after_ping
+	; -l / -a / -u / -2 select an exercise other than the plain TCP one.
+	LD	A,(LISTEN_MODE)
+	AND	A
+	JR	Z,.check_async
+	CALL	LISTEN_PHASE
+	JP	.teardown
+.check_async
+	LD	A,(ASYNC_MODE)
+	AND	A
+	JR	Z,.check_dual
+	CALL	ASYNC_PHASE
+	JP	.teardown
+.check_dual
+	LD	A,(DUAL_MODE)
+	AND	A
+	JR	Z,.check_udp
+	CALL	DUAL_PHASE
+	JP	.teardown
+.check_udp
+	LD	A,(UDP_MODE)
+	AND	A
+	JR	Z,.tcp_phase
+	CALL	UDP_PHASE
+	JP	.teardown
+.tcp_phase
+
+	; --- CONNECT host:port ---
+	LD	HL,MSG_CONNECT
+	CALL	PUTS
+	LD	HL,HOST_BUFF
+	CALL	PUTS
+	LD	A,':'
+	CALL	PUT_CHAR
+	LD	HL,PORT_BUFF
+	CALL	PUTS_LN
+	XOR	A				; channel 0
+	LD	DE,HOST_BUFF
+	LD	IX,PORT_BUFF
+	LD	B,UNET_FN_CONNECT
+	CALL	DO_CALL
+	OR	A
+	JP	NZ,ERR_CONNECT
+
+	; --- Zero-timeout regression, TCP side.  unet.inc reads IY=0 as
+	;     "poll, do not block", and draining a channel that way before
+	;     sending is the idiom unet.inc itself prescribes for SEND.  The
+	;     UDP phase has checked this since the port; TCP had not, and a
+	;     backend whose timebase refuses a zero timeout answers the whole
+	;     idiom with NERR_PARAM.  The link is idle here, so the reply is
+	;     NERR_OK with DE=0. ---
+	XOR	A				; channel 0
+	LD	DE,RECV_BUF
+	LD	IX,RECV_BUF_SIZE - 1
+	LD	IY,0
+	LD	B,UNET_FN_RECV
+	CALL	DO_CALL
+	OR	A
+	JP	NZ,ERR_POLL0
+	LD	HL,MSG_TCP_POLL0
+	CALL	PUTS_LN
+
+	; --- SEND an HTTP HEAD request ---
+	CALL	BUILD_REQUEST			; -> REQ_BUF, BC=length
+	LD	(REQ_LEN),BC
+	XOR	A				; channel 0
+	LD	DE,REQ_BUF
+	LD	IX,(REQ_LEN)
+	LD	B,UNET_FN_SEND
+	CALL	DO_CALL				; -> A, DE=sent
+	OR	A
+	JP	NZ,ERR_SEND
+	; unet.inc promises DE = bytes sent, and a consumer with a partial-send
+	; loop advances its own buffer by that count. Nothing else in this kit
+	; reads it, so without this check a backend can return garbage there and
+	; still pass every scenario -- which is exactly how a wrong count shipped.
+	LD	HL,(REQ_LEN)
+	OR	A
+	SBC	HL,DE
+	JP	NZ,ERR_SENT_COUNT
+	LD	HL,MSG_SENT
+	CALL	PUTS_LN
+
+	; --- RECV loop (up to RECV_MAX_BLOCKS blocks) ---
+	LD	A,RECV_MAX_BLOCKS
+	LD	(RECV_LEFT),A
+	LD	HL,MSG_REPLY
+	CALL	PUTS_LN
+.recv_loop
+	LD	A,(RECV_LEFT)
+	AND	A
+	JR	Z,.recv_done
+	DEC	A
+	LD	(RECV_LEFT),A
+	XOR	A				; channel 0
+	LD	DE,RECV_BUF
+	LD	IX,RECV_BUF_SIZE - 1
+	LD	IY,4000
+	LD	B,UNET_FN_RECV
+	CALL	DO_CALL				; -> A, DE=got
+	CP	NERR_OK
+	JR	Z,.recv_ok
+	CP	NERR_CLOSED
+	JR	Z,.recv_closed_data
+	; error
+	LD	HL,MSG_RECV_ERR
+	CALL	PUTS_LN
+	CALL	MARK_FAIL
+	JR	.recv_done
+.recv_ok
+	LD	A,D
+	OR	E
+	JR	Z,.recv_loop			; timeout, nothing this round
+	CALL	NOTE_RECV
+	JR	.recv_loop
+.recv_closed_data
+	LD	A,D
+	OR	E
+	JR	Z,.recv_closed
+	CALL	NOTE_RECV
+.recv_closed
+	LD	HL,MSG_CLOSED
+	CALL	PUTS_LN
+.recv_done
+	; A peer that closes (or stays silent) without answering the HEAD
+	; request is a failed exercise, but every RECV above returned a
+	; success status -- a timeout is DE=0. Say so, and fail.
+	LD	A,(TCP_GOT_DATA)
+	OR	A
+	JR	NZ,.teardown
+	LD	HL,MSG_NO_REPLY
+	CALL	PUTS_LN
+	CALL	MARK_FAIL
+.teardown
+
+	; --- CLOSE / NETDONE / free ---
+	XOR	A
+	LD	B,UNET_FN_CLOSE
+	CALL	DO_CALL
+	LD	B,UNET_FN_NETDONE
+	CALL	DO_CALL
+	LD	HL,(HANDLE)
+	CALL	LIBMAN.l_free
+
+	LD	HL,MSG_DONE
+	CALL	PUTS_LN
+	LD	A,(PHASE_FAIL)
+	LD	B,A
+	JP	EXIT
+
+; ======================================================
+; Error exits
+; ======================================================
+; DLL load failed: print WHY from LIBMAN.l_reason / LIBMAN.l_dsserr, exit 2.
+ERR_LOAD
+	LD	HL,MSG_ERR_LOAD
+	CALL	PUTS_LN
+	LD	A,(LIBMAN.l_reason)
+	CP	LIBMAN.LR_OPEN
+	JR	Z,.OPEN
+	CP	LIBMAN.LR_FORMAT
+	JR	Z,.FMT
+	CP	LIBMAN.LR_INIT
+	JR	Z,.INIT
+	CP	LIBMAN.LR_MEMORY
+	JR	Z,.MEM
+	CP	LIBMAN.LR_LIMIT
+	JR	Z,.LIMIT
+	CP	LIBMAN.LR_CALL
+	JR	Z,.CALL
+	LD	HL,MSG_LOAD_IO			; LR_IO or anything unexpected
+	CALL	PUTS
+	CALL	PRINT_LOAD_CODE
+	JR	.OUT
+.CALL
+	LD	A,(LIBMAN.l_call_error)
+	CP	LIBMAN.LCERR_HANDLE
+	JR	Z,.CALL_HANDLE
+	CP	LIBMAN.LCERR_WINDOW
+	JR	Z,.CALL_WINDOW
+	CP	LIBMAN.LCERR_SETWIN
+	JR	Z,.CALL_SETWIN
+	LD	HL,MSG_LOAD_CALL
+	CALL	PUTS
+	CALL	PRINT_LOAD_CODE
+	JR	.OUT
+.CALL_HANDLE
+	LD	HL,MSG_LOAD_CALL_HANDLE
+	CALL	PUTS_LN
+	JR	.OUT
+.CALL_WINDOW
+	LD	HL,MSG_LOAD_CALL_WINDOW
+	CALL	PUTS_LN
+	JR	.OUT
+.CALL_SETWIN
+	LD	HL,MSG_LOAD_CALL_SETWIN
+	CALL	PUTS
+	CALL	PRINT_LOAD_CODE
+	JR	.OUT
+.LIMIT
+	LD	HL,MSG_LOAD_LIMIT		; lib_table full - no DSS code to show
+	CALL	PUTS_LN
+	JR	.OUT
+.OPEN
+	LD	HL,MSG_LOAD_OPEN
+	CALL	PUTS
+	CALL	PRINT_LOAD_CODE
+	LD	HL,MSG_LOAD_HINT
+	CALL	PUTS_LN
+	JR	.OUT
+.MEM
+	LD	HL,MSG_LOAD_MEM
+	CALL	PUTS
+	CALL	PRINT_LOAD_CODE
+	JR	.OUT
+.FMT
+	LD	HL,MSG_LOAD_FMT
+	CALL	PUTS_LN
+	JR	.OUT
+.INIT
+	LD	HL,MSG_LOAD_INIT
+	CALL	PUTS
+	CALL	PRINT_LOAD_CODE
+.OUT
+	LD	B,2
+	JP	EXIT
+
+; l_info failed after a successful load (bad handle): its own message, exit 2.
+ERR_INFO
+	LD	HL,MSG_ERR_INFO
+	CALL	PUTS_LN
+	LD	B,2
+	JP	EXIT
+
+; Print " (code <n>)" + CRLF from LIBMAN.l_dsserr.
+PRINT_LOAD_CODE
+	LD	HL,MSG_LOAD_CODE
+	CALL	PUTS
+	LD	A,(LIBMAN.l_dsserr)
+	CALL	PUT_DEC_A
+	LD	A,')'
+	CALL	PUT_CHAR
+	JP	CRLF
+ERR_NETINIT
+	; map A (NERR_*) to an exit code and message
+	CP	NERR_NONET
+	JR	Z,.cfg
+	CP	NERR_HW
+	JR	Z,.hw
+	LD	HL,MSG_ERR_NETINIT
+	CALL	PUTS_LN
+	CALL	DUMP_LASTERR
+	LD	B,3
+	JP	EXIT
+.cfg
+	LD	HL,MSG_ERR_NONET
+	CALL	PUTS_LN
+	LD	B,4
+	JP	EXIT
+.hw
+	LD	HL,MSG_ERR_HW
+	CALL	PUTS_LN
+	LD	B,2
+	JP	EXIT
+ERR_CONNECT
+	LD	HL,MSG_ERR_CONNECT
+	CALL	PUTS_LN
+	CALL	DUMP_LASTERR
+	CALL	FREE_AND_DONE
+	LD	B,3
+	JP	EXIT
+ERR_SENT_COUNT
+	LD	HL,MSG_ERR_SENT_COUNT
+	CALL	PUTS_LN
+	CALL	FREE_AND_DONE
+	LD	B,3
+	JP	EXIT
+ERR_POLL0
+	LD	HL,MSG_ERR_POLL0
+	CALL	PUTS_LN
+	CALL	DUMP_LASTERR
+	CALL	FREE_AND_DONE
+	LD	B,3
+	JP	EXIT
+ERR_SEND
+	LD	HL,MSG_ERR_SEND
+	CALL	PUTS_LN
+	CALL	DUMP_LASTERR
+	CALL	FREE_AND_DONE
+	LD	B,3
+	JP	EXIT
+ERR_UDPOPEN
+	; NERR_NOTSUP is a legitimate answer from a backend without
+	; CAP_UDP, so report it apart from a genuine failure.
+	CP	NERR_NOTSUP
+	JR	Z,.unsup
+	LD	HL,MSG_ERR_UDPOPEN
+	CALL	PUTS_LN
+	CALL	DUMP_LASTERR
+	CALL	FREE_AND_DONE
+	LD	B,3
+	JP	EXIT
+.unsup
+	LD	HL,MSG_UDP_UNSUP
+	CALL	PUTS_LN
+	CALL	FREE_AND_DONE
+	LD	B,0
+	JP	EXIT
+
+USAGE_EXIT
+	LD	HL,MSG_USAGE
+	CALL	PUTS_LN
+	LD	HL,MSG_USAGE2
+	CALL	PUTS_LN
+	LD	B,1
+	JP	EXIT
+
+; Best-effort close + free after a mid-session error.
+FREE_AND_DONE
+	XOR	A
+	LD	B,UNET_FN_CLOSE
+	CALL	DO_CALL
+	LD	HL,(HANDLE)
+	CALL	LIBMAN.l_free
+	RET
+
+; A check inside the run failed. The API call itself may well have
+; succeeded (a RECV timeout is DE=0, an echo mismatch is a full-length
+; datagram), so nothing else would carry this to the exit status.
+; Sticky and idempotent: the first failure wins and later ones cannot
+; clear it. Preserves every register the callers still need.
+MARK_FAIL
+	PUSH	AF
+	LD	A,EXIT_CHECK
+	LD	(PHASE_FAIL),A
+	POP	AF
+	RET
+
+; PRINT_RECV plus the flag .recv_done uses to tell a real reply from a
+; RECV loop that only ever timed out.  In: DE=length, as PRINT_RECV.
+NOTE_RECV
+	LD	A,1
+	LD	(TCP_GOT_DATA),A
+	JP	PRINT_RECV
+
+; Print LASTERR tail for diagnostics.
+DUMP_LASTERR
+	LD	HL,MSG_LASTERR
+	CALL	PUTS
+	XOR	A
+	LD	(STR_BUF),A
+	LD	DE,STR_BUF
+	LD	IX,STR_BUF_SIZE
+	LD	B,UNET_FN_LASTERR
+	CALL	DO_CALL
+	OR	A
+	JR	NZ,.failed
+	LD	HL,STR_BUF
+	CALL	PUTS_LN
+	RET
+.failed
+	LD	HL,MSG_FAILED
+	CALL	PUTS_LN
+	RET
+
+; EXIT prints the CLAUDE.md-mandated RESULT line before handing B to DSS:
+; every diagnostic in this kit ends with an unambiguous RESULT OK/FAIL so a
+; caller never has to infer success from printed text alone.
+EXIT
+	LD	A,B
+	OR	A
+	JR	NZ,.FAIL
+	LD	HL,MSG_RESULT_OK
+	CALL	PUTS_LN
+	JR	.GO
+.FAIL
+	PUSH	AF
+	LD	HL,MSG_RESULT_FAIL
+	CALL	PUTS
+	POP	AF
+	CALL	PUT_DEC_A
+	CALL	CRLF
+.GO
+	LD	C,DSS_EXIT
+	RST	DSS
+
+; ======================================================
+; libman call helper: args already in A/DE/IX/IY, B = function number.
+; ======================================================
+DO_CALL
+	LD	HL,(HANDLE)
+	CALL	LIBMAN.l_call
+	RET	NC
+	LD	HL,MSG_ERR_CALL
+	CALL	PUTS
+	LD	A,(LIBMAN.l_call_error)
+	CALL	PUT_DEC_A
+	LD	HL,MSG_LOAD_CODE
+	CALL	PUTS
+	LD	A,(LIBMAN.l_call_dsserr)
+	CALL	PUT_DEC_A
+	LD	A,')'
+	CALL	PUT_CHAR
+	CALL	CRLF
+	LD	B,2
+	JP	EXIT
+
+; ======================================================
+; Snapshot the first 256 bytes of the relocated DLL image.
+; This deliberately mirrors l_info's page lookup but copies enough bytes to
+; include the export table and the backend's GETCAPS body.  Estex-DSS SETWIN3
+; clobbers HL, so the source address is saved across RST #10.
+; Out: CF=0 copied, CF=1 invalid handle or DSS_SETWIN3 failure.
+; ======================================================
+SNAPSHOT_DLL
+	XOR	A
+	LD	(SNAPSHOT_DSS_ERROR),A
+	LD	HL,(HANDLE)
+	LD	A,L
+	ADD	A,A
+	ADD	A,A
+	LD	L,A
+	LD	H,0
+	LD	DE,LIBMAN.lib_table
+	ADD	HL,DE
+	LD	A,(HL)
+	OR	A
+	SCF
+	RET	Z
+	INC	HL
+	LD	B,(HL)				; DSS memory-block descriptor
+	INC	HL
+	LD	A,(HL)				; logical image-base high byte
+	LD	(DLL_BASE_H),A
+	OR	0xC0
+	LD	H,A
+	LD	L,0
+	IN	A,(0xE2)
+	LD	(SNAPSHOT_OLD_WIN),A
+	PUSH	HL
+	LD	A,B
+	LD	BC,0x003B			; DSS_SETWIN3, page 0
+	RST	DSS
+	POP	HL
+	JR	C,.map_error
+	LD	DE,DLL_PROBE
+	LD	BC,DLL_PROBE_SIZE
+	LDIR
+	LD	A,(SNAPSHOT_OLD_WIN)
+	OUT	(0xE2),A
+	OR	A
+	RET
+.map_error
+	LD	(SNAPSHOT_DSS_ERROR),A
+	LD	A,(SNAPSHOT_OLD_WIN)
+	OUT	(0xE2),A
+	SCF
+	RET
+
+ERR_SNAPSHOT
+	LD	HL,MSG_ERR_SNAPSHOT
+	CALL	PUTS
+	LD	A,(SNAPSHOT_DSS_ERROR)
+	CALL	PUT_DEC_A
+	LD	A,')'
+	CALL	PUT_CHAR
+	CALL	CRLF
+	LD	B,2
+	JP	EXIT
+
+ERR_BAD_IMAGE
+	LD	HL,MSG_ERR_BAD_IMAGE
+	CALL	PUTS_LN
+	LD	HL,MSG_IMAGE_SIZE
+	CALL	PUTS
+	LD	DE,(INFO_BUF + 2)
+	CALL	PUT_HEX16
+	LD	HL,MSG_CODE_SIZE
+	CALL	PUTS
+	LD	DE,(INFO_BUF + 4)
+	CALL	PUT_HEX16
+	CALL	CRLF
+	LD	HL,MSG_ENTRY2
+	CALL	PUTS
+	LD	HL,DLL_PROBE + 0x26
+	LD	B,3
+	CALL	PRINT_HEX_BYTES
+	CALL	CRLF
+	LD	HL,MSG_GETCAPS_CODE
+	CALL	PUTS
+	LD	HL,DLL_PROBE + 0x81
+	LD	B,9
+	CALL	PRINT_HEX_BYTES
+	CALL	CRLF
+	LD	B,2
+	JP	EXIT
+
+; Print B bytes from HL as two hex digits separated by spaces.
+PRINT_HEX_BYTES
+	LD	A,(HL)
+	CALL	PUT_HEX8
+	INC	HL
+	DJNZ	.more
+	RET
+.more
+	LD	A,' '
+	CALL	PUT_CHAR
+	JR	PRINT_HEX_BYTES
+
+; ======================================================
+; UDP exercise (-u PORT): UDPOPEN -> SEND -> RECV -> verify echo.
+; The caller does CLOSE / NETDONE / l_free, exactly as for TCP.
+;
+; A datagram is either echoed intact or not at all, so a mismatch here
+; is a real defect in the UDP path rather than a partial transfer.
+; ======================================================
+UDP_PHASE
+	LD	HL,MSG_UDP
+	CALL	PUTS
+	LD	HL,HOST_BUFF
+	CALL	PUTS
+	LD	A,':'
+	CALL	PUT_CHAR
+	LD	HL,UDP_PORT_BUF
+	CALL	PUTS_LN
+
+	XOR	A				; channel 0
+	LD	DE,HOST_BUFF
+	LD	IX,UDP_PORT_BUF
+	LD	IY,0				; local port: backend default
+	LD	B,UNET_FN_UDPOPEN
+	CALL	DO_CALL
+	OR	A
+	JP	NZ,ERR_UDPOPEN
+
+	; --- Zero-timeout regression: this is a poll, not a 16-bit
+	;     countdown wrap.  A stale matching datagram is harmless; the
+	;     acceptance condition here is simply a successful quick return. ---
+	XOR	A				; channel 0
+	LD	DE,RECV_BUF
+	LD	IX,RECV_BUF_SIZE - 1
+	LD	IY,0
+	LD	B,UNET_FN_RECV
+	CALL	DO_CALL
+	OR	A
+	JP	NZ,.err
+	LD	HL,MSG_UDP_POLL0
+	CALL	PUTS_LN
+
+	; --- SEND the probe payload.  Default (-u PORT): the fixed
+	; 21-byte string, straight from the image, exactly as before.
+	; Sized (-u PORT SIZE): a generated i&0xFF pattern in PATTERN_BUF,
+	; exercising payload sizes up to the standard UDP MTU (1472) and
+	; the backend's own NERR_PARAM rejection just above it.
+	; The DE/IX arguments are loaded AFTER all printing (see
+	; .size_noted below): PUT_DEC_HL exits with DE=0 (its EX DE,HL
+	; hands back the divided-down value), so loading the payload
+	; pointer before the size line silently sent 21 bytes read from
+	; address 0x0000 instead of the payload. ---
+	; Print the effective outgoing size before SEND.  A misplaced HOST
+	; argument between the UDP port and SIZE (e.g. "-u 7777 1.2.3.4
+	; 1472") makes SIZE parse as HOST instead of a decimal token, so
+	; PARSE_ARGS silently falls back to the default 21-byte payload;
+	; this line makes that visible on screen instead of requiring a
+	; wire capture to notice the size argument was never applied.
+	LD	HL,MSG_UDP_PAYLOAD
+	CALL	PUTS
+	LD	HL,(UDP_TEST_SIZE)
+	LD	A,H
+	OR	L
+	JR	NZ,.print_size
+	LD	HL,UDP_PAYLOAD_LEN
+.print_size
+	CALL	PUT_DEC_HL
+	LD	HL,MSG_UDP_BYTES
+	CALL	PUTS
+	LD	HL,(UDP_TEST_SIZE)
+	LD	A,H
+	OR	L
+	JR	NZ,.size_noted
+	LD	HL,MSG_UDP_DEFAULT
+	CALL	PUTS
+.size_noted
+	CALL	CRLF
+	LD	HL,(UDP_TEST_SIZE)
+	LD	A,H
+	OR	L
+	JR	Z,.default_payload
+	LD	DE,PATTERN_BUF
+	LD	BC,(UDP_TEST_SIZE)
+	CALL	FILL_PATTERN
+	LD	DE,PATTERN_BUF
+	LD	IX,(UDP_TEST_SIZE)
+	JR	.have_payload
+.default_payload
+	LD	DE,UDP_PAYLOAD
+	LD	IX,UDP_PAYLOAD_LEN
+.have_payload
+	XOR	A				; channel 0
+	LD	B,UNET_FN_SEND
+	CALL	DO_CALL				; -> A, DE=sent
+	OR	A
+	JP	NZ,ERR_SEND
+	LD	HL,MSG_SENT
+	CALL	PUTS_LN
+
+	; --- RECV: one datagram per call; A=0 with DE=0 means "timed out,
+	;     link still alive", so retry rather than give up at once. ---
+	LD	A,UDP_MAX_TRIES
+	LD	(RECV_LEFT),A
+.wait
+	LD	A,(RECV_LEFT)
+	AND	A
+	JR	Z,.no_reply
+	DEC	A
+	LD	(RECV_LEFT),A
+	XOR	A				; channel 0
+	LD	DE,RECV_BUF
+	LD	IX,RECV_BUF_SIZE - 1
+	LD	IY,2000
+	LD	B,UNET_FN_RECV
+	CALL	DO_CALL				; -> A, DE=got, IX=flags
+	OR	A
+	JR	NZ,.err
+	LD	A,D
+	OR	E
+	JR	Z,.wait				; nothing this round
+	LD	(UDP_RX_LEN),DE
+	PUSH	IX
+	POP	HL
+	LD	A,L
+	LD	(UDP_RX_FLAGS),A
+	JR	.got
+.err
+	LD	HL,MSG_RECV_ERR
+	CALL	PUTS_LN
+	CALL	MARK_FAIL
+	JP	DUMP_LASTERR
+.no_reply
+	LD	HL,MSG_UDP_NOREPLY
+	CALL	PUTS_LN
+	CALL	MARK_FAIL
+	JP	DUMP_LASTERR
+.got
+	LD	HL,MSG_UDP_REPLY
+	CALL	PUTS
+	LD	HL,(UDP_RX_LEN)
+	CALL	PUT_DEC_HL
+	; The sized i&0xFF pattern embeds 0x00 every 256th byte, so
+	; PRINT_RECV (a plain ASCIIZ PUTS) would only show the first
+	; segment and print binary noise besides; skip the raw dump and
+	; go straight to the byte-for-byte PATTERN_MATCH verdict instead.
+	LD	HL,(UDP_TEST_SIZE)
+	LD	A,H
+	OR	L
+	JR	NZ,.sized_reply
+	LD	HL,MSG_UDP_DATA
+	CALL	PUTS
+	LD	DE,(UDP_RX_LEN)
+	CALL	PRINT_RECV			; terminates the buffer, then prints
+.sized_reply
+	CALL	CRLF
+	LD	A,(UDP_RX_FLAGS)
+	AND	1				; bit0: datagram was truncated
+	JR	Z,.compare
+	LD	HL,MSG_UDP_TRUNC
+	CALL	PUTS_LN
+.compare
+	LD	HL,(UDP_TEST_SIZE)
+	LD	A,H
+	OR	L
+	JR	Z,.compare_default
+	CALL	PATTERN_MATCH
+	JR	.have_verdict
+.compare_default
+	CALL	UDP_ECHO_MATCH
+.have_verdict
+	LD	HL,MSG_UDP_OK
+	JR	Z,.verdict
+	LD	HL,MSG_UDP_BAD
+	CALL	MARK_FAIL
+.verdict
+	JP	PUTS_LN
+
+; ======================================================
+; Two-channel exercise (-2 DATAPORT): keep a control and a data connection
+; open together, as a passive-FTP client does.  Pair with
+; tools/dev/dual_server.py on the host.
+; ======================================================
+DUAL_PHASE
+	LD	A,(CAPS)
+	AND	UNET_CAP_MULTICHAN
+	JR	NZ,.supported
+	LD	HL,MSG_DUAL_UNSUP
+	JP	PUTS_LN
+.supported
+	LD	HL,MSG_DUAL
+	CALL	PUTS
+	LD	HL,PORT_BUFF
+	CALL	PUTS
+	LD	A,'/'
+	CALL	PUT_CHAR
+	LD	HL,DUAL_PORT_BUF
+	CALL	PUTS_LN
+
+	; Channel 0: control.
+	LD	HL,MSG_DUAL_CTRL_OPEN
+	CALL	PUTS
+	LD	HL,HOST_BUFF
+	CALL	PUTS
+	LD	A,':'
+	CALL	PUT_CHAR
+	LD	HL,PORT_BUFF
+	CALL	PUTS_LN
+	XOR	A
+	LD	DE,HOST_BUFF
+	LD	IX,PORT_BUFF
+	LD	B,UNET_FN_CONNECT
+	CALL	DO_CALL
+	OR	A
+	JP	NZ,DUAL_CONNECT_FAILED
+
+	; Channel 1: data, opened without closing channel 0.
+	LD	HL,MSG_DUAL_DATA_OPEN
+	CALL	PUTS
+	LD	HL,HOST_BUFF
+	CALL	PUTS
+	LD	A,':'
+	CALL	PUT_CHAR
+	LD	HL,DUAL_PORT_BUF
+	CALL	PUTS_LN
+	LD	A,1
+	LD	DE,HOST_BUFF
+	LD	IX,DUAL_PORT_BUF
+	LD	B,UNET_FN_CONNECT
+	CALL	DO_CALL
+	OR	A
+	JP	NZ,DUAL_CONNECT_FAILED
+
+	; Send control traffic while the data peer is already streaming.
+	XOR	A
+	LD	DE,DUAL_PROBE
+	LD	IX,DUAL_PROBE_LEN
+	LD	B,UNET_FN_SEND
+	CALL	DO_CALL
+	OR	A
+	JP	NZ,ERR_SEND
+	LD	HL,MSG_SENT
+	CALL	PUTS_LN
+
+	; Did the peer's reply ride in on our own command's ACK?  If it did,
+	; the backend captured it into this channel's pend slot DURING the
+	; SEND -- exactly the state in which the chunk loop's pend guard
+	; used to refuse a send that had already fully landed.  Without this
+	; line a passing --lockstep run is only consistent with the fix: a
+	; server whose stack ACKed before replying never reaches that state,
+	; and the screen looks identical either way.
+	XOR	A
+	LD	B,UNET_FN_STATUS
+	CALL	DO_CALL
+	LD	A,E
+	AND	UNET_ST_RXPEND
+	LD	HL,MSG_ACK_RIDE
+	JR	NZ,.ack_verdict
+	LD	HL,MSG_ACK_NORIDE
+.ack_verdict
+	CALL	PUTS_LN
+
+	XOR	A
+	LD	(DUAL_NEXT),A
+	LD	(DUAL_BAD),A
+	LD	HL,0
+	LD	(DUAL_TOTAL),HL
+	LD	(DUAL_MAX_RECV),HL
+	LD	A,DUAL_MAX_ROUNDS
+	LD	(RECV_LEFT),A
+.data_loop
+	LD	A,(RECV_LEFT)
+	AND	A
+	JR	Z,.data_done
+	DEC	A
+	LD	(RECV_LEFT),A
+	LD	A,1
+	LD	DE,RECV_BUF
+	LD	IX,RECV_BUF_SIZE - 1
+	LD	IY,4000
+	LD	B,UNET_FN_RECV
+	CALL	DO_CALL
+	CP	NERR_CLOSED
+	JR	Z,.data_closed
+	OR	A
+	JR	NZ,.data_err
+	LD	A,D
+	OR	E
+	JR	Z,.data_loop
+	PUSH	DE
+	LD	HL,(DUAL_MAX_RECV)
+	OR	A
+	SBC	HL,DE
+	POP	DE
+	JR	NC,.max_recv_done
+	LD	(DUAL_MAX_RECV),DE
+.max_recv_done
+	CALL	DUAL_CHECK_SEQ
+	JR	.data_loop
+.data_err
+	LD	HL,MSG_RECV_ERR
+	CALL	PUTS_LN
+	CALL	MARK_FAIL
+	JR	.data_done
+.data_closed
+	LD	A,D
+	OR	E
+	CALL	NZ,DUAL_CHECK_SEQ
+	LD	HL,MSG_DUAL_CLOSED
+	CALL	PUTS_LN
+.data_done
+	; An empty stream is not "continuous" in any useful sense.  Keep the
+	; configurable host byte count manual, but make the zero-data failure
+	; unambiguous instead of printing a vacuous success.
+	LD	HL,(DUAL_TOTAL)
+	LD	A,H
+	OR	L
+	JR	NZ,.have_data
+	LD	A,1
+	LD	(DUAL_BAD),A
+.have_data
+	LD	HL,MSG_DUAL_BYTES
+	CALL	PUTS
+	LD	HL,(DUAL_TOTAL)
+	CALL	PUT_DEC_HL
+	CALL	CRLF
+	LD	HL,MSG_DUAL_MAX_RECV
+	CALL	PUTS
+	LD	DE,(DUAL_MAX_RECV)
+	PUSH	DE
+	POP	HL
+	CALL	PUT_DEC_HL
+	CALL	CRLF
+	LD	A,(DUAL_BAD)
+	AND	A
+	LD	HL,MSG_DUAL_SEQ_OK
+	JR	Z,.seq_verdict
+	LD	HL,MSG_DUAL_SEQ_BAD
+	CALL	MARK_FAIL
+.seq_verdict
+	CALL	PUTS_LN
+
+	; The control reply arrived during the data transfer and must still exist.
+	XOR	A
+	LD	B,UNET_FN_STATUS
+	CALL	DO_CALL
+	LD	A,E
+	AND	UNET_ST_RXPEND
+	LD	HL,MSG_DUAL_PEND
+	JR	NZ,.pend_verdict
+	LD	HL,MSG_DUAL_NOPEND
+.pend_verdict
+	CALL	PUTS_LN
+
+	XOR	A
+	LD	DE,RECV_BUF
+	LD	IX,RECV_BUF_SIZE - 1
+	LD	IY,4000
+	LD	B,UNET_FN_RECV
+	CALL	DO_CALL
+	OR	A
+	JR	NZ,.ctrl_err
+	LD	A,D
+	OR	E
+	JR	Z,.ctrl_none
+	LD	HL,MSG_DUAL_CTRL
+	CALL	PUTS
+	CALL	PRINT_RECV
+	CALL	CRLF
+	JR	.close_both
+.ctrl_none
+	; The peer answers the control command before the data stream ends,
+	; so an empty control channel here means the second channel lost it.
+	LD	HL,MSG_DUAL_CTRL_NONE
+	CALL	PUTS_LN
+	CALL	MARK_FAIL
+	JR	.close_both
+.ctrl_err
+	LD	HL,MSG_RECV_ERR
+	CALL	PUTS_LN
+	CALL	MARK_FAIL
+.close_both
+	LD	A,1
+	LD	B,UNET_FN_CLOSE
+	CALL	DO_CALL
+	XOR	A
+	LD	B,UNET_FN_CLOSE
+	CALL	DO_CALL
+	RET
+
+DUAL_CONNECT_FAILED
+	PUSH	AF
+	LD	HL,MSG_ERR_CONNECT
+	CALL	PUTS
+	LD	HL,MSG_DUAL_STATUS
+	CALL	PUTS
+	POP	AF
+	CALL	PUT_DEC_A
+	CALL	CRLF
+	CALL	DUMP_LASTERR
+	CALL	FREE_AND_DONE
+	LD	B,3
+	JP	EXIT
+
+; Verify that DE bytes in RECV_BUF continue 0,1,...,255,0,...
+DUAL_CHECK_SEQ
+	PUSH	DE
+	LD	HL,(DUAL_TOTAL)
+	ADD	HL,DE
+	LD	(DUAL_TOTAL),HL
+	POP	BC
+	LD	HL,RECV_BUF
+.loop
+	LD	A,B
+	OR	C
+	RET	Z
+	LD	A,(DUAL_NEXT)
+	CP	(HL)
+	JR	Z,.ok
+	LD	A,1
+	LD	(DUAL_BAD),A
+	LD	A,(HL)
+.ok
+	INC	A
+	LD	(DUAL_NEXT),A
+	INC	HL
+	DEC	BC
+	JR	.loop
+
+; ======================================================
+; LISTEN exercise (-l LISTENPORT): LISTEN -> accept -> SEND/RECV -> CLOSE,
+; run twice on channel 0 to verify UNET's documented auto-re-arm-on-CLOSE
+; (docs/UNET509B.md "Passive open (LISTEN)"), then UNLISTEN.
+; Pair with tools/dev/unettest_listen_client.py (or plain `nc HOST PORT`)
+; run twice from the host, or a manual `nc 192.168.7.2 LISTENPORT`.
+; ======================================================
+LISTEN_PHASE
+	LD	A,(CAPS)
+	AND	UNET_CAP_LISTEN
+	JR	NZ,.supported
+	LD	HL,MSG_LISTEN_UNSUP
+	JP	PUTS_LN
+.supported
+	LD	HL,MSG_LISTEN
+	CALL	PUTS
+	LD	HL,LISTEN_PORT_BUF
+	CALL	PUTS_LN
+	LD	HL,LISTEN_PORT_BUF
+	CALL	PARSE_DEC_TOKEN			; -> HL=port (0..9999), CF=1 invalid
+	JP	C,ERR_LISTEN_PORT
+	EX	DE,HL				; DE = port, binary
+	XOR	A				; channel 0
+	LD	B,UNET_FN_LISTEN
+	CALL	DO_CALL
+	OR	A
+	JP	NZ,ERR_LISTEN
+	LD	HL,MSG_LISTENING
+	CALL	PUTS_LN
+
+	LD	C,1				; ascending peer number for the log
+	LD	B,LISTEN_MAX_PEERS
+.peer_loop
+	PUSH	BC
+	LD	A,C
+	CALL	LISTEN_ACCEPT_SERVE
+	POP	BC
+	INC	C
+	DJNZ	.peer_loop
+
+	XOR	A				; the (still) listening channel
+	LD	B,UNET_FN_UNLISTEN
+	CALL	DO_CALL
+	LD	HL,MSG_UNLISTENED
+	CALL	PUTS_LN
+	RET
+
+ERR_LISTEN
+	LD	HL,MSG_ERR_LISTEN
+	CALL	PUTS_LN
+	CALL	DUMP_LASTERR
+	CALL	FREE_AND_DONE
+	LD	B,3
+	JP	EXIT
+
+; LISTENPORT failed PARSE_DEC_TOKEN (non-digits, empty, or >4 digits) --
+; a usage error, but caught late (after the DLL is up), so clean up like
+; the other mid-session error exits instead of jumping to USAGE_EXIT.
+ERR_LISTEN_PORT
+	LD	HL,MSG_USAGE
+	CALL	PUTS_LN
+	LD	HL,MSG_USAGE2
+	CALL	PUTS_LN
+	CALL	FREE_AND_DONE
+	LD	B,1
+	JP	EXIT
+
+; One accept-serve-close cycle on channel 0.  In: A = peer number (for the
+; log only).  Never propagates an error upward -- always prints and
+; returns so LISTEN_PHASE can try the next peer (this is a diagnostic
+; loop, not a fatal-on-first-error client).
+LISTEN_ACCEPT_SERVE
+	PUSH	AF				; peer number: PUTS (RST DSS) trashes A
+	LD	HL,MSG_LISTEN_WAITING
+	CALL	PUTS
+	POP	AF
+	CALL	PUT_DEC_A
+	CALL	CRLF
+	LD	A,LISTEN_ACCEPT_TRIES
+	LD	(RECV_LEFT),A
+.wait
+	LD	A,(RECV_LEFT)
+	AND	A
+	JP	Z,.timeout
+	DEC	A
+	LD	(RECV_LEFT),A
+	XOR	A				; channel 0
+	LD	DE,RECV_BUF
+	LD	IX,RECV_BUF_SIZE - 1
+	LD	IY,2000
+	LD	B,UNET_FN_RECV
+	CALL	DO_CALL				; -> A, DE=got (progresses the accept)
+	OR	A
+	JP	NZ,.recv_err
+	LD	(LISTEN_RX_LEN),DE
+	XOR	A
+	LD	B,UNET_FN_STATUS
+	CALL	DO_CALL				; -> A=0, DE=state bits
+	LD	A,E
+	AND	UNET_ST_ACCEPT
+	JR	Z,.wait
+	; accepted
+	LD	HL,MSG_LISTEN_ACCEPTED
+	CALL	PUTS_LN
+	LD	DE,(LISTEN_RX_LEN)
+	LD	A,D
+	OR	E
+	JR	Z,.reply
+	CALL	PRINT_RECV
+	CALL	CRLF
+.reply
+	XOR	A				; channel 0
+	LD	DE,LISTEN_REPLY
+	LD	IX,LISTEN_REPLY_LEN
+	LD	B,UNET_FN_SEND
+	CALL	DO_CALL
+	OR	A
+	JR	NZ,.send_err
+	LD	HL,MSG_SENT
+	CALL	PUTS_LN
+	XOR	A
+	LD	DE,RECV_BUF
+	LD	IX,RECV_BUF_SIZE - 1
+	LD	IY,1000
+	LD	B,UNET_FN_RECV
+	CALL	DO_CALL				; drain once more, non-fatal
+	CP	NERR_CLOSED
+	JR	Z,.peer_closed
+	OR	A
+	JR	NZ,.recv_err_close
+	LD	A,D
+	OR	E
+	JR	Z,.close
+	CALL	PRINT_RECV
+	CALL	CRLF
+.close
+	XOR	A
+	LD	B,UNET_FN_CLOSE
+	CALL	DO_CALL
+	LD	HL,MSG_LISTEN_CLOSED
+	CALL	PUTS_LN
+	RET
+; The peer read the reply and closed on its own (normal shutdown, not
+; an error): RECV's NERR_CLOSED report has ALREADY re-armed LISTEN for
+; us, which is what unet.inc's function 18 promises -- "CLOSE (or a peer
+; close) of the accepted connection re-arms LISTEN on the same port".
+; Calling CLOSE again here would run the backend's release-or-re-arm a
+; second time with the accepted flag already cleared, taking the plain
+; close path and unarming the listener instead (channel state -> 0).
+; Do not CLOSE on this path.
+.peer_closed
+	LD	HL,MSG_LISTEN_PEER_CLOSED
+	CALL	PUTS_LN
+	RET
+.send_err
+	LD	HL,MSG_ERR_SEND
+	CALL	PUTS_LN
+	CALL	MARK_FAIL
+	CALL	DUMP_LASTERR
+	XOR	A
+	LD	B,UNET_FN_CLOSE
+	CALL	DO_CALL
+	RET
+; Pre-accept RECV error: the channel is still just listening, so do NOT
+; CLOSE it (that would tear the listener down instead of re-arming it).
+.recv_err
+	LD	HL,MSG_RECV_ERR
+	CALL	PUTS_LN
+	CALL	MARK_FAIL
+	JP	DUMP_LASTERR
+; Post-accept RECV error: CLOSE the accepted connection so LISTEN
+; re-arms and the next peer iteration still stands a chance.
+.recv_err_close
+	LD	HL,MSG_RECV_ERR
+	CALL	PUTS_LN
+	CALL	MARK_FAIL
+	CALL	DUMP_LASTERR
+	XOR	A
+	LD	B,UNET_FN_CLOSE
+	CALL	DO_CALL
+	RET
+.timeout
+	LD	HL,MSG_LISTEN_TIMEOUT
+	CALL	PUTS_LN
+	JP	MARK_FAIL
+
+; ======================================================
+; ASYNCSEND exercise (-a): SETOPT SENDSLICE, CONNECT to HOST:PORT, then
+; SEND a multi-chunk payload against a peer that stalls its TCP receive
+; window (tools/dev/unettest_asyncsend_stall.py) to force at least one
+; NERR_AGAIN, verifying the documented resume contract: repeat the SAME
+; channel/buffer/length until SEND finally settles.
+; ======================================================
+ASYNC_PHASE
+	LD	A,(CAPS+1)
+	AND	HIGH UNET_CAP_ASYNCSEND
+	JR	NZ,.supported
+	LD	HL,MSG_ASYNC_UNSUP
+	JP	PUTS_LN
+.supported
+	LD	A,UNET_OPT_SENDSLICE
+	LD	DE,ASYNC_SLICE_MS
+	LD	B,UNET_FN_SETOPT
+	CALL	DO_CALL
+	OR	A
+	JR	Z,.slice_ok
+	; the backend advertises CAP_ASYNCSEND, so a SETOPT refusal is a
+	; genuine failure, not a missing feature -- exit 3 like other
+	; network errors (Exit Status Guidelines).
+	LD	HL,MSG_ASYNC_SETOPT_FAIL
+	CALL	PUTS_LN
+	CALL	DUMP_LASTERR
+	CALL	FREE_AND_DONE
+	LD	B,3
+	JP	EXIT
+.slice_ok
+	LD	HL,MSG_ASYNC_CONNECT
+	CALL	PUTS
+	LD	HL,HOST_BUFF
+	CALL	PUTS
+	LD	A,':'
+	CALL	PUT_CHAR
+	LD	HL,PORT_BUFF
+	CALL	PUTS_LN
+	XOR	A				; channel 0
+	LD	DE,HOST_BUFF
+	LD	IX,PORT_BUFF
+	LD	B,UNET_FN_CONNECT
+	CALL	DO_CALL
+	OR	A
+	JP	NZ,ERR_CONNECT			; prints, frees, exit 3
+.connected
+	LD	DE,PATTERN_BUF
+	LD	BC,ASYNC_PAYLOAD_LEN
+	CALL	FILL_PATTERN
+	XOR	A
+	LD	(ASYNC_AGAIN_COUNT),A
+.send_attempt
+	XOR	A				; channel 0
+	LD	DE,PATTERN_BUF
+	LD	IX,ASYNC_PAYLOAD_LEN
+	LD	B,UNET_FN_SEND
+	CALL	DO_CALL				; -> A, DE=confirmed so far
+	CP	NERR_AGAIN
+	JR	NZ,.settled
+	LD	HL,ASYNC_AGAIN_COUNT
+	INC	(HL)
+	LD	A,(HL)
+	CP	ASYNC_MAX_AGAIN
+	JR	NC,.stuck
+	LD	HL,MSG_ASYNC_AGAIN
+	CALL	PUTS
+	PUSH	DE
+	POP	HL
+	CALL	PUT_DEC_HL
+	CALL	CRLF
+	JR	.send_attempt			; resume: SAME buffer/length
+.stuck
+	LD	HL,MSG_ASYNC_STUCK
+	CALL	PUTS_LN
+	CALL	FREE_AND_DONE
+	LD	B,3
+	JP	EXIT
+.settled
+	OR	A
+	JP	NZ,ERR_SEND			; prints, frees, exit 3
+.ok
+	LD	HL,MSG_SENT
+	CALL	PUTS_LN
+	LD	HL,MSG_ASYNC_AGAIN_COUNT
+	CALL	PUTS
+	LD	A,(ASYNC_AGAIN_COUNT)
+	CALL	PUT_DEC_A
+	CALL	CRLF
+.close
+	XOR	A
+	LD	B,UNET_FN_CLOSE
+	CALL	DO_CALL
+	RET
+
+; Compare the received datagram with the payload we sent.
+; Out: ZF=1 on an exact match. Trashes A, B, DE, HL.
+UDP_ECHO_MATCH
+	LD	HL,(UDP_RX_LEN)
+	LD	DE,UDP_PAYLOAD_LEN
+	OR	A
+	SBC	HL,DE
+	RET	NZ				; length differs
+	LD	HL,RECV_BUF
+	LD	DE,UDP_PAYLOAD
+	LD	B,UDP_PAYLOAD_LEN
+.loop
+	LD	A,(DE)
+	CP	(HL)
+	RET	NZ
+	INC	HL
+	INC	DE
+	DJNZ	.loop
+	XOR	A				; ZF=1
+	RET
+
+; Fill (DE) with BC bytes of pattern byte[i] = i & 0xFF, used to
+; generate the sized -u payload up to the standard UDP MTU (1472)
+; without baking a multi-KB literal into the image.
+;   In: DE = dest, BC = count.  Trashes A, BC, DE, HL.
+FILL_PATTERN
+	LD	HL,0
+.loop
+	LD	A,B
+	OR	C
+	RET	Z
+	LD	A,L
+	LD	(DE),A
+	INC	DE
+	INC	HL
+	DEC	BC
+	JR	.loop
+
+; Verify RECV_BUF[0..UDP_TEST_SIZE-1] == i & 0xFF (sized -u payload
+; test), mirroring UDP_ECHO_MATCH's length-then-bytes structure.
+;   Out: ZF=1 match.  Trashes A, BC, DE, HL.
+PATTERN_MATCH
+	LD	HL,(UDP_RX_LEN)
+	LD	DE,(UDP_TEST_SIZE)
+	OR	A
+	SBC	HL,DE
+	RET	NZ				; length differs
+	LD	BC,(UDP_TEST_SIZE)
+	LD	HL,RECV_BUF
+	LD	DE,0
+.loop
+	LD	A,B
+	OR	C
+	JR	Z,.match
+	LD	A,(HL)
+	CP	E
+	RET	NZ
+	INC	HL
+	INC	DE
+	DEC	BC
+	JR	.loop
+.match
+	XOR	A				; ZF=1
+	RET
+
+; ======================================================
+; Build "HEAD / HTTP/1.0\r\nHost: <host>\r\nConnection: close\r\n\r\n"
+; into REQ_BUF. Out: BC = length (no terminator sent).
+; ======================================================
+BUILD_REQUEST
+	LD	HL,REQ_BUF
+	LD	DE,REQ_HEAD
+	CALL	APPEND
+	LD	DE,HOST_BUFF
+	CALL	APPEND
+	LD	DE,REQ_TAIL
+	CALL	APPEND
+	; length = HL - REQ_BUF
+	LD	DE,REQ_BUF
+	OR	A
+	SBC	HL,DE
+	LD	B,H
+	LD	C,L
+	RET
+
+; Append ASCIIZ (DE) to buffer (HL). Out: HL at terminator.
+APPEND
+	LD	A,(DE)
+	AND	A
+	RET	Z
+	LD	(HL),A
+	INC	HL
+	INC	DE
+	JR	APPEND
+
+; ======================================================
+; Command-line parsing: [-d FILE.DLL] [-u UDPPORT] [-2 DATAPORT] HOST [PORT]
+; Flags may appear in any order but must precede HOST.
+; ======================================================
+PARSE_ARGS
+	; defaults
+	LD	HL,DEF_DLL
+	LD	DE,DLL_NAME
+	CALL	STRCPY
+	LD	HL,DEF_HOST
+	LD	DE,HOST_BUFF
+	CALL	STRCPY
+	LD	HL,DEF_PORT
+	LD	DE,PORT_BUFF
+	CALL	STRCPY
+	XOR	A
+	LD	(DLL_ARG_FLAG),A		; default: no -d, resolve beside the EXE
+	LD	(UDP_MODE),A			; default: TCP exercise
+	LD	(DUAL_MODE),A
+	LD	(LISTEN_MODE),A
+	LD	(ASYNC_MODE),A
+	LD	(UDP_TEST_SIZE),A
+	LD	(UDP_TEST_SIZE+1),A		; default: fixed 21-byte payload
+	; init parse state
+	LD	HL,(CMDLINE_PTR)
+	LD	A,(HL)
+	LD	(PARSE_LEFT),A
+	INC	HL
+	LD	(PARSE_PTR),HL
+.next_flag
+	LD	DE,TOKEN_BUF
+	LD	C,TOKEN_BUF_SIZE
+	CALL	NEXT_TOKEN
+	RET	C				; no more args -> defaults
+	LD	A,(TOKEN_BUF)
+	CP	'-'
+	JP	NZ,.host_is_tok
+	LD	HL,TOKEN_BUF
+	LD	DE,STR_DASH_D
+	CALL	STREQ				; trashes C
+	JR	Z,.flag_d
+	LD	HL,TOKEN_BUF
+	LD	DE,STR_DASH_U
+	CALL	STREQ
+	JR	Z,.flag_u
+	LD	HL,TOKEN_BUF
+	LD	DE,STR_DASH_2
+	CALL	STREQ
+	JR	Z,.flag_2
+	LD	HL,TOKEN_BUF
+	LD	DE,STR_DASH_L
+	CALL	STREQ
+	JP	Z,.flag_l
+	LD	HL,TOKEN_BUF
+	LD	DE,STR_DASH_A
+	CALL	STREQ
+	JP	Z,.flag_a
+	JP	USAGE_EXIT			; unknown flag
+.flag_d
+	LD	DE,DLL_NAME
+	LD	C,DLL_NAME_SIZE
+	CALL	NEXT_TOKEN
+	JP	C,USAGE_EXIT			; -d without a file name
+	LD	A,1
+	LD	(DLL_ARG_FLAG),A		; use DLL_NAME verbatim (may hold a path)
+	JR	.next_flag
+.flag_u
+	LD	DE,UDP_PORT_BUF
+	LD	C,PORT_BUFF_SIZE
+	CALL	NEXT_TOKEN
+	JP	C,USAGE_EXIT			; -u without a port
+	LD	A,1
+	LD	(UDP_MODE),A
+	; Optional payload size: "-u PORT [SIZE]".  Peek the next token;
+	; if it is not purely decimal digits, it is not a size (most
+	; likely HOST) -- rewind the parse position so normal flag/host
+	; parsing continues from right after the port token, as before.
+	LD	HL,(PARSE_PTR)
+	LD	(SAVE_PARSE_PTR),HL
+	LD	A,(PARSE_LEFT)
+	LD	(SAVE_PARSE_LEFT),A
+	LD	DE,TOKEN_BUF
+	LD	C,TOKEN_BUF_SIZE
+	CALL	NEXT_TOKEN
+	JP	C,.next_flag			; no more tokens: default payload
+	LD	HL,TOKEN_BUF
+	CALL	PARSE_DEC_TOKEN			; -> HL=value, CF=1 invalid/empty
+	JR	C,.u_restore
+	; Clamp to PATTERN_BUF_SIZE so a mistyped size can never overflow
+	; it; the backend's own NERR_PARAM rejection above 1472 is still
+	; reachable (PATTERN_BUF_SIZE=1600 > 1472).
+	PUSH	HL
+	LD	DE,PATTERN_BUF_SIZE
+	OR	A
+	SBC	HL,DE
+	POP	HL
+	JR	C,.u_size_ok			; size < PATTERN_BUF_SIZE
+	LD	HL,PATTERN_BUF_SIZE
+.u_size_ok
+	LD	(UDP_TEST_SIZE),HL
+	JP	.next_flag
+.u_restore
+	LD	HL,(SAVE_PARSE_PTR)
+	LD	(PARSE_PTR),HL
+	LD	A,(SAVE_PARSE_LEFT)
+	LD	(PARSE_LEFT),A
+	JP	.next_flag
+.flag_2
+	LD	DE,DUAL_PORT_BUF
+	LD	C,PORT_BUFF_SIZE
+	CALL	NEXT_TOKEN
+	JP	C,USAGE_EXIT			; -2 without a data port
+	LD	A,1
+	LD	(DUAL_MODE),A
+	JP	.next_flag
+.flag_l
+	; LISTENPORT is parsed later by PARSE_DEC_TOKEN (0..9999; ample for
+	; any test port), so just capture the raw token here like -u/-2 do.
+	LD	DE,LISTEN_PORT_BUF
+	LD	C,PORT_BUFF_SIZE
+	CALL	NEXT_TOKEN
+	JP	C,USAGE_EXIT			; -l without a port
+	LD	A,1
+	LD	(LISTEN_MODE),A
+	JP	.next_flag
+.flag_a
+	LD	A,1
+	LD	(ASYNC_MODE),A
+	JP	.next_flag
+.host_is_tok
+	LD	HL,TOKEN_BUF
+	LD	DE,HOST_BUFF
+	CALL	STRCPY
+	LD	DE,PORT_BUFF
+	LD	C,PORT_BUFF_SIZE
+	CALL	NEXT_TOKEN			; optional; ignore CF
+	RET
+
+; ======================================================
+; Choose the file name passed to LIBMAN.l_load.
+;   -d given : the user's string verbatim (may carry its own path).
+;   default  : "<exe_home>\UNET509B.DLL" via DSS APPINFO; on any APPINFO
+;              problem fall back to the bare name (then cwd IS the EXE dir,
+;              same tolerance NETCFG applies to NET.CFG).
+; Out: HL -> ASCIIZ candidate; (USED_EXEDIR)=1 when HL = DLL_PATH.
+; ======================================================
+RESOLVE_DLL_PATH
+	XOR	A
+	LD	(USED_EXEDIR),A
+	LD	A,(DLL_ARG_FLAG)
+	OR	A
+	JR	NZ,.BARE			; -d: use DLL_NAME as typed
+	LD	HL,DLL_PATH
+	LD	B,APPINFO_EXE_HOMEDIR
+	LD	C,DSS_APPINFO
+	RST	DSS
+	JR	C,.BARE				; APPINFO unsupported -> cwd
+	LD	HL,DLL_PATH
+	LD	BC,DLL_PATH_SIZE - DLL_DEF_RESERVE
+.FIND_END
+	LD	A,(HL)
+	OR	A
+	JR	Z,.HAVE_END
+	INC	HL
+	DEC	BC
+	LD	A,B
+	OR	C
+	JR	NZ,.FIND_END
+	JR	.BARE				; overlong/malformed result
+.HAVE_END
+	LD	A,(DLL_PATH)
+	OR	A
+	JR	Z,.BARE				; empty result
+	DEC	HL
+	LD	A,(HL)
+	INC	HL
+	CP	92				; '\'
+	JR	Z,.APPEND
+	CP	'/'
+	JR	Z,.APPEND
+	LD	(HL),92				; add path separator
+	INC	HL
+.APPEND
+	EX	DE,HL				; DE -> append point
+	LD	HL,DLL_NAME			; default name placed there by PARSE_ARGS
+	CALL	STRCPY
+	LD	A,1
+	LD	(USED_EXEDIR),A
+	LD	HL,DLL_PATH
+	RET
+.BARE
+	LD	HL,DLL_NAME
+	RET
+
+; Print "Loading <HL>" + CRLF, preserving HL.
+SAY_LOADING
+	PUSH	HL
+	LD	HL,MSG_LOADING
+	CALL	PUTS
+	POP	HL
+	PUSH	HL
+	CALL	PUTS_LN
+	POP	HL
+	RET
+
+; Copy next whitespace-delimited token from the parse state to (DE),
+; truncated to C-1 chars (C = destination size incl NUL).
+; Out: CF=1 if no token remains.
+NEXT_TOKEN
+	PUSH	DE
+	DEC	C				; capacity without the NUL
+.skip
+	LD	A,(PARSE_LEFT)
+	AND	A
+	JR	Z,.none
+	LD	HL,(PARSE_PTR)
+	LD	A,(HL)
+	CP	0x21
+	JR	NC,.start
+	CALL	.advance
+	JR	.skip
+.start
+	POP	DE
+	PUSH	DE
+.copy
+	LD	A,(PARSE_LEFT)
+	AND	A
+	JR	Z,.end
+	LD	HL,(PARSE_PTR)
+	LD	A,(HL)
+	CP	0x21
+	JR	C,.end
+	INC	C
+	DEC	C				; capacity left?
+	JR	Z,.nostore			; truncate: keep consuming the token
+	LD	(DE),A
+	INC	DE
+	DEC	C
+.nostore
+	CALL	.advance
+	JR	.copy
+.end
+	XOR	A
+	LD	(DE),A
+	POP	DE
+	AND	A				; CF=0
+	RET
+.none
+	POP	DE
+	SCF
+	RET
+.advance
+	LD	HL,(PARSE_PTR)
+	INC	HL
+	LD	(PARSE_PTR),HL
+	LD	A,(PARSE_LEFT)
+	DEC	A
+	LD	(PARSE_LEFT),A
+	RET
+
+; Parse a pure-decimal ASCIIZ token (1-4 digits, 0..9999) at (HL),
+; used by "-u PORT [SIZE]" to tell an optional size token apart from
+; the next flag/HOST token.
+;   Out: HL = value; CF=1 if empty, contains a non-digit, or > 4 digits.
+;   Trashes A, BC, DE.
+PARSE_DEC_TOKEN
+	LD	DE,0
+	XOR	A
+	LD	(.DIGITS),A
+.loop
+	LD	A,(HL)
+	OR	A
+	JR	Z,.done
+	CP	'0'
+	JR	C,.bad
+	CP	'9'+1
+	JR	NC,.bad
+	LD	A,(.DIGITS)
+	CP	4
+	JR	NC,.bad				; more than 4 digits
+	INC	A
+	LD	(.DIGITS),A
+	LD	A,(HL)
+	SUB	'0'
+	LD	C,A
+	LD	B,0				; BC = digit (0..9)
+	PUSH	HL
+	LD	H,D
+	LD	L,E
+	ADD	HL,HL				; x2
+	ADD	HL,HL				; x4
+	ADD	HL,DE				; x5
+	ADD	HL,HL				; x10
+	ADD	HL,BC				; +digit
+	EX	DE,HL				; DE = new value
+	POP	HL
+	INC	HL
+	JR	.loop
+.done
+	LD	A,(.DIGITS)
+	OR	A
+	JR	Z,.bad				; no digits consumed
+	EX	DE,HL
+	OR	A				; CF=0
+	RET
+.bad
+	SCF
+	RET
+.DIGITS	DB 0
+
+; ======================================================
+; Small string / print helpers
+; ======================================================
+STRCPY
+	LD	A,(HL)
+	LD	(DE),A
+	AND	A
+	RET	Z
+	INC	HL
+	INC	DE
+	JR	STRCPY
+
+; Compare ASCIIZ (HL) and (DE). Out: ZF=1 if equal.
+STREQ
+	LD	A,(DE)
+	LD	C,A
+	LD	A,(HL)
+	CP	C
+	RET	NZ
+	AND	A
+	RET	Z
+	INC	HL
+	INC	DE
+	JR	STREQ
+
+; Print ASCIIZ (HL).
+PUTS
+	PUSH	BC
+	PUSH	DE
+	PUSH	HL
+	LD	C,DSS_PCHARS
+	RST	DSS
+	POP	HL
+	POP	DE
+	POP	BC
+	RET
+
+; Print ASCIIZ (HL) + CRLF.
+PUTS_LN
+	CALL	PUTS
+CRLF
+	LD	HL,MSG_CRLF
+	JR	PUTS
+
+; Print one char (A).
+PUT_CHAR
+	PUSH	AF
+	PUSH	BC
+	PUSH	DE
+	PUSH	HL
+	LD	C,DSS_PUTCHAR
+	RST	DSS
+	POP	HL
+	POP	DE
+	POP	BC
+	POP	AF
+	RET
+
+; Print DE as 4 hex digits.
+PUT_HEX16
+	LD	A,D
+	CALL	PUT_HEX8
+	LD	A,E
+PUT_HEX8
+	PUSH	AF
+	RRA
+	RRA
+	RRA
+	RRA
+	CALL	PUT_NIB
+	POP	AF
+PUT_NIB
+	AND	0x0F
+	ADD	A,0x90
+	DAA
+	ADC	A,0x40
+	DAA
+	JP	PUT_CHAR
+
+; Print A as unsigned decimal (0..255).
+PUT_DEC_A
+	LD	L,A
+	LD	H,0
+	; fall through
+; Print HL as unsigned decimal.
+PUT_DEC_HL
+	LD	DE,DEC_BUF + 6
+	XOR	A
+	LD	(DE),A
+.next
+	DEC	DE
+	CALL	DIV10_HL
+	ADD	A,'0'
+	LD	(DE),A
+	LD	A,H
+	OR	L
+	JR	NZ,.next
+	EX	DE,HL
+	JP	PUTS
+
+; HL /= 10, remainder in A.
+DIV10_HL
+	PUSH	BC
+	LD	BC,0x0D0A
+	XOR	A
+	ADD	HL,HL
+	RLA
+	ADD	HL,HL
+	RLA
+	ADD	HL,HL
+	RLA
+.dl1
+	ADD	HL,HL
+	RLA
+	CP	C
+	JR	C,.dl2
+	SUB	C
+	INC	L
+.dl2
+	DJNZ	.dl1
+	POP	BC
+	RET
+
+; Print "cfg=<0/1> init=<0/1>" from status bits in DE.
+PRINT_STATUS_BITS
+	PUSH	DE
+	LD	HL,MSG_CFG
+	CALL	PUTS
+	POP	DE
+	PUSH	DE
+	LD	A,E
+	AND	1
+	CALL	PUT_BIT
+	LD	HL,MSG_INIT
+	CALL	PUTS
+	POP	DE
+	LD	A,E
+	AND	2
+	JR	Z,.zero
+	LD	A,1
+.zero
+	JP	PUT_BIT
+
+PUT_BIT
+	ADD	A,'0'
+	JP	PUT_CHAR
+
+; Print RECV_BUF as text, DE = byte count. NUL-terminate then print.
+PRINT_RECV
+	LD	H,D
+	LD	L,E
+	LD	DE,RECV_BUF
+	ADD	HL,DE				; HL = RECV_BUF + count
+	LD	(HL),0				; terminate
+	LD	HL,RECV_BUF
+	JP	PUTS
+
+; ======================================================
+; Strings
+; ======================================================
+MSG_BANNER	DB "3C509B UNETTEST v",PACKAGE_VERSION,0
+MSG_USAGE	DB "Usage: UNETTEST [-d FILE.DLL] [-u UDPPORT [SIZE]] [-2 DATAPORT]",0
+MSG_USAGE2	DB "               [-l LISTENPORT] [-a] [HOST [PORT]]",0
+MSG_LOADING	DB "Loading ",0
+MSG_DLL		DB "DLL: ",0
+MSG_VER		DB "  v",0
+MSG_CAPS	DB "caps=0x",0
+MSG_ABI		DB "abi=0x",0
+MSG_NETSTAT	DB "net: ",0
+MSG_CFG		DB "cfg=",0
+MSG_INIT	DB " init=",0
+MSG_NETUP	DB "NETINIT ok",0
+MSG_IP		DB "IP: ",0
+MSG_RESOLVE	DB "resolve: ",0
+MSG_UNSUP	DB "unsupported (emulator/firmware gap)",0
+MSG_PING	DB "ping: ",0
+MSG_MS		DB " ms",0
+MSG_CONNECT	DB "connect ",0
+MSG_SENT	DB "request sent",0
+MSG_REPLY	DB "--- reply ---",0
+MSG_CLOSED	DB "--- closed ---",0
+MSG_DONE	DB "done.",0
+MSG_RESULT_OK	DB "RESULT OK",0
+MSG_RESULT_FAIL	DB "RESULT FAIL code=",0
+MSG_FAILED	DB "failed",0
+MSG_RECV_ERR	DB "receive error",0
+MSG_NO_REPLY	DB "no reply to the request",0
+MSG_LASTERR	DB "lasterr: ",0
+MSG_ERR_LOAD	DB "Cannot load DLL:",0
+MSG_LOAD_OPEN	DB "DLL file not found",0
+MSG_LOAD_HINT	DB "Put the DLL next to UNETTEST.EXE or use -d DIR",92,"FILE.DLL",0
+MSG_LOAD_MEM	DB "out of DSS memory",0
+MSG_LOAD_IO	DB "DLL read/seek error",0
+MSG_LOAD_FMT	DB "not an L0/L1 DLL (bad file format)",0
+MSG_LOAD_INIT	DB "DLL refused to start (wrong window?)",0
+MSG_LOAD_LIMIT	DB "too many DLLs loaded (64 max)",0
+MSG_LOAD_CALL	DB "LibMan INIT dispatch failed",0
+MSG_LOAD_CALL_HANDLE	DB "LibMan lost the loaded DLL table entry.",0
+MSG_LOAD_CALL_WINDOW	DB "LibMan produced an invalid DLL window descriptor.",0
+MSG_LOAD_CALL_SETWIN	DB "DSS could not map the DLL page",0
+MSG_ERR_INFO	DB "DLL loaded but info query failed.",0
+MSG_ERR_CALL	DB "LibMan call failed at stage ",0
+MSG_ERR_SNAPSHOT	DB "Cannot inspect loaded DLL (DSS code ",0
+MSG_ERR_BAD_IMAGE	DB "Invalid DLL ABI/capabilities; stopping before SETOPT.",0
+MSG_IMAGE_SIZE	DB "image=0x",0
+MSG_CODE_SIZE	DB " code=0x",0
+MSG_ENTRY2	DB "entry2: ",0
+MSG_GETCAPS_CODE	DB "getcaps@+81: ",0
+MSG_LOAD_CODE	DB " (code ",0
+MSG_ERR_NETINIT	DB "NETINIT failed.",0
+MSG_ERR_NONET	DB "Network not configured - run NETCFG -i or IFUP first.",0
+MSG_ERR_HW	DB "Network hardware not found.",0
+MSG_ERR_CONNECT	DB "Connect failed.",0
+MSG_ERR_SEND	DB "Send failed.",0
+MSG_ERR_SENT_COUNT DB "SEND reported the wrong byte count.",0
+MSG_ERR_POLL0	DB "RECV with IY=0 (poll) failed on an idle channel.",0
+MSG_ERR_UDPOPEN	DB "UDPOPEN failed.",0
+MSG_UDP		DB "udp ",0
+MSG_UDP_POLL0	DB "udp poll0 ok",0
+MSG_TCP_POLL0	DB "tcp poll0 ok",0
+MSG_UDP_PAYLOAD	DB "udp payload: ",0
+MSG_UDP_BYTES	DB " bytes",0
+MSG_UDP_DEFAULT	DB " (default)",0
+MSG_UDP_REPLY	DB "udp reply: len=",0
+MSG_UDP_DATA	DB " data=",0
+MSG_UDP_TRUNC	DB "(datagram truncated to the receive buffer)",0
+MSG_UDP_OK	DB "udp echo ok",0
+MSG_UDP_BAD	DB "udp echo MISMATCH",0
+MSG_UDP_NOREPLY	DB "no udp reply",0
+MSG_UDP_UNSUP	DB "UDP not supported by this backend.",0
+MSG_DUAL	DB "dual channel ports ",0
+MSG_DUAL_CTRL_OPEN DB "connect control ",0
+MSG_DUAL_DATA_OPEN DB "connect data ",0
+MSG_DUAL_STATUS	DB " status ",0
+MSG_DUAL_UNSUP	DB "two channels not supported by this backend",0
+MSG_DUAL_CLOSED	DB "data channel closed by peer",0
+MSG_DUAL_BYTES	DB "data bytes: ",0
+MSG_DUAL_MAX_RECV DB "max recv block: ",0
+MSG_DUAL_SEQ_OK	DB "data stream continuous",0
+MSG_DUAL_SEQ_BAD DB "data stream GAP - bytes were lost",0
+MSG_ACK_RIDE	DB "reply rode our ACK - SEND guard path exercised",0
+MSG_ACK_NORIDE	DB "no reply on our ACK - SEND guard path not hit",0
+MSG_DUAL_PEND	DB "control reply pending (STATUS RXPEND)",0
+MSG_DUAL_NOPEND	DB "no control reply pending",0
+MSG_DUAL_CTRL	DB "control reply: ",0
+MSG_DUAL_CTRL_NONE DB "control channel returned nothing",0
+DUAL_PROBE	DB "UNETTEST DUAL CONTROL",13,10
+DUAL_PROBE_LEN	EQU $ - DUAL_PROBE
+MSG_LISTEN	DB "listen on port ",0
+MSG_LISTEN_UNSUP DB "listen not supported by this backend",0
+MSG_LISTENING	DB "listening; connect a peer now (docs/STAGE14_TESTING_RU.md)",0
+MSG_ERR_LISTEN	DB "Listen failed.",0
+MSG_LISTEN_WAITING DB "waiting for peer #",0
+MSG_LISTEN_TIMEOUT DB "no peer connected in time",0
+MSG_LISTEN_ACCEPTED DB "peer accepted",0
+MSG_LISTEN_CLOSED DB "closed (re-arms LISTEN automatically)",0
+MSG_LISTEN_PEER_CLOSED DB "peer closed after reading reply (re-armed)",0
+MSG_UNLISTENED	DB "unlisten done",0
+MSG_ASYNC_UNSUP	DB "ASYNCSEND not supported by this backend",0
+MSG_ASYNC_SETOPT_FAIL DB "SETOPT SENDSLICE failed",0
+MSG_ASYNC_CONNECT DB "connect ",0
+MSG_ASYNC_AGAIN	DB "SEND suspended (NERR_AGAIN), confirmed so far: ",0
+MSG_ASYNC_AGAIN_COUNT DB "resumes needed: ",0
+MSG_ASYNC_STUCK	DB "gave up after too many NERR_AGAIN resumes",0
+MSG_CRLF	DB 13,10,0
+
+DEF_DLL		DB "UNET509B.DLL",0
+DEF_HOST	DB "example.com",0
+DEF_PORT	DB "80",0
+STR_DASH_D	DB "-d",0
+STR_DASH_U	DB "-u",0
+STR_DASH_2	DB "-2",0
+STR_DASH_L	DB "-l",0
+STR_DASH_A	DB "-a",0
+
+REQ_HEAD	DB "HEAD / HTTP/1.0",13,10,"Host: ",0
+REQ_TAIL	DB 13,10,"Connection: close",13,10,13,10,0
+
+; Echo probe: sent with an explicit length, so no terminator travels.
+UDP_PAYLOAD	DB "SPRINTER UNETTEST UDP"
+UDP_PAYLOAD_LEN	EQU $ - UDP_PAYLOAD
+
+; -l reply: sent with an explicit length, so no terminator travels.
+LISTEN_REPLY	DB "UNETTEST LISTEN REPLY",13,10
+LISTEN_REPLY_LEN	EQU $ - LISTEN_REPLY
+
+	ENDMODULE
+
+; ======================================================
+; Embedded libman 1.3 loader
+; ======================================================
+	INCLUDE "libman13.asm"
+
+; ======================================================
+; BSS (runtime buffers) - placed after all code, inside window 2.
+; ======================================================
+	MODULE MAIN
+
+; 1514 = 14+20+8+1472, the standard UDP MTU the DLL now accepts
+; end to end (UDPLIB_MAX_PAYLOAD/RX_BUF_SIZE in memmap.inc/unetrtl.asm).
+RECV_BUF_SIZE	EQU 1514
+STR_BUF_SIZE	EQU 96
+REQ_BUF_SIZE	EQU 160
+TOKEN_BUF_SIZE	EQU 64
+DLL_NAME_SIZE	EQU 128			; -d value may carry a directory path
+DLL_PATH_SIZE	EQU 272			; APPINFO dir (<=256) + '\' + name + NUL
+DLL_DEF_RESERVE	EQU 16			; '\' + "UNET509B.DLL" + NUL headroom
+HOST_BUFF_SIZE	EQU 64
+PORT_BUFF_SIZE	EQU 16
+; Sized -u payload test ("-u PORT [SIZE]"): generated i&0xFF pattern,
+; sized a bit above the 1472 UDP MTU so a mistyped/deliberate over-limit
+; SIZE (e.g. 1473, to exercise the backend's own NERR_PARAM rejection)
+; can never overflow this buffer even before the clamp in PARSE_ARGS.
+PATTERN_BUF_SIZE	EQU 1600
+
+BSS_BASE	EQU $
+HANDLE		EQU BSS_BASE
+CAPS		EQU HANDLE + 2
+ABI_VERSION	EQU CAPS + 2
+API_STATUS	EQU ABI_VERSION + 2
+TMP16		EQU API_STATUS + 1
+REQ_LEN		EQU TMP16 + 2
+RECV_LEFT	EQU REQ_LEN + 2
+CMDLINE_PTR	EQU RECV_LEFT + 1
+PARSE_PTR	EQU CMDLINE_PTR + 2
+PARSE_LEFT	EQU PARSE_PTR + 2
+SAVE_PARSE_PTR	EQU PARSE_LEFT + 1	; -u's optional-SIZE-token backtrack
+SAVE_PARSE_LEFT	EQU SAVE_PARSE_PTR + 2
+DLL_ARG_FLAG	EQU SAVE_PARSE_LEFT + 1	; 1 = -d given, use DLL_NAME verbatim
+USED_EXEDIR	EQU DLL_ARG_FLAG + 1	; 1 = first candidate was DLL_PATH
+UDP_MODE	EQU USED_EXEDIR + 1	; 1 = -u given, run the UDP exercise
+UDP_RX_LEN	EQU UDP_MODE + 1
+UDP_RX_FLAGS	EQU UDP_RX_LEN + 2
+UDP_TEST_SIZE	EQU UDP_RX_FLAGS + 1	; 0 = default 21-byte payload;
+					; else generated-pattern size
+DUAL_MODE	EQU UDP_TEST_SIZE + 2	; 1 = -2 given
+DUAL_NEXT	EQU DUAL_MODE + 1
+DUAL_BAD	EQU DUAL_NEXT + 1
+DUAL_TOTAL	EQU DUAL_BAD + 1
+DUAL_MAX_RECV	EQU DUAL_TOTAL + 2
+LISTEN_MODE	EQU DUAL_MAX_RECV + 2	; 1 = -l given
+ASYNC_MODE	EQU LISTEN_MODE + 1	; 1 = -a given
+LISTEN_RX_LEN	EQU ASYNC_MODE + 1
+ASYNC_AGAIN_COUNT	EQU LISTEN_RX_LEN + 2
+PHASE_FAIL	EQU ASYNC_AGAIN_COUNT + 1	; 0 = every check passed so far;
+					; otherwise the exit code the tail uses
+TCP_GOT_DATA	EQU PHASE_FAIL + 1	; 1 = the plain TCP exercise saw a reply byte
+DEC_BUF		EQU TCP_GOT_DATA + 1
+INFO_BUF	EQU DEC_BUF + 8
+DLL_NAME	EQU INFO_BUF + 32
+DLL_PATH	EQU DLL_NAME + DLL_NAME_SIZE
+HOST_BUFF	EQU DLL_PATH + DLL_PATH_SIZE
+PORT_BUFF	EQU HOST_BUFF + HOST_BUFF_SIZE
+UDP_PORT_BUF	EQU PORT_BUFF + PORT_BUFF_SIZE
+DUAL_PORT_BUF	EQU UDP_PORT_BUF + PORT_BUFF_SIZE
+LISTEN_PORT_BUF	EQU DUAL_PORT_BUF + PORT_BUFF_SIZE
+TOKEN_BUF	EQU LISTEN_PORT_BUF + PORT_BUFF_SIZE
+STR_BUF		EQU TOKEN_BUF + TOKEN_BUF_SIZE
+REQ_BUF		EQU STR_BUF + STR_BUF_SIZE
+RECV_BUF	EQU REQ_BUF + REQ_BUF_SIZE
+PATTERN_BUF	EQU RECV_BUF + RECV_BUF_SIZE
+DLL_BASE_H	EQU PATTERN_BUF + PATTERN_BUF_SIZE
+SNAPSHOT_OLD_WIN	EQU DLL_BASE_H + 1
+SNAPSHOT_DSS_ERROR	EQU SNAPSHOT_OLD_WIN + 1
+DLL_PROBE	EQU SNAPSHOT_DSS_ERROR + 1
+DLL_PROBE_SIZE	EQU 256
+BSS_END		EQU DLL_PROBE + DLL_PROBE_SIZE
+
+STACK_BOTTOM	EQU BSS_END
+STACK_TOP	EQU STACK_BOTTOM + 0x600
+
+EXIT_CHECK	EQU 5			; a check inside the run failed
+RECV_MAX_BLOCKS	EQU 4
+UDP_MAX_TRIES	EQU 3			; 3 x 2000 ms before giving up
+DUAL_MAX_ROUNDS EQU 200			; bounded data-channel drain loop
+LISTEN_MAX_PEERS	EQU 2		; accept-serve-close twice: proves re-arm
+LISTEN_ACCEPT_TRIES	EQU 15		; 15 x 2000 ms before giving up on a peer
+ASYNC_SLICE_MS	EQU 150			; SETOPT SENDSLICE: min useful is 50
+ASYNC_PAYLOAD_LEN	EQU 1200	; > 2 TCP_MSS chunks, well under PATTERN_BUF_SIZE
+ASYNC_MAX_AGAIN	EQU 20			; bounded NERR_AGAIN resume loop
+
+	ASSERT STACK_TOP <= 0xC000
+
+	ENDMODULE
+
+	END MAIN.START

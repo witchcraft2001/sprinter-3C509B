@@ -146,7 +146,21 @@ START
 	LD	A,(W12_HOP_DONE)
 	OR	A
 	JP	NZ,HTTP_FAIL
-	JR	.RX_LOOP
+	CALL	BODY_COMPLETE
+	JR	C,.RX_LOOP
+	; The declared Content-Length has arrived, so the response is over by
+	; its own framing: stop the clock here instead of waiting for a FIN.
+	; A keep-alive server (HTTP/1.1 is the default for Python's own
+	; http.server, and DLSPEED's "Connection: close" is only a request) is
+	; entitled to hold the socket open indefinitely -- waiting for its FIN
+	; would burn HTTP_IDLE_MS and then report a bogus 0x1E on a transfer
+	; that actually completed byte-exact. CLOSE, not ABORT: the peer gets
+	; an orderly FIN rather than an RST in the middle of its own keep-alive
+	; bookkeeping.
+	CALL	CAPTURE_STOP
+	XOR	A
+	CALL	@TCPX.CLOSE
+	JR	.RESPONSE_DONE
 .RX_END_OR_FAIL
 	CP	TCP_ERR_CLOSED
 	JR	Z,.PEER_CLOSED
@@ -157,6 +171,16 @@ START
 	CALL	CAPTURE_STOP
 	XOR	A
 	CALL	@TCPX.CLOSE
+	; A close-delimited response (no Content-Length) ends exactly here, and
+	; only here. One that declared a length and stopped short of it is a
+	; truncated transfer, not a measurement: report it instead of printing
+	; a rate for a partial body.
+	LD	A,(W12_CONTENT_KNOWN)
+	OR	A
+	JR	Z,.RESPONSE_DONE
+	CALL	BODY_COMPLETE
+	JP	C,TCP_RECV_FAIL_PROTOCOL
+.RESPONSE_DONE
 	LD	A,(W12_STATUS_SEEN)
 	OR	A
 	JP	Z,TCP_RECV_FAIL_PROTOCOL
@@ -338,6 +362,140 @@ PROCESS_CHUNK
 	LD	(W12_BODY_RECEIVED+2),HL
 	RET
 
+; BODY_COMPLETE: CF=1 "keep receiving", CF=0 "the body is complete".
+; Complete means: the headers are over (state 4), a Content-Length was
+; declared, and at least that many body bytes have been counted. Without a
+; declared length the only legal end-of-body marker is the peer's FIN, so
+; this always answers "keep receiving" and .PEER_CLOSED does the deciding.
+; Trashes A, DE, HL.
+BODY_COMPLETE
+	LD	A,(W12_HTTP_STATE)
+	CP	4
+	JR	NZ,.MORE
+	LD	A,(W12_CONTENT_KNOWN)
+	OR	A
+	JR	Z,.MORE
+	; 32-bit received - declared: CF=1 (borrow) means still short. A body
+	; longer than declared (a broken server) also ends the transfer here
+	; rather than hanging; W12_BODY_RECEIVED then reports what really
+	; arrived, which is what a measurement tool should say.
+	LD	HL,(W12_BODY_RECEIVED)
+	LD	DE,(W12_CONTENT_LENGTH)
+	OR	A
+	SBC	HL,DE
+	LD	HL,(W12_BODY_RECEIVED+2)
+	LD	DE,(W12_CONTENT_LENGTH+2)
+	SBC	HL,DE
+	RET
+.MORE
+	SCF
+	RET
+
+; CHECK_CONTENT_LENGTH: on a captured header line reading "Content-Length:"
+; (case-insensitive, per RFC 7230 field names), parse the 32-bit decimal
+; value into W12_CONTENT_LENGTH and raise W12_CONTENT_KNOWN. Anything else,
+; including a malformed or empty value, leaves both untouched -- the
+; response then falls back to close-delimited framing rather than being
+; rejected, since HTTP/1.0 allows exactly that. Trashes A, BC, DE, HL.
+CHECK_CONTENT_LENGTH
+	LD	HL,W12_HEADER_LINE
+	LD	DE,LIT_CONTENT_LENGTH
+.PREFIX
+	LD	A,(DE)
+	OR	A
+	JR	Z,.VALUE
+	LD	C,A
+	LD	A,(HL)
+	CALL	TOLOWER
+	CP	C
+	RET	NZ
+	INC	HL
+	INC	DE
+	JR	.PREFIX
+.VALUE
+	LD	A,(HL)
+	CP	' '
+	JR	Z,.SKIP
+	CP	9
+	JR	NZ,.DIGITS
+.SKIP
+	INC	HL
+	JR	.VALUE
+.DIGITS
+	LD	DE,0
+	LD	(W12_WORK32),DE
+	LD	(W12_WORK32+2),DE
+	LD	B,0
+.NEXT
+	LD	A,(HL)
+	SUB	'0'
+	JR	C,.END
+	CP	10
+	JR	NC,.END
+	INC	B
+	LD	C,A
+	PUSH	HL
+	CALL	MUL_WORK32_10
+	LD	A,(W12_WORK32)
+	ADD	A,C
+	LD	(W12_WORK32),A
+	JR	NC,.NO_CARRY
+	LD	HL,W12_WORK32+1
+	INC	(HL)
+	JR	NZ,.NO_CARRY
+	INC	HL
+	INC	(HL)
+	JR	NZ,.NO_CARRY
+	INC	HL
+	INC	(HL)
+.NO_CARRY
+	POP	HL
+	INC	HL
+	JR	.NEXT
+.END
+	LD	A,B
+	OR	A
+	RET	Z			; no digits at all: not a usable length
+	LD	HL,(W12_WORK32)
+	LD	(W12_CONTENT_LENGTH),HL
+	LD	HL,(W12_WORK32+2)
+	LD	(W12_CONTENT_LENGTH+2),HL
+	LD	A,1
+	LD	(W12_CONTENT_KNOWN),A
+	RET
+
+; W12_WORK32 *= 10, via (x*2) + (x*8). W12_CONTENT_LENGTH holds the x*2
+; addend meanwhile: it is written for real only once the whole value has
+; been parsed, so it is free scratch until then (same trick as WGET's).
+MUL_WORK32_10
+	CALL	SHIFT_WORK32		; 2x, kept as the addend
+	LD	HL,(W12_WORK32)
+	LD	DE,(W12_WORK32+2)
+	LD	(W12_CONTENT_LENGTH),HL
+	LD	(W12_CONTENT_LENGTH+2),DE
+	CALL	SHIFT_WORK32		; 4x
+	CALL	SHIFT_WORK32		; 8x
+	LD	HL,(W12_WORK32)
+	LD	DE,(W12_CONTENT_LENGTH)
+	ADD	HL,DE
+	LD	(W12_WORK32),HL
+	LD	HL,(W12_WORK32+2)
+	LD	DE,(W12_CONTENT_LENGTH+2)
+	ADC	HL,DE
+	LD	(W12_WORK32+2),HL
+	RET
+
+SHIFT_WORK32
+	LD	HL,W12_WORK32
+	SLA	(HL)
+	INC	HL
+	RL	(HL)
+	INC	HL
+	RL	(HL)
+	INC	HL
+	RL	(HL)
+	RET
+
 CAPTURE_HEADER_BYTE
 	LD	(W12_LAST_ERROR),A
 	CP	10
@@ -373,6 +531,7 @@ CAPTURE_HEADER_BYTE
 	LD	(W12_STATUS_SEEN),A
 	JR	.RESET
 .HEADER
+	CALL	CHECK_CONTENT_LENGTH
 .RESET
 	XOR	A
 	LD	(W12_HEADER_LENGTH),A
@@ -1060,6 +1219,7 @@ EXIT_NO_RESULT
 BOOT_FAIL
 	DSS_RETURN DSS_EXIT_LOCAL
 
+LIT_CONTENT_LENGTH DB "content-length:",0
 LIT_GET		DB "GET ",0
 LIT_HTTP_HOST	DB " HTTP/1.0",13,10,"Host: ",0
 LIT_REST	DB 13,10,"Connection: close",13,10,13,10,0
@@ -1120,7 +1280,6 @@ SAVED_EXIT_CODE EQU S10_COMMAND_BUFFER
 	INCLUDE "tcp.asm"
 	INCLUDE "stage9_app.asm"
 	INCLUDE "nettime.asm"
-	INCLUDE "file.asm"
 	INCLUDE "stage9_cli.asm"
 	INCLUDE "tcp_transport.asm"
 	INCLUDE "stage11_app.asm"

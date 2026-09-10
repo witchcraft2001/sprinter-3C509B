@@ -165,7 +165,16 @@ HOP_LOOP
 	LD	A,(W12_HOP_DONE)
 	CP	2
 	JP	Z,HTTP_FAIL
-	JR	.RX_LOOP
+	CALL	BODY_COMPLETE
+	JR	C,.RX_LOOP
+	; The declared Content-Length has arrived, so the response is over by
+	; its own framing. Waiting for a FIN here instead would stall for
+	; HTTP_IDLE_MS and then report a receive timeout on a download that in
+	; fact completed byte-exact -- "Connection: close" is only a request,
+	; and an HTTP/1.1 server is entitled to keep the socket open.
+	XOR	A
+	CALL	@TCPX.CLOSE
+	JR	.RESPONSE_DONE
 .RX_END_OR_FAIL
 	CP	TCP_ERR_CLOSED
 	JR	Z,.PEER_CLOSED
@@ -175,6 +184,7 @@ HOP_LOOP
 .PEER_CLOSED
 	XOR	A
 	CALL	@TCPX.CLOSE
+.RESPONSE_DONE
 	; A complete response always has a parsed status line and CRLFCRLF.
 	LD	A,(W12_STATUS_SEEN)
 	OR	A
@@ -331,8 +341,41 @@ PROCESS_CHUNK
 .BODY
 	LD	A,(W12_HOP_DONE)
 	OR	A
-	RET	NZ
-	JP	APPEND_BODY
+	JP	Z,APPEND_BODY
+	; A redirect or error hop's body is thrown away rather than written,
+	; but it still has to be COUNTED: that is what lets BODY_COMPLETE end
+	; the hop on its declared Content-Length instead of waiting for a FIN
+	; the server need never send. The counter is reset per hop
+	; (RESET_HOP_STATE), so this cannot leak into the real download's total.
+	PUSH	BC
+	POP	DE
+	LD	HL,W12_BODY_RECEIVED
+	JP	ADD16_TO_32
+
+; BODY_COMPLETE: CF=1 "keep receiving", CF=0 "this response is complete".
+; Complete means the headers are over (state 4), the response declared a
+; Content-Length, and at least that many body bytes have been counted.
+; Without a declared length the body runs to the peer's close, which is the
+; only end-of-body marker HTTP/1.0 gives such a response, so this answers
+; "keep receiving" and .PEER_CLOSED does the deciding. Trashes A, DE, HL.
+BODY_COMPLETE
+	LD	A,(W12_HTTP_STATE)
+	CP	4
+	JR	NZ,.MORE
+	LD	A,(W12_CONTENT_KNOWN)
+	OR	A
+	JR	Z,.MORE
+	LD	HL,(W12_BODY_RECEIVED)
+	LD	DE,(W12_CONTENT_LENGTH)
+	OR	A
+	SBC	HL,DE
+	LD	HL,(W12_BODY_RECEIVED+2)
+	LD	DE,(W12_CONTENT_LENGTH+2)
+	SBC	HL,DE
+	RET
+.MORE
+	SCF
+	RET
 
 CAPTURE_HEADER_BYTE
 	LD	(W12_LAST_ERROR),A

@@ -17,6 +17,30 @@
 	ASSERT S11_PENDING_CAPACITY >= TCP_RECV_WINDOW
 	ENDIF
 
+; TCPX_TX_BUFFER: every outgoing TCP segment (SYN/data/ACK/FIN/RST) this
+; module builds via SEND_SEGMENT_COMMON, plus its own outgoing ARP
+; requests -- never its ARP REPLIES, see below -- is a frame we are
+; constructing fresh; none of them ever needs to read the RX buffer's
+; current contents at the same time (any inbound payload a segment might
+; ACK is already copied out of RX before SEND_SEGMENT runs -- see
+; HANDLE_SEGMENT's own long comment on segment length). So for the DLL,
+; which has no spare page for a second reservation the size of
+; TCP_MSS+headers, this reuses the otherwise-idle RX buffer instead (the
+; same trick UDP's own UDPX_TX_BUFFER already uses). ARP REPLY building
+; is different -- ARP_BUILD_REPLY reads fields from the very request
+; frame it is still writing the reply into -- so PROCESS_ARP and
+; RESOLVE_ROUTE's own reply-to-a-request branch keep using the small,
+; separate STAGE9_TX_BUFFER (60 bytes, exactly one ARP frame, see
+; unet509b_bss.inc) instead of this alias; do not redirect those two call
+; sites to TCPX_TX_BUFFER.
+	IFDEF	UNET_DLL
+TCPX_TX_BUFFER		EQU STAGE9_RX_BUFFER
+TCPX_TX_CAPACITY	EQU STAGE9_RX_CAPACITY
+	ELSE
+TCPX_TX_BUFFER		EQU STAGE9_TX_BUFFER
+TCPX_TX_CAPACITY	EQU STAGE9_TX_CAPACITY
+	ENDIF
+
 ; TCPX_SINGLE_CONTEXT restricts the transport to channel 0 only: RESET clears
 ; just one context, SELECT_CONTEXT rejects channel 1, and PROCESS_FRAME never
 ; falls through to a second context. WGET and DLSPEED want this -- one stream
@@ -293,10 +317,12 @@ SEND
 	CALL	CHOOSE_SEGMENT_LENGTH
 	LD	HL,(S11_SEGMENT_LENGTH)
 	LD	(S11_ACTIVE_LENGTH),HL
+	IFNDEF	UNET_DLL
 	LD	HL,(S11_SEND_POINTER)
-	LD	DE,STAGE9_TX_BUFFER+14+IPV4_HEADER_LENGTH+TCP_HEADER_LENGTH
+	LD	DE,TCPX_TX_BUFFER+14+IPV4_HEADER_LENGTH+TCP_HEADER_LENGTH
 	LD	BC,(S11_ACTIVE_LENGTH)
 	LDIR
+	ENDIF
 	ENDIF
 	PUSH	IX
 	POP	HL
@@ -331,6 +357,17 @@ SEND
 	LD	A,(IX+CTX_EVENT)
 	AND	~(EVENT_ACK|EVENT_RST|EVENT_FIN)
 	LD	(IX+CTX_EVENT),A
+	IFDEF	UNET_DLL
+	; Re-copy the payload from the caller's own buffer before every
+	; attempt, not just the first (SEND_WINDOW_PROBE already does the same
+	; for its own 1-byte probe -- see its own comment): TCPX_TX_BUFFER
+	; aliases the RX buffer, and inbound frames read during the waits
+	; below (any channel) may have overwritten it since the last attempt.
+	LD	HL,(S11_SEND_POINTER)
+	LD	DE,TCPX_TX_BUFFER+14+IPV4_HEADER_LENGTH+TCP_HEADER_LENGTH
+	LD	BC,(S11_ACTIVE_LENGTH)
+	LDIR
+	ENDIF
 	IFDEF	TCPX_SEND_BURST
 	CALL	SEND_BURST
 	ELSE
@@ -340,19 +377,54 @@ SEND
 	ENDIF
 	JP	C,.SEND_FAIL
 	LD	A,(IX+CTX_RETRY_LEFT)
-	CP	3
-	LD	BC,1000
-	JP	Z,.DATA_WAIT
-	CP	2
-	LD	BC,2000
-	JP	Z,.DATA_WAIT
-	LD	BC,4000
+	CALL	ATTEMPT_MS
+.DATA_ATTEMPT_MS
+	IFDEF	TCPX_ASYNCSEND
+	LD	(S11_ASYNC_MS_LEFT),BC
+.DATA_WAIT
+	; Quantum for this wait: the whole remaining attempt budget when
+	; blocking (UNET_OPT_SLICE=0, byte-identical to the non-ASYNCSEND
+	; behavior below), or the smaller of the remaining budget and the
+	; slice when the caller armed UNET_OPT_SENDSLICE.
+	LD	HL,(S11_ASYNC_MS_LEFT)
+	LD	DE,(UNET_OPT_SLICE)
+	LD	A,D
+	OR	E
+	JR	Z,.DATA_QUANTUM_READY
+	OR	A
+	SBC	HL,DE
+	JR	NC,.DATA_QUANTUM_READY
+	ADD	HL,DE			; remaining < slice: use remaining as-is
+.DATA_QUANTUM_READY
+	LD	B,H
+	LD	C,L
+	LD	A,EVENT_ACK|EVENT_RST
+	CALL	WAIT_FOR_EVENT
+	JP	NC,.DATA_EVENT
+	CP	TCP_ERR_TIMEOUT
+	JP	NZ,.SEND_FAIL
+	; WAIT_FOR_EVENT only returns F_TIMEOUT after waiting its full
+	; requested quantum, so BC is exactly the elapsed silence.
+	LD	HL,(S11_ASYNC_MS_LEFT)
+	OR	A
+	SBC	HL,BC
+	LD	(S11_ASYNC_MS_LEFT),HL
+	LD	A,H
+	OR	L
+	JP	Z,.DATA_ATTEMPT_EXHAUSTED
+	; Silence within the attempt but budget remains: suspend without
+	; burning a retry or retransmitting. SEND_RESUME re-enters .DATA_WAIT
+	; directly for this same outstanding segment.
+	JP	.SEND_AGAIN
+.DATA_ATTEMPT_EXHAUSTED
+	ELSE
 .DATA_WAIT
 	LD	A,EVENT_ACK|EVENT_RST
 	CALL	WAIT_FOR_EVENT
 	JP	NC,.DATA_EVENT
 	CP	TCP_ERR_TIMEOUT
 	JP	NZ,.SEND_FAIL
+	ENDIF
 	LD	A,(IX+CTX_RETRY_LEFT)
 	DEC	A
 	LD	(IX+CTX_RETRY_LEFT),A
@@ -391,6 +463,17 @@ SEND
 	LD	DE,(S11_SEND_CONFIRMED)
 	SCF
 	JP	.SEND_RETURN
+	IFDEF	TCPX_ASYNCSEND
+; Not a failure: the segment (or window probe) is still legitimately in
+; flight. FAIL_CONTEXT must NOT run here -- the context stays exactly as
+; it is so SEND_RESUME can continue waiting on the SAME outstanding
+; segment/probe.
+.SEND_AGAIN
+	LD	A,TCP_ERR_AGAIN
+	LD	DE,(S11_SEND_CONFIRMED)
+	SCF
+	JP	.SEND_RETURN
+	ENDIF
 .SEND_CLOSED
 	LD	A,TCP_ERR_CLOSED
 	LD	DE,0
@@ -407,6 +490,20 @@ SEND
 .SEND_RETURN
 	POP	IY,IX
 	RET
+
+	IFDEF	TCPX_ASYNCSEND
+; SEND_RESUME: continue a SEND suspended with TCP_ERR_AGAIN. In: A=channel
+; (the shim's own resume-contract check already confirmed this matches the
+; suspended one). Re-enters SEND's own ACK wait directly for the same
+; outstanding segment -- neither resends nor burns a retry (the window-
+; probe wait is never sliced, so a suspend can only ever be pending there).
+; Out/clobbers: same as SEND.
+SEND_RESUME
+	PUSH	IX,IY
+	CALL	SELECT_CONTEXT
+	JP	C,SEND.SEND_RETURN
+	JP	SEND.DATA_WAIT
+	ENDIF
 
 ; RECV
 ; In: A=channel, HL=destination, BC=capacity, DE=timeout milliseconds.
@@ -666,6 +763,83 @@ ABORT
 	POP	IY,IX
 	RET
 
+	IFDEF	TCPX_LISTEN
+; LISTEN arms a channel for exactly one inbound connection. In: A=channel,
+; HL=local port (host order, already validated nonzero by the shim). Out:
+; CF/A status. Clobbers AF/BC/DE/HL; preserves IX/IY.
+LISTEN
+	PUSH	IX,IY
+	PUSH	HL			; neither helper below leaves the port alone:
+					; SELECT_CONTEXT returns the context address
+					; in HL, and CLEAR_CONTEXT walks HL to the end
+					; of the region it zeroes. Bound with the
+					; leftover, the listener sits on an address-
+					; shaped port no peer will ever address, and
+					; nothing reports it -- LISTEN, STATUS and
+					; UNLISTEN all still behave, every SYN just
+					; misses PROCESS_FRAME's destination-port test
+					; and the accept never happens.
+	CALL	SELECT_CONTEXT
+	JP	C,.LISTEN_BAD
+	CALL	CLEAR_CONTEXT
+	POP	HL
+	LD	(IX+CTX_LOCAL_PORT),L
+	LD	(IX+CTX_LOCAL_PORT+1),H
+	LD	(IX+CTX_STATE),TCP_STATE_LISTEN
+	XOR	A
+	JR	.LISTEN_RETURN
+.LISTEN_BAD
+	POP	DE			; discard the saved port; A/CF already set
+.LISTEN_RETURN
+	POP	IY,IX
+	RET
+
+; UNLISTEN stops a channel TCPX.LISTEN armed: RST only if a peer's
+; handshake is in flight (SYN_RECEIVED), otherwise just clears the
+; context. In: A=channel. Out: CF/A status. Clobbers AF/BC/DE/HL;
+; preserves IX/IY.
+UNLISTEN
+	PUSH	IX,IY
+	CALL	SELECT_CONTEXT
+	JP	C,.UNLISTEN_RETURN
+	LD	A,(IX+CTX_STATE)
+	CP	TCP_STATE_SYN_RECEIVED
+	JR	NZ,.UNLISTEN_CLEAR
+	LD	A,TCP_FLAG_RST|TCP_FLAG_ACK
+	LD	BC,0
+	CALL	SEND_SEGMENT
+.UNLISTEN_CLEAR
+	CALL	CLEAR_CONTEXT
+	XOR	A
+.UNLISTEN_RETURN
+	POP	IY,IX
+	RET
+
+; ACCEPT_POLL waits up to BC ms for the bound channel's handshake to
+; finish. In: A=channel, BC=timeout ms. Out: A=1 established, A=0 idle
+; (timeout, or the peer reset -- LISTEN is already re-armed by then).
+; Clobbers AF/BC/DE/HL; preserves IX/IY.
+ACCEPT_POLL
+	PUSH	IX,IY
+	CALL	SELECT_CONTEXT
+	JP	C,.ACCEPT_IDLE
+	LD	A,(IX+CTX_EVENT)
+	AND	~(EVENT_SYN_ACK|EVENT_RST)
+	LD	(IX+CTX_EVENT),A
+	LD	A,EVENT_SYN_ACK|EVENT_RST
+	CALL	WAIT_FOR_EVENT
+	JR	C,.ACCEPT_IDLE
+	BIT	3,A
+	JR	NZ,.ACCEPT_IDLE
+	LD	A,1
+	JR	.ACCEPT_RETURN
+.ACCEPT_IDLE
+	XOR	A
+.ACCEPT_RETURN
+	POP	IY,IX
+	RET
+	ENDIF
+
 	IFNDEF STAGE12_LAYOUT	; WGET reports through its own diagnostics
 ; STATUS: In A=channel. Out A=TCP_STATE_*, B=last status, CF clear.
 ; Invalid channel returns NETDRV_ERR_PARAMETER/CF set. Clobbers AF/B/HL;
@@ -776,14 +950,19 @@ RESOLVE_ROUTE
 	LD	C,A
 	LD	B,0
 	LD	HL,NET_NEXT_HOP_IP
+	IFDEF	UNET_DLL
+	; No ARP cache in the DLL (plan decision #6): one exchange per operation.
+	SCF
+	ELSE
 	CALL	@ARP.CACHE_LOOKUP
+	ENDIF
 	RET	NC
 	LD	(IX+CTX_RETRY_LEFT),ARP_ATTEMPTS
 .ARP_TRY
-	LD	DE,STAGE9_TX_BUFFER
+	LD	DE,TCPX_TX_BUFFER
 	LD	HL,NET_NEXT_HOP_IP
 	CALL	@ARP.BUILD_REQUEST
-	LD	HL,STAGE9_TX_BUFFER
+	LD	HL,TCPX_TX_BUFFER
 	CALL	@NETDRV.SEND_FRAME
 	RET	C
 	; The first request after the driver comes up is the one that gets lost:
@@ -834,6 +1013,10 @@ RESOLVE_ROUTE
 	SCF
 	RET
 .ARP_FOUND
+	IFDEF	UNET_DLL
+	; No ARP cache in the DLL (plan decision #6); CF is already clear here.
+	RET
+	ELSE
 	CALL	@S9APP.SECONDS
 	LD	C,A
 	LD	B,0
@@ -841,6 +1024,7 @@ RESOLVE_ROUTE
 	LD	DE,NET_RESULT_MAC
 	CALL	@ARP.CACHE_INSERT
 	RET
+	ENDIF
 .BAD_TARGET
 	LD	A,NETDRV_ERR_PARAMETER
 	SCF
@@ -972,13 +1156,11 @@ WAIT_REMOTE_WINDOW
 	CALL	SEND_WINDOW_PROBE
 	RET	C
 	LD	A,(IX+CTX_RETRY_LEFT)
-	CP	3
-	LD	BC,1000
-	JP	Z,.PROBE_WAIT
-	CP	2
-	LD	BC,2000
-	JP	Z,.PROBE_WAIT
-	LD	BC,4000
+	CALL	ATTEMPT_MS
+; Unlike SEND's own ACK wait, this window-probe wait is never sliced by
+; TCPX_ASYNCSEND: a fully-closed remote window is rare enough that RTL's
+; own ASYNCSEND does not cover it either (see this DLL's plan notes), and
+; every byte here is scarce.
 .PROBE_WAIT
 	LD	A,EVENT_WINDOW|EVENT_RST|EVENT_FIN
 	CALL	WAIT_FOR_EVENT
@@ -1007,7 +1189,7 @@ WAIT_REMOTE_WINDOW
 SEND_WINDOW_PROBE
 	LD	HL,(S11_SEND_POINTER)
 	LD	A,(HL)
-	LD	(STAGE9_TX_BUFFER+14+IPV4_HEADER_LENGTH+TCP_HEADER_LENGTH),A
+	LD	(TCPX_TX_BUFFER+14+IPV4_HEADER_LENGTH+TCP_HEADER_LENGTH),A
 	PUSH	IX
 	POP	HL
 	LD	DE,CTX_SND_NXT
@@ -1022,6 +1204,19 @@ SEND_WINDOW_PROBE
 	LD	BC,1
 	JP	SEND_SEGMENT_COMMON
 
+; ATTEMPT_MS: shared by SEND's own retry ladder and WAIT_REMOTE_WINDOW's.
+; In: A=(IX+CTX_RETRY_LEFT), already loaded by the caller (3/2/1 remaining).
+; Out: BC=1000/2000/4000. Trashes AF.
+ATTEMPT_MS
+	CP	3
+	LD	BC,1000
+	RET	Z
+	CP	2
+	LD	BC,2000
+	RET	Z
+	LD	BC,4000
+	RET
+
 ; SEND_SEGMENT builds Ethernet/IPv4/TCP contiguously and transmits it.
 ; In: IX=context, A=flags, BC=payload length already at TX+54.
 SEND_SEGMENT
@@ -1032,9 +1227,9 @@ SEND_SEGMENT
 SEND_SEGMENT_COMMON
 	LD	(S11_BUILD_FLAGS),A
 	LD	(S11_SEGMENT_LENGTH),BC
-	LD	HL,STAGE9_TX_BUFFER+14+IPV4_HEADER_LENGTH
+	LD	HL,TCPX_TX_BUFFER+14+IPV4_HEADER_LENGTH
 	LD	(S11_TCP_BUILD_DESC+TCPB_BUFFER),HL
-	LD	HL,STAGE9_TX_CAPACITY-14-IPV4_HEADER_LENGTH
+	LD	HL,TCPX_TX_CAPACITY-14-IPV4_HEADER_LENGTH
 	LD	(S11_TCP_BUILD_DESC+TCPB_CAPACITY),HL
 	LD	HL,NET_LOCAL_IP
 	LD	(S11_TCP_BUILD_DESC+TCPB_SOURCE_IP),HL
@@ -1152,9 +1347,9 @@ SEND_SEGMENT_COMMON
 	RET	C
 	LD	(S11_TCP_LENGTH),BC
 	LD	(S11_IPV4_BUILD_DESC+IP4B_DATA_LENGTH),BC
-	LD	HL,STAGE9_TX_BUFFER+14
+	LD	HL,TCPX_TX_BUFFER+14
 	LD	(S11_IPV4_BUILD_DESC+IP4B_BUFFER),HL
-	LD	HL,STAGE9_TX_CAPACITY-14
+	LD	HL,TCPX_TX_CAPACITY-14
 	LD	(S11_IPV4_BUILD_DESC+IP4B_CAPACITY),HL
 	LD	HL,NET_LOCAL_IP
 	LD	(S11_IPV4_BUILD_DESC+IP4B_SOURCE),HL
@@ -1178,7 +1373,7 @@ SEND_SEGMENT_COMMON
 	POP	HL
 	LD	DE,CTX_REMOTE_MAC
 	ADD	HL,DE
-	LD	DE,STAGE9_TX_BUFFER
+	LD	DE,TCPX_TX_BUFFER
 	LD	BC,6
 	LDIR
 	LD	HL,NETDRV_STATION_MAC
@@ -1194,7 +1389,7 @@ SEND_SEGMENT_COMMON
 	ADD	HL,DE
 	LD	B,H
 	LD	C,L
-	LD	HL,STAGE9_TX_BUFFER
+	LD	HL,TCPX_TX_BUFFER
 	JP	@NETDRV.SEND_FRAME
 
 ; WAIT_FOR_EVENT polls and dispatches all frames, including the other channel.
@@ -1758,11 +1953,40 @@ PROCESS_FRAME
 	CALL	MATCH_CONTEXT
 	JP	Z,.MATCHED
 	IFDEF	TCPX_SINGLE_CONTEXT
+		IFDEF	TCPX_LISTEN
+	JP	.TRY_LISTEN
+		ELSE
 	JP	.IGNORE
+		ENDIF
 	ELSE
 	LD	IX,S11_CONTEXT1
 	CALL	MATCH_CONTEXT
+		IFDEF	TCPX_LISTEN
+	JP	Z,.MATCHED
+	JP	.TRY_LISTEN
+		ELSE
 	JP	NZ,.IGNORE
+		ENDIF
+	ENDIF
+	IFDEF	TCPX_LISTEN
+; No established peer matched. A context bound by TCPX.LISTEN has no peer
+; tuple of its own yet (CTX_REMOTE_IP/PORT are still zero, MATCH_CONTEXT
+; excludes it on purpose), so it is found by state instead and fed through
+; the SAME fill-and-parse below: CTX_REMOTE_PORT=0 there is exactly the
+; "accept any source port" wildcard @TCP.PARSE already supports, and
+; CTX_LOCAL_PORT is the bound port, so this needs no descriptor changes.
+.TRY_LISTEN
+	LD	IX,S11_CONTEXT0
+	LD	A,(IX+CTX_STATE)
+	CP	TCP_STATE_LISTEN
+	JP	Z,.MATCHED
+		IFNDEF	TCPX_SINGLE_CONTEXT
+	LD	IX,S11_CONTEXT1
+	LD	A,(IX+CTX_STATE)
+	CP	TCP_STATE_LISTEN
+	JP	Z,.MATCHED
+		ENDIF
+	JP	.IGNORE
 	ENDIF
 .MATCHED
 	PUSH	IX
@@ -1814,6 +2038,10 @@ MATCH_CONTEXT
 	LD	A,(IX+CTX_STATE)
 	OR	A
 	JP	Z,.NO_MATCH
+	IFDEF	TCPX_LISTEN
+	CP	TCP_STATE_LISTEN
+	JP	Z,.NO_MATCH		; a listener has no peer tuple to match yet
+	ENDIF
 	LD	HL,(S11_IPV4_PARSE_DESC+IP4P_SOURCE)
 	PUSH	IX
 	POP	DE
@@ -1855,6 +2083,10 @@ HANDLE_SEGMENT
 	LD	A,(IX+CTX_STATE)
 	CP	TCP_STATE_SYN_SENT
 	JP	Z,.RST_SYN_SENT
+	IFDEF	TCPX_LISTEN
+	CP	TCP_STATE_SYN_RECEIVED
+	JP	Z,.RST_SYN_RECEIVED
+	ENDIF
 	LD	HL,S11_PARSE_SEQUENCE
 	PUSH	IX
 	POP	DE
@@ -1886,10 +2118,33 @@ HANDLE_SEGMENT
 	CALL	SET_EVENT
 	XOR	A
 	RET
+	IFDEF	TCPX_LISTEN
+; An RST during the half-open handshake aborts the passive attempt and
+; re-arms LISTEN on the same port straight away: unet.inc's ACCEPT_POLL
+; contract is "one inbound connection at a time", and a half-open peer
+; that never completes must not tie up the only listener.
+.RST_SYN_RECEIVED
+	LD	L,(IX+CTX_LOCAL_PORT)
+	LD	H,(IX+CTX_LOCAL_PORT+1)
+	CALL	CLEAR_CONTEXT
+	LD	(IX+CTX_LOCAL_PORT),L
+	LD	(IX+CTX_LOCAL_PORT+1),H
+	LD	(IX+CTX_STATE),TCP_STATE_LISTEN
+	LD	A,EVENT_RST
+	CALL	SET_EVENT
+	XOR	A
+	RET
+	ENDIF
 .NOT_RST
 	LD	A,(IX+CTX_STATE)
 	CP	TCP_STATE_SYN_SENT
 	JP	Z,HANDLE_SYN_ACK
+	IFDEF	TCPX_LISTEN
+	CP	TCP_STATE_LISTEN
+	JP	Z,HANDLE_PASSIVE_SYN
+	CP	TCP_STATE_SYN_RECEIVED
+	JP	Z,.SYN_RECEIVED
+	ENDIF
 	LD	A,(S11_TCP_PARSE_DESC+TCPP_FLAGS)
 	AND	TCP_FLAG_ACK
 	JP	Z,.NO_ACK
@@ -2071,6 +2326,149 @@ HANDLE_SEGMENT
 .DONE
 	XOR	A
 	RET
+	IFDEF	TCPX_LISTEN
+; A segment for a half-open (SYN_RECEIVED) context: a duplicate SYN means
+; our own SYN|ACK was lost, so resend it unchanged; otherwise this is the
+; handshake's closing ACK -- once it matches, move to ESTABLISHED, raise
+; EVENT_SYN_ACK for ACCEPT_POLL, and fall into the ordinary ACK/data path
+; above (.NO_ACK) so payload piggybacked on that same ACK isn't dropped.
+.SYN_RECEIVED
+	LD	A,(S11_TCP_PARSE_DESC+TCPP_FLAGS)
+	BIT	1,A			; TCP_FLAG_SYN
+	JP	Z,.SYN_RECEIVED_ACK
+	LD	A,TCP_FLAG_SYN|TCP_FLAG_ACK
+	LD	BC,0
+	JP	SEND_SEGMENT
+.SYN_RECEIVED_ACK
+	AND	TCP_FLAG_ACK
+	JP	Z,.DONE
+	LD	HL,S11_PARSE_ACK
+	PUSH	IX
+	POP	DE
+	LD	BC,CTX_SND_NXT
+	EX	DE,HL
+	ADD	HL,BC
+	EX	DE,HL
+	CALL	CMP4
+	JP	NZ,.DONE
+	LD	HL,S11_PARSE_ACK
+	PUSH	IX
+	POP	DE
+	LD	BC,CTX_SND_UNA
+	EX	DE,HL
+	ADD	HL,BC
+	EX	DE,HL
+	CALL	COPY4
+	CALL	UPDATE_REMOTE_WINDOW
+	LD	(IX+CTX_STATE),TCP_STATE_ESTABLISHED
+	LD	A,EVENT_SYN_ACK
+	CALL	SET_EVENT
+	JP	.NO_ACK
+	ENDIF
+
+	IFDEF	TCPX_LISTEN
+; HANDLE_PASSIVE_SYN: a segment matched a LISTEN-state context (see
+; PROCESS_FRAME's .TRY_LISTEN). Only a pure, dataless SYN starts a passive
+; open; anything else here is noise (a stray ACK/data segment aimed at the
+; bound port with no real connection yet) and is ignored. No ARP: the
+; SYN's own Ethernet/IP source already says where to send the SYN|ACK.
+HANDLE_PASSIVE_SYN
+	LD	A,(S11_TCP_PARSE_DESC+TCPP_FLAGS)
+	AND	TCP_FLAG_SYN|TCP_FLAG_ACK|TCP_FLAG_FIN
+	CP	TCP_FLAG_SYN
+	JP	NZ,.PASSIVE_DONE
+	LD	HL,(S11_TCP_PARSE_DESC+TCPP_PAYLOAD_LENGTH)
+	LD	A,H
+	OR	L
+	JP	NZ,.PASSIVE_DONE
+	LD	HL,(S11_IPV4_PARSE_DESC+IP4P_SOURCE)
+	PUSH	IX
+	POP	DE
+	LD	BC,CTX_REMOTE_IP
+	EX	DE,HL
+	ADD	HL,BC
+	EX	DE,HL
+	LD	BC,4
+	LDIR
+	LD	HL,STAGE9_RX_BUFFER+6
+	PUSH	IX
+	POP	DE
+	LD	BC,CTX_REMOTE_MAC
+	EX	DE,HL
+	ADD	HL,BC
+	EX	DE,HL
+	LD	BC,6
+	LDIR
+	; CTX_REMOTE_PORT has no @TCP.PARSE output field of its own (an
+	; established context's is already known going in) -- read it
+	; straight from the TCP header's first two bytes (network order).
+	LD	HL,(S11_TCP_PARSE_DESC+TCPP_BUFFER)
+	LD	A,(HL)
+	INC	HL
+	LD	E,(HL)
+	LD	D,A
+	LD	(IX+CTX_REMOTE_PORT),E
+	LD	(IX+CTX_REMOTE_PORT+1),D
+	; RCV_NXT = peer's ISN + 1 (the SYN consumes one sequence number).
+	LD	HL,S11_PARSE_SEQUENCE
+	PUSH	IX
+	POP	DE
+	LD	BC,CTX_RCV_NXT
+	EX	DE,HL
+	ADD	HL,BC
+	EX	DE,HL
+	CALL	COPY4
+	PUSH	IX
+	POP	HL
+	LD	DE,CTX_RCV_NXT
+	ADD	HL,DE
+	CALL	INC32
+	; Our own ISN: reuse GENERATE_TUPLE's own algorithm and its SND_UNA->
+	; SND_NXT copy, since it is already proven and this saves duplicating
+	; it here. It also reassigns CTX_LOCAL_PORT (an ephemeral port, for
+	; the active-open case it was written for) -- wrong for a listener,
+	; which must keep the port it was bound to, so that one field is
+	; saved and restored around the call.
+	LD	L,(IX+CTX_LOCAL_PORT)
+	LD	H,(IX+CTX_LOCAL_PORT+1)
+	PUSH	HL
+	CALL	GENERATE_TUPLE
+	POP	HL
+	LD	(IX+CTX_LOCAL_PORT),L
+	LD	(IX+CTX_LOCAL_PORT+1),H
+	PUSH	IX
+	POP	HL
+	LD	DE,CTX_SND_NXT
+	ADD	HL,DE
+	CALL	INC32
+	; Clamp the peer's advertised MSS exactly like HANDLE_SYN_ACK does for
+	; the active-open side.
+	LD	HL,(S11_TCP_PARSE_DESC+TCPP_MSS)
+	LD	A,H
+	OR	L
+	JP	Z,.PASSIVE_DEFAULT_MSS
+	LD	DE,TCP_MSS+1
+	OR	A
+	SBC	HL,DE
+	JP	NC,.PASSIVE_DEFAULT_MSS
+	ADD	HL,DE
+	JP	.PASSIVE_STORE_MSS
+.PASSIVE_DEFAULT_MSS
+	LD	HL,TCP_MSS
+.PASSIVE_STORE_MSS
+	LD	(IX+CTX_PEER_MSS),L
+	LD	(IX+CTX_PEER_MSS+1),H
+	LD	(IX+CTX_STATE),TCP_STATE_SYN_RECEIVED
+	LD	A,TCP_FLAG_SYN|TCP_FLAG_ACK
+	LD	BC,0
+	CALL	SEND_SEGMENT
+	RET	C
+	XOR	A
+	RET
+.PASSIVE_DONE
+	XOR	A
+	RET
+	ENDIF
 
 HANDLE_SYN_ACK
 	LD	A,(S11_TCP_PARSE_DESC+TCPP_FLAGS)

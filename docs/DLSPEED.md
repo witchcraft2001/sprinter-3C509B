@@ -27,6 +27,28 @@ not trusted as a rate — the result explicitly flags it as too short instead
 of printing a number rounded from too little data. Use a file of at least a
 few hundred KB for a stable measurement.
 
+## How the response is framed
+
+The request asks for `Connection: close`, but a server is free to ignore that
+and keep the socket open, which HTTP/1.1 servers do by default. So the end of
+the response is decided by its own framing, in this order:
+
+- **`Content-Length` present.** The transfer is complete the moment that many
+  body bytes have been counted. The clock stops there, DLSPEED closes the
+  connection with an orderly FIN, and the result is printed without waiting
+  for anything further from the server. A connection that closes *before* the
+  declared length arrives is a truncated transfer and is reported as an error,
+  not measured.
+- **No `Content-Length`.** The body then runs until the server closes the
+  connection, which is the only end-of-body marker HTTP/1.0 offers for such a
+  response. This case cannot distinguish an orderly end from a dropped
+  connection; prefer a server that sends a length.
+
+The header name is matched case-insensitively and the value may be padded with
+spaces or tabs. If a server sends no usable length and never closes the
+connection, the transfer ends on the 15-second idle timeout with a network
+error rather than hanging.
+
 ## What to expect
 
 Against the MAME 3C509B model with the stage 13 responder, a 512 KiB download
@@ -43,6 +65,15 @@ it directly, so one `RECV` call normally takes about eleven segments. The body
 is counted, not inspected: a corrupted byte that somehow passed the TCP
 checksum would not be noticed here. Use WGET with a known sha256 when the
 question is integrity rather than speed.
+
+Any HTTP server that reports a correct `Content-Length` works, including
+Python's own `http.server`, so a measurement on real hardware does not depend
+on the MAME stage-13 responder. For example:
+
+```sh
+python3 -m http.server 8080 --directory /path/with/a/big/file
+DLSPEED http://192.168.7.44:8080/big.bin
+```
 
 DLSPEED does not follow redirects and only accepts a `2xx` response; anything
 else fails with the HTTP status line printed. Exit classes: 0 success,

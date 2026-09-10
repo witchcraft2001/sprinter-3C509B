@@ -138,6 +138,15 @@ ACTIVATE
 	LD	A,D
 	OR	A
 	JR	NZ,.EXPLICIT
+	IFDEF	UNET_DLL
+	; This DLL's own netdrv.asm always calls ACTIVATE with A=1: NETDRV_MODE
+	; AUTO is rejected upstream, at NETINIT's own env parsing (NET_HW=AUTO
+	; -> NERR_NONET before NETDRV.INIT ever runs) -- so the EEPROM-base
+	; branch below is provably unreachable and not linked in.
+	LD	A,EL3_ERR_PARAMETER
+	SCF
+	JR	.RETURN
+	ELSE
 	LD	A,(EEPROM_BUFFER + 0x08*2)
 	AND	0x1F
 	CALL	@EL3ALG.BASE_DECODE
@@ -145,6 +154,7 @@ ACTIVATE
 	LD	(EL3_BASE),HL
 	LD	A,EL3_ID_ACTIVATE_EEPROM
 	JR	.WRITE_ACTIVATE
+	ENDIF
 .EXPLICIT
 	CALL	@EL3ALG.BASE_ENCODE
 	JR	C,.RETURN

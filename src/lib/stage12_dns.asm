@@ -10,6 +10,27 @@
 DNS_LOCAL_PORT	EQU 0xD035
 DNS_TIMEOUT_MS	EQU 5000
 
+; The query frame is built before anything has been received this attempt
+; (RX is idle at that point, same reasoning as UDPX_TX_BUFFER/TCPX_TX_BUFFER),
+; so for UNET_DLL it reuses the RX buffer instead of a dedicated reservation.
+	IFDEF	UNET_DLL
+DNSX_TX_BUFFER		EQU STAGE9_RX_BUFFER
+DNSX_TX_CAPACITY	EQU STAGE9_RX_CAPACITY
+	ELSE
+DNSX_TX_BUFFER		EQU STAGE9_TX_BUFFER
+DNSX_TX_CAPACITY	EQU STAGE9_TX_CAPACITY
+	ENDIF
+
+	IFDEF	UNET_DLL
+; Shared tail for this module's cold trampolines below (BUILD_QUERY,
+; PARSE_DNS_REPLY, BUILD_FRAME, PARSE_REPLY_FRAME): JP, not CALL, so the
+; original caller's own return address (from its CALL BUILD_FRAME etc.)
+; stays on the stack all the way through to COLD.RUN's RET.
+DNS_COLD_CALL
+	LD	IX,UNET_COLD_CTX
+	JP	@COLD.RUN
+	ENDIF
+
 RESOLVE_OR_LITERAL
 	PUSH	IX,IY
 	LD	(DNS_NAME_POINTER),HL
@@ -38,14 +59,26 @@ RESOLVE_OR_LITERAL
 	JP	Z,.NEXT_SERVER
 	LD	DE,NET_TARGET_IP
 	CALL	COPY4
-	; RESOLVE_ROUTE operates on the context selected by IX.  DNS uses
-	; channel 0 as its scratch route context; selecting it explicitly keeps
-	; the caller's IX (and the TCP context) from being corrupted.
+	; RESOLVE_ROUTE operates on the context selected by IX.  A dedicated
+	; scratch context keeps this route resolve from corrupting a live TCP
+	; channel context -- UNET_DLL uses S11_CONTEXT_SCRATCH (channels 0/1
+	; are real, in-use connections there); the standalone WGET client has
+	; no such conflict and keeps using channel 0's own context, as before.
+	IFDEF	UNET_DLL
+	LD	IX,S11_CONTEXT_SCRATCH
+	LD	HL,NET_TARGET_IP
+	LD	DE,S11_CONTEXT_SCRATCH+1
+	ELSE
 	LD	IX,S11_CONTEXT0
 	LD	HL,NET_TARGET_IP
 	LD	DE,S11_CONTEXT0+1
+	ENDIF
 	CALL	COPY4
+	IFDEF	UNET_DLL
+	LD	IX,S11_CONTEXT_SCRATCH
+	ELSE
 	LD	IX,S11_CONTEXT0
+	ENDIF
 	CALL	@TCPX.RESOLVE_ROUTE
 	JP	C,.SERVER_ERROR
 	LD	A,3
@@ -53,7 +86,7 @@ RESOLVE_OR_LITERAL
 .TRY
 	CALL	BUILD_FRAME
 	JP	C,.RETURN
-	LD	HL,STAGE9_TX_BUFFER
+	LD	HL,DNSX_TX_BUFFER
 	LD	BC,(S9_RX_LENGTH)
 	CALL	@NETDRV.SEND_FRAME
 	JP	C,.RETURN
@@ -135,14 +168,23 @@ RESOLVE_OR_LITERAL
 	POP	IY,IX
 	RET
 
+	IFDEF	UNET_DLL
+; Cold: same wire format, reached via CFN_DNS_BUILD_FRAME (unet509b_cold.asm)
+; -- every fixed hot address this touches (DNS_NAME_POINTER, NET_LOCAL_IP,
+; NET_TARGET_IP, NETDRV_STATION_MAC, NET_RESULT_MAC, S9_IP_ID, S9_RX_LENGTH,
+; S9_IPV4_BUILD_DESC) becomes a CCTX_DNS_* dereference instead. IX=&COLD_CTX.
+BUILD_FRAME
+	LD	A,CFN_DNS_BUILD_FRAME
+	JP	DNS_COLD_CALL
+	ELSE
 BUILD_FRAME
 	LD	HL,(DNS_NAME_POINTER)
-	LD	DE,STAGE9_TX_BUFFER+42
+	LD	DE,DNSX_TX_BUFFER+42
 	CALL	BUILD_QUERY
 	RET	C
 	; Minimal UDP header. A zero checksum is valid for IPv4 and avoids retaining
 	; a second packet-codec stack solely for DNS.
-	LD	HL,STAGE9_TX_BUFFER+34
+	LD	HL,DNSX_TX_BUFFER+34
 	LD	(HL),HIGH DNS_LOCAL_PORT
 	INC	HL
 	LD	(HL),LOW DNS_LOCAL_PORT
@@ -158,7 +200,7 @@ BUILD_FRAME
 	ADD	HL,DE
 	LD	D,H
 	LD	E,L
-	LD	HL,STAGE9_TX_BUFFER+38
+	LD	HL,DNSX_TX_BUFFER+38
 	LD	(HL),D
 	INC	HL
 	LD	(HL),E
@@ -172,9 +214,9 @@ BUILD_FRAME
 	LD	B,H
 	LD	C,L
 	LD	(S9_IPV4_BUILD_DESC+IP4B_DATA_LENGTH),BC
-	LD	HL,STAGE9_TX_BUFFER+14
+	LD	HL,DNSX_TX_BUFFER+14
 	LD	(S9_IPV4_BUILD_DESC+IP4B_BUFFER),HL
-	LD	HL,STAGE9_TX_CAPACITY-14
+	LD	HL,DNSX_TX_CAPACITY-14
 	LD	(S9_IPV4_BUILD_DESC+IP4B_CAPACITY),HL
 	LD	HL,NET_LOCAL_IP
 	LD	(S9_IPV4_BUILD_DESC+IP4B_SOURCE),HL
@@ -197,7 +239,7 @@ BUILD_FRAME
 	ADD	HL,BC
 	LD	(S9_RX_LENGTH),HL
 	LD	HL,NET_RESULT_MAC
-	LD	DE,STAGE9_TX_BUFFER
+	LD	DE,DNSX_TX_BUFFER
 	LD	BC,6
 	LDIR
 	LD	HL,NETDRV_STATION_MAC
@@ -210,7 +252,16 @@ BUILD_FRAME
 	LD	(DE),A
 	XOR	A
 	RET
+	ENDIF	; UNET_DLL (BUILD_FRAME trampoline above)
 
+	IFDEF	UNET_DLL
+; Cold: same wire format, reached via CFN_DNS_PARSE_FRAME (unet509b_cold.asm)
+; -- every fixed hot address this touches becomes a CCTX_DNS_* dereference
+; instead (see BUILD_FRAME's own header comment). IX=&COLD_CTX.
+PARSE_REPLY_FRAME
+	LD	A,CFN_DNS_PARSE_FRAME
+	JP	DNS_COLD_CALL
+	ELSE
 PARSE_REPLY_FRAME
 	LD	HL,STAGE9_RX_BUFFER+14
 	LD	(S9_IPV4_PARSE_DESC+IP4P_BUFFER),HL
@@ -287,6 +338,7 @@ PARSE_REPLY_FRAME
 	LD	A,NETDRV_ERR_PARAMETER
 	SCF
 	RET
+	ENDIF	; UNET_DLL (PARSE_REPLY_FRAME trampoline above)
 
 GENERATE_ID
 	LD	C,DSS_SYSTIME
@@ -305,14 +357,30 @@ GENERATE_ID
 	LD	(DNS_TRANSACTION_ID),HL
 	RET
 
+	IFDEF	UNET_DLL
+; Cold: same copy, reached via CFN_DNS_COPY_RESULT -- DNS_RESULT_IP and
+; NET_TARGET_IP are fixed hot addresses, so this dereferences each via its
+; own CCTX field instead (both already exist for other DNS/route uses).
+COPY_RESULT
+	LD	A,CFN_DNS_COPY_RESULT
+	JP	DNS_COLD_CALL
+	ELSE
 COPY_RESULT
 	LD	HL,DNS_RESULT_IP
 	LD	DE,NET_TARGET_IP
+	ENDIF
 COPY4
 	LD	BC,4
 	LDIR
 	RET
 
+	IFDEF	UNET_DLL
+; Cold: identical body (pure register logic), reached via
+; CFN_DNS_NONZERO_IP. No CCTX pointer needed.
+NONZERO_IP
+	LD	A,CFN_DNS_NONZERO_IP
+	JP	DNS_COLD_CALL
+	ELSE
 NONZERO_IP
 	PUSH	HL
 	LD	B,4
@@ -323,8 +391,16 @@ NONZERO_IP
 	DJNZ	.NZ_LOOP
 	POP	HL
 	RET
+	ENDIF
 
 ; HL=name. Reject empty/oversize labels and non-printable input.
+	IFDEF	UNET_DLL
+; Cold: identical body (pure register logic, no hot-address dependency at
+; all), reached via CFN_DNS_VALIDATE_NAME. No CCTX pointer needed.
+VALIDATE_NAME
+	LD	A,CFN_DNS_VALIDATE_NAME
+	JP	@COLD.RUN
+	ELSE
 VALIDATE_NAME
 	LD	B,0
 	LD	C,0
@@ -364,8 +440,18 @@ VALIDATE_NAME
 	LD	A,NETDRV_ERR_PARAMETER
 	SCF
 	RET
+	ENDIF	; UNET_DLL (VALIDATE_NAME trampoline above)
 
 ; HL=name, DE=destination. Returns BC=query length.
+	IFDEF	UNET_DLL
+; Cold: identical body, reached via CFN_DNS_BUILD_QUERY (unet509b_cold.asm)
+; -- DNS_TRANSACTION_ID is a fixed hot address, unreachable from cold code
+; directly, so the cold copy dereferences it through (IX+CCTX_DNS_XID)
+; instead. IX=&COLD_CTX is set by this trampoline; HL/DE pass through.
+BUILD_QUERY
+	LD	A,CFN_DNS_BUILD_QUERY
+	JP	DNS_COLD_CALL
+	ELSE
 BUILD_QUERY
 	PUSH	DE
 	LD	BC,(DNS_TRANSACTION_ID)
@@ -440,7 +526,9 @@ BUILD_QUERY
 	LD	C,L
 	XOR	A
 	RET
+	ENDIF	; UNET_DLL (BUILD_QUERY trampoline above)
 
+	IFNDEF	UNET_DLL
 ; HL=DNS payload, BC=length. Compressed owner names are skipped safely; the
 ; first A/IN answer is returned and CNAME/unknown RRs are bounded by RDLENGTH.
 PARSE_DNS_REPLY
@@ -635,6 +723,18 @@ ADVANCE_BOUNDED
 .AB_OK
 	OR	A
 	RET
+	ENDIF	; UNET_DLL (PARSE_DNS_REPLY/SKIP_DNS_NAME/CHECK_ONE/ADVANCE_BOUNDED above)
+
+	IFDEF	UNET_DLL
+; Cold: same body as the IFNDEF branch above, reached via CFN_DNS_PARSE_REPLY
+; (unet509b_cold.asm) -- DNS_TRANSACTION_ID/DNS_RESULT_IP/S9_RX_PAYLOAD/
+; S9_DRAIN_LEFT are fixed hot addresses, so the cold copy reaches each
+; through its own CCTX_DNS_* pointer instead. HL=payload, BC=length pass
+; through untouched; IX=&COLD_CTX is set here.
+PARSE_DNS_REPLY
+	LD	A,CFN_DNS_PARSE_REPLY
+	JP	DNS_COLD_CALL
+	ENDIF
 
 	ENDMODULE
 	ENDIF

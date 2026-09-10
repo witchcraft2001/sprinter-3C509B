@@ -669,6 +669,69 @@ for (const tcp of [{duplicateData: true}, {outOfOrderBeforeData: true},
   speedChecked(result);
 }
 
+// Response framing. Until this was fixed, DLSPEED ignored Content-Length
+// entirely and treated the peer's FIN as the only end-of-body marker, so any
+// server that kept the connection open (HTTP/1.1 keep-alive is the default in
+// Python's own http.server, and "Connection: close" is only a request) made a
+// byte-perfect transfer sit idle for HTTP_IDLE_MS and then report TCP recv
+// 0x1E -- and the ABORT on that error path put an RST on the wire, which is
+// what surfaced as a traceback on the server rather than on the client that
+// caused it. The harness sends FIN as soon as the body drains unless keepOpen
+// says otherwise, which is exactly why the defect was invisible here.
+function clientTcpFlags(result) {
+  return result.transmittedFrames.map((frame) => Buffer.from(frame, 'hex')).filter((frame) =>
+    frame.length >= 34 && frame.readUInt16BE(12) === 0x0800 && frame[23] === 6)
+    .map((frame) => frame[14 + (frame[14] & 0x0f) * 4 + 13]);
+}
+const KEEPALIVE_BODY = Buffer.alloc(4000, 0x5a);
+result = runExe(speedExe, 'http://192.168.7.44/KEEP.BIN', speedScenario({
+  response: {status: '200 OK', body: KEEPALIVE_BODY, headers: {}, closeDelimited: false},
+  keepOpen: true,
+}));
+assert.strictEqual(result.exitCode, 0, result.output);
+assert.match(result.output, new RegExp(`Received: ${KEEPALIVE_BODY.length} bytes`));
+assert.doesNotMatch(result.output, /TCP recv failed/, result.output);
+assert.match(result.output, /RESULT OK/);
+// Ended by the declared length, so the peer gets an orderly FIN and never an
+// RST -- the client must not abort a connection it finished with cleanly.
+const keepFlags = clientTcpFlags(result);
+assert.ok(keepFlags.some((flags) => flags & 0x01), 'DLSPEED never sent a FIN');
+assert.ok(!keepFlags.some((flags) => flags & 0x04),
+  `DLSPEED reset a completed keep-alive connection: ${keepFlags.map((f) => f.toString(16))}`);
+speedChecked(result);
+
+// A declared length the server never delivers is a truncated transfer, not a
+// measurement: it must be reported, never printed as a rate for a short body.
+result = runExe(speedExe, 'http://192.168.7.44/SHORT.BIN', speedScenario({
+  response: {raw: `HTTP/1.0 200 OK\r\nContent-Length: 10000\r\n\r\n${'x'.repeat(400)}`},
+}));
+assert.strictEqual(result.exitCode, 3, result.output);
+assert.match(result.output, /TCP recv failed, code 0x/);
+assert.match(result.output, /RESULT FAIL/);
+speedChecked(result);
+
+// No Content-Length at all is still legal HTTP/1.0 framing: the body then runs
+// to the peer's FIN, which stays the only thing that can end it.
+const CLOSE_BODY = Buffer.alloc(3000, 0x5a);
+result = runExe(speedExe, 'http://192.168.7.44/CLOSE.BIN', speedScenario({
+  response: {status: '200 OK', body: CLOSE_BODY, headers: {}, closeDelimited: true},
+}));
+assert.strictEqual(result.exitCode, 0, result.output);
+assert.match(result.output, new RegExp(`Received: ${CLOSE_BODY.length} bytes`));
+assert.match(result.output, /RESULT OK/);
+speedChecked(result);
+
+// Header field names are case-insensitive (RFC 7230), and the value may be
+// padded; a server writing it any other way must not silently fall back to
+// FIN-delimited framing and hang against keep-alive.
+result = runExe(speedExe, 'http://192.168.7.44/CASE.BIN', speedScenario({
+  response: {raw: `HTTP/1.0 200 OK\r\nCONTENT-LENGTH:   400\r\n\r\n${'y'.repeat(400)}`},
+  keepOpen: true,
+}));
+assert.strictEqual(result.exitCode, 0, result.output);
+assert.match(result.output, /Received: 400 bytes/);
+speedChecked(result);
+
 // remoteFinAfterData attaches FIN to the *next* chunk drainConnectionSendQueue
 // sends regardless of queue depth (see harness.js), so it only mirrors
 // TCPTEST's "FIN on the one and only reply" case when the whole body fits in

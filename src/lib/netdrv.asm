@@ -35,7 +35,13 @@ INIT
 	LD	H,(IX+NETDRV_CFG_IDPORT+1)
 	LD	A,(IX+NETDRV_CFG_MODE)
 	CP	NETDRV_MODE_AUTO
+	IFDEF	UNET_DLL
+	JP	Z,.BAD_CONFIG		; AUTO is rejected upstream (env NET_HW=AUTO -> NERR_NONET); a
+					; config that reaches here with it anyway is malformed, not
+					; a slot to probe -- this DLL never probes (see below).
+	ELSE
 	JR	Z,.AUTO
+	ENDIF
 	CP	NETDRV_MODE_EXPLICIT
 	JP	NZ,.BAD_CONFIG
 	LD	A,(IX+NETDRV_CFG_SLOT)
@@ -43,13 +49,18 @@ INIT
 	CALL	@EL3.CONFIGURE
 	JP	C,.RETURN
 	CALL	@EL3.DISCOVER
+	IFDEF	UNET_DLL
+	JP	C,.RETURN		; no AUTO fallback in this DLL: report DISCOVER's own status
+	ELSE
 	JR	C,.AUTO
+	ENDIF
 	LD	L,(IX+NETDRV_CFG_BASE)
 	LD	H,(IX+NETDRV_CFG_BASE+1)
 	LD	A,1
 	CALL	@EL3.ACTIVATE
 	JP	C,.ACTIVATE_FAILED
 	JR	.ACTIVE
+	IFNDEF	UNET_DLL
 ; Only DISCOVER decides that a pinned slot missed: it is the one step that
 ; asks the hardware whether an adapter answers there, so its failure falls
 ; back to the same probe AUTO uses, hinted with the pinned slot (a card that
@@ -59,6 +70,10 @@ INIT
 ; rejection on both slots and report the bad ID port as "card not found".
 ; A failed ACTIVATE is not a missed pin either: the card answered ID, so a
 ; bad base is reported as-is via .ACTIVATE_FAILED.
+; AUTO probing itself is dropped entirely for the DLL: NETINIT's own env
+; parsing already rejects NET_HW=AUTO before NETDRV.INIT is ever called
+; (decision recorded in the plan), so keeping this ~60-byte loop linked in
+; would only spend image budget on a path that never runs.
 .AUTO
 	LD	A,(IX+NETDRV_CFG_SLOT)
 	CP	2
@@ -92,6 +107,7 @@ INIT
 	LD	A,EL3_ERR_NOT_FOUND
 	SCF
 	JP	.RETURN
+	ENDIF	; UNET_DLL
 .ACTIVE
 	LD	(NETDRV_SELECTED_BASE),HL
 	LD	A,1
@@ -277,7 +293,13 @@ VALIDATE_BUFFER
 		JR	NC,.BAD
 .NO_DLL_OVERLAP
 	ENDIF
+	IFNDEF	UNET_DLL
 	; Resident buffers at/above 8000h must end no closer than 256 bytes to SP.
+	; Skipped for the DLL: this code runs on the CALLER's stack (SP may be
+	; anywhere in the consumer's own address space, e.g. WIN1 while this
+	; image's own RX buffer sits at WIN2+BSS_RX), so "256 bytes below SP"
+	; is meaningless here and would reject this DLL's own internal buffers
+	; for no reason (see the plan's own note on this exact failure mode).
 	LD	HL,(NETDRV_BUFFER_PTR)
 	BIT	7,H
 	JR	Z,.OK
@@ -292,6 +314,7 @@ VALIDATE_BUFFER
 	OR	A
 	SBC	HL,DE
 	JR	C,.BAD
+	ENDIF
 .OK
 	XOR	A
 	RET

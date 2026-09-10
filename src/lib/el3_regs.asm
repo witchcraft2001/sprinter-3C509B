@@ -408,8 +408,14 @@ INIT
 	LD	HL,EL3_CMD_ACK_INTR | EL3_ACK_POLLING
 	CALL	CMD_SYNC
 	JP	C,.RETURN
+	IFNDEF	UNET_DLL
+	; DISCOVER+ACTIVATE already proved the card responds and latched its
+	; station address (see netdrv.asm's INIT); a size-constrained DLL
+	; trusts that instead of re-verifying every INIT register write byte
+	; for byte (plan's own reasoning for this cut).
 	CALL	VERIFY_INIT
 	JP	C,.RETURN
+	ENDIF
 	LD	A,1
 	LD	(INIT_ACTIVE),A
 	XOR	A
@@ -457,6 +463,7 @@ DONE
 	POP	IY,IX
 	RET
 
+	IFNDEF	UNET_DLL
 VERIFY_INIT
 	LD	A,EL3_VERIFY_MAC
 	LD	(EL3_VERIFY_FIELD),A
@@ -611,6 +618,7 @@ CLEAR_VERIFY_DIAGNOSTICS
 	LD	(EL3_VERIFY_EXPECTED),HL
 	LD	(EL3_VERIFY_ACTUAL),HL
 	RET
+	ENDIF	; UNET_DLL (VERIFY_INIT/VERIFY_WORD/VERIFY_MEDIA/CLEAR_VERIFY_DIAGNOSTICS above)
 
 	IFNDEF STAGE12_LAYOUT
 ; SNAPSHOT

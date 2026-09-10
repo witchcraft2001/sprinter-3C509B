@@ -5,6 +5,15 @@
 	IFNDEF	_MEMORY_INC
 	DEFINE	_MEMORY_INC
 
+	IFDEF	UNET_DLL
+; UNET509B.DLL carries its own state as in-image BSS (DLL_BSS, declared by
+; src/dll/unet509b.asm before this INCLUDE) instead of the fixed
+; RUNTIME_BASE/PAGE_BASE addresses below -- those belong to the consumer's
+; own address space and a libman DLL must never write there. See
+; memory_dll.inc's header comment.
+	INCLUDE	"memory_dll.inc"
+	ELSE
+
 ; PAGE_BASE is the window a program maps its private DSS page over. Every
 ; utility here loads at 8080h, owns WIN2 and maps its page over WIN1, so the
 ; default is 4000h. Stage 12 is the exception: WGET's image fills a whole
@@ -804,5 +813,7 @@ STACK_TOP		EQU S10_STACK_TOP
 	ELSE
 STACK_TOP		EQU 0xBFF0
 	ENDIF
+
+	ENDIF	; UNET_DLL
 
 	ENDIF
