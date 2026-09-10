@@ -472,6 +472,31 @@ TEST_START
 	CP	NERR_CLOSED
 	JP	NZ,FAIL
 
+	CASE	18			; CLOSE must RELEASE the channel. Every case
+					; above closes through F_RECV's own re-arm
+					; path, so none of them executes the tail of
+					; CLOSE itself -- and that tail is reached by
+					; falling through, which any routine inserted
+					; under the call silently steals. CLOSE then
+					; still answers NERR_OK while the channel stays
+					; marked open, so the NEXT CONNECT on it gets
+					; NERR_STATE: a browser loads one page and then
+					; reports "connect failed" for the rest of the
+					; session.
+	LD	HL,FINACK_FRAME		; the peer's ACK of the FIN CLOSE sends
+	LD	(RX_QSRC),HL
+	LD	HL,ACK_LEN
+	LD	(RX_QLEN),HL
+	LD	HL,0
+	LD	(RX_QLEN2),HL
+	XOR	A
+	ENTRY	UNET_FN_CLOSE
+	JP	C,FAIL
+	OR	A
+	JP	NZ,FAIL
+	EXPECT_BYTE A_CH_STATE, 0	; free again: what CONNECT demands
+	EXPECT_BYTE A_CTX0 + CTX_STATE, TCP_STATE_CLOSED
+
 	JP	PASS
 
 ; ------------------------------------------------------

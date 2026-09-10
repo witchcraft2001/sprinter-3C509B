@@ -244,4 +244,4 @@ fi
 
 image_size="$(wc -c < "$tmp_dir/image_0020.bin" | tr -d ' ')"
 cold_size="$(wc -c < "$tmp_dir/cold.bin" | tr -d ' ')"
-echo "Stage 14 ASM: shipped image == stand-alone build, libman relocation to WIN1/WIN2 == direct assembly, 40 entry-point vectors in WIN1 and WIN2, window-3 refusal, 72 cold-overlay vectors, 17 passive-open vectors passed (image $image_size bytes, cold $cold_size bytes, deepest cold stack $cold_depth of 96)"
+echo "Stage 14 ASM: shipped image == stand-alone build, libman relocation to WIN1/WIN2 == direct assembly, 40 entry-point vectors in WIN1 and WIN2, window-3 refusal, 72 cold-overlay vectors, 18 passive-open vectors passed (image $image_size bytes, cold $cold_size bytes, deepest cold stack $cold_depth of 96)"

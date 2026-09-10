@@ -693,25 +693,14 @@ F_CLOSE
 	LD	(UNET_STAGE),A
 	LD	A,(UNET_ARG_A)
 	CALL	@TCPX.CLOSE
-; RELEASE_OR_REARM: the tail of CLOSE, also called by F_RECV when the peer
-; closes the accepted connection on us. In: UNET_ARG_A = channel, its TCPX
-; context already closed. Out: A=0.
-; IS_ACCEPTED_LISTEN: does UNET_ARG_A name the channel LISTEN accepted?
-; Out: CF=1 yes, CF=0 no. Trashes A/HL.
-IS_ACCEPTED_LISTEN
-	LD	A,(UNET_LISTEN_ACCEPTED)
-	OR	A
-	RET	Z			; CF=0 from OR A: nothing was accepted
-	LD	A,(UNET_LISTEN_CHANNEL)
-	LD	HL,UNET_ARG_A
-	CP	(HL)
-	JR	Z,.yes
-	OR	A			; CF=0: some other channel
-	RET
-.yes
-	SCF
-	RET
-
+; RELEASE_OR_REARM: the tail of CLOSE -- it MUST stay immediately below the
+; call above, because that is how CLOSE reaches it. It is also called
+; outright by F_RECV when the peer closes the accepted connection on us.
+; In: UNET_ARG_A = channel, its TCPX context already closed. Out: A=0.
+; Anything placed between the two releases nothing and returns A=0 anyway,
+; so CLOSE still reports success while the channel stays marked open -- and
+; the NEXT CONNECT on it answers NERR_STATE. One transfer works, every one
+; after it fails to connect.
 RELEASE_OR_REARM
 	CALL	IS_ACCEPTED_LISTEN
 	JR	NC,.plain_close
@@ -730,6 +719,22 @@ RELEASE_OR_REARM
 	CALL	CH_STATE_PTR
 	LD	(HL),0
 	XOR	A
+	RET
+
+; IS_ACCEPTED_LISTEN: does UNET_ARG_A name the channel LISTEN accepted?
+; Out: CF=1 yes, CF=0 no. Trashes A/HL.
+IS_ACCEPTED_LISTEN
+	LD	A,(UNET_LISTEN_ACCEPTED)
+	OR	A
+	RET	Z			; CF=0 from OR A: nothing was accepted
+	LD	A,(UNET_LISTEN_CHANNEL)
+	LD	HL,UNET_ARG_A
+	CP	(HL)
+	JR	Z,.yes
+	OR	A			; CF=0: some other channel
+	RET
+.yes
+	SCF
 	RET
 
 ; ------------------------------------------------------
