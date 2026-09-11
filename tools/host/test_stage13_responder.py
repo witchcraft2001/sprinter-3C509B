@@ -168,6 +168,10 @@ class Stage13ResponderTest(unittest.TestCase):
         head, partial_body = received.split(b"\r\n\r\n", 1)
         self.assertIn(b"200 OK", head)
         self.assertIn(f"Content-Length: {len(stage13.HTTP_LARGE)}".encode(), head)
+        self.assertIn(b"Connection: keep-alive", head)
+        self.assertFalse(any(stage11.parse_tcp(frame)["flags"] & 1
+                             for _, frame in replies),
+                         "HTTP responder must not delimit the benchmark with FIN")
         self.assertEqual(partial_body, stage13.HTTP_LARGE[:len(partial_body)])
 
     def test_http_fixture_is_its_own_large_body_not_ftps(self):
@@ -176,7 +180,7 @@ class Stage13ResponderTest(unittest.TestCase):
         # that a transfer can't complete inside one RTC second and get
         # rejected by DLSPEED's own "sample too short" check.
         self.assertNotEqual(len(stage13.HTTP_LARGE), len(stage13.LARGE))
-        self.assertGreaterEqual(len(stage13.HTTP_LARGE), 512 * 1024)
+        self.assertEqual(len(stage13.HTTP_LARGE), 4 * 1024 * 1024)
 
     def test_control_lines_are_logged_verbatim(self):
         # Diagnostic aid: a mismatch between what ftp.asm typed on screen and

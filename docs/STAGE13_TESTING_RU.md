@@ -5,6 +5,22 @@ FTP/host responder на `192.168.7.44` (имя `ftp.stage13.test`). До зап�
 подготовьте образ и запустите responder в том же host-only Ethernet-сегменте.
 Сохраните его текстовый лог и pcap на протяжении всей проверки.
 
+Для реального Sprinter raw-Ethernet responder на `feth1` не используется: это
+виртуальный интерфейс MAME. На Mac запустите TCP-режим на адресе физического
+интерфейса (например, `192.168.1.36`), подключённого к той же сети:
+
+```text
+STAGE13_HTTP_BIND=192.168.1.36 tools/stage13-mame.sh responder-http
+```
+
+Либо передайте адрес явно: `tools/stage13-mame.sh responder-http
+192.168.1.36 8080`. По умолчанию используется непривилегированный TCP-порт
+8080; в DSS в этом случае укажите один и тот же URL
+`http://192.168.1.36:8080/` для `DLDIRECT` и `DLSPEED`. Порт 80 можно выбрать
+через `STAGE13_HTTP_PORT=80` (на macOS для него может потребоваться `sudo`).
+Запись pcap для физического теста
+делается отдельно (`tcpdump`/Wireshark) на том же Ethernet-интерфейсе.
+
 В DSS выполните по порядку (responder — профиль `clean`, см. ниже про
 единственное исключение):
 
@@ -18,7 +34,11 @@ FTP ftp.stage13.test SMALL.BIN -o COPY.BIN -y
 FTP ftp.stage13.test PUT COPY.BIN -o UPLOAD.BIN
 FTP ftp.stage13.test LARGE.BIN -r
 DLSPEED /?
+DLDIRECT /?
+DLDIRECT http://ftp.stage13.test/
 DLSPEED http://ftp.stage13.test/
+DLSPEED http://ftp.stage13.test/
+DLDIRECT http://ftp.stage13.test/
 ```
 
 **Отдельно, после перезапуска responder'а с `--profile refuse-pass`**
@@ -63,20 +83,21 @@ fixture, **без задвоения уже скачанной части**: res
 без зависания. Повторите этот файл с `-r` и убедитесь, что содержимое
 восстановлено полностью.
 
-`DLSPEED` печатает `Waiting for RTC edge; transfer is silent until done...`,
-затем (без промежуточного вывода) `Received: N bytes`, строку `N bytes in S
-sec, R KB/s` и `RESULT OK`. `stage13_responder.py` теперь сам отвечает и на
-обычный HTTP GET (любой путь — отдаёт отдельную 512-КиБ фикстуру `HTTP_LARGE`,
-не путать с FTP-шным 3000-байтным `LARGE.BIN`), так что DLSPEED работает
-против того же responder'а, без переключения на образ/responder Stage 12.
-512 КиБ выбраны намеренно: RTC тикает целыми секундами, и файл, укладывающийся
-в одну секунду (как 70-килобайтный `LARGE.BIN` из Stage 12 на виртуальном
-линке — 68 КБ/с за 1 сек), либо получает от самого DLSPEED отказ "sample too
-short", либо даёт грубую, недостоверную оценку KB/s (см. `docs/DLSPEED.md`,
-там же рекомендованы "at least 512 KiB"). Совместно с приёмкой этого этапа
-сравните измеренную скорость с прежними ~3 КБ/с (до исправления TCP receive
-window, см. `specs.md`) — ожидается
-кратно более высокое и равномерное значение.
+Обе утилиты печатают `Waiting for RTC edge; transfer is silent until done...`,
+затем без промежуточного вывода `Received: 4194304 bytes`, строку `N bytes in
+S sec, R KB/s` и `RESULT OK`. `DLDIRECT` — оптимизированный прямой путь;
+`DLSPEED` загружает расположенный рядом `UNET509B.DLL` и измеряет публичный
+UNET/libman путь. `stage13_responder.py` отвечает на обычный HTTP GET любой
+4-МиБ фикстурой `HTTP_LARGE` с `Content-Length` и keep-alive (не путать с
+FTP-шным 3000-байтным `LARGE.BIN`). Поэтому клиент обязан остановиться точно
+на объявленной длине и закрыться штатным FIN без RST, не ожидая FIN сервера.
+
+Порядок запуска уже образует первый блок двухточечного сравнения:
+`DLDIRECT`, `DLSPEED`, `DLSPEED`, `DLDIRECT`. Повторяйте его, пока не будет
+минимум пяти успешных результатов каждой утилиты, затем сравните медианы на
+одном стенде. Строгого порога нет; разность медиан — полная цена публичного
+DLL-пути. Для каждой утилиты обязателен успешный повторный запуск без
+зависания. Подробности и формат записи — в `docs/DLSPEED.md`.
 
 Отдельно проверьте скорость отдачи. Загрузите на сервер файл заведомо больше
 двух сегментов — подойдёт `LARGE.BIN`, лучше несколько десятков килобайт:
@@ -99,6 +120,6 @@ FTP ftp.stage13.test PUT LARGE.BIN -o BIG_UP.BIN
 ошибки логина, resume, PUT и Esc/Ctrl+C; responder log; pcap (проверьте SYN на
 управляющий порт 21, ответ `227` и SYN на объявленный порт данных, до 5
 сегментов в очереди и отсутствие `win=0`); checksum образа, `FTP.EXE`,
-`DLSPEED.EXE`, fixtures и файлов, извлечённых из FAT12. Заполните
+`DLSPEED.EXE`, `DLDIRECT.EXE`, fixtures и файлов, извлечённых из FAT12. Заполните
 `docs/evidence/STAGE13_TEST_TEMPLATE.md`. До наличия этих файлов MAME-флажок в
 `specs.md` остаётся открытым; проверка реальной карты выполняется отдельно.

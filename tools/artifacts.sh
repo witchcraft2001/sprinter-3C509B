@@ -28,6 +28,7 @@ IMG_ARTIFACTS=(
   "binary|build/WGET.EXE|WGET.EXE"
   "binary|build/FTP.EXE|FTP.EXE"
   "binary|build/DLSPEED.EXE|DLSPEED.EXE"
+  "binary|build/DLDIRECT.EXE|DLDIRECT.EXE"
   "binary|build/NETPROF.EXE|NETPROF.EXE"
   "binary|build/UNET509B.DLL|UNET509B.DLL"
   "binary|build/UNETTEST.EXE|UNETTEST.EXE"

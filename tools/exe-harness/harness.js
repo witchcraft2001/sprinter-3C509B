@@ -1512,8 +1512,9 @@ function runExe(exePath, args = '', inputScenario = {}) {
   const ram = freshPage(0x10000);
   for (let i = 0; i < exe.length; i++) ram[loadAddress + i] = exe[i];
   const card = new EtherLinkIII(scenario);
-  let page3 = 3, systemIsa = false, isaOpen = false, selectedSlot = 0;
-  let win1 = null, win2 = null, nextBlock = 16;
+  let page0 = 0, page1 = 1, page2 = 2, page3 = 3;
+  let systemIsa = false, isaOpen = false, selectedSlot = 0;
+  let win0 = null, win1 = null, win2 = null, win3 = null, nextBlock = 16;
   // memoryAccesses matches MAME's do_mem_wait cost currency (every rd/wr is a
   // padded bus slot in turbo); isaSessions counts distinct ISA-window opens,
   // i.e. each 0x9fbd mapping sequence below. Round-2 throughput gates read
@@ -1563,6 +1564,8 @@ function runExe(exePath, args = '', inputScenario = {}) {
       if (card.active && port >= card.base && port < card.base + 0x10) return card.readByte(port - card.base);
       return 0xff;
     }
+    if (address >= 0xc000 && win3 !== null) return pages.get(win3)[address - 0xc000];
+    if (address < 0x4000 && win0 !== null) return pages.get(win0)[address];
     if (address >= 0x4000 && address < 0x8000 && win1 !== null) return pages.get(win1)[address - 0x4000];
     if (address >= 0x8000 && address < 0xc000 && win2 !== null) return pages.get(win2)[address - 0x8000];
     return ram[address];
@@ -1578,6 +1581,8 @@ function runExe(exePath, args = '', inputScenario = {}) {
       if (card.active && port >= card.base && port < card.base + 0x10) return card.writeByte(port - card.base, value);
       return;
     }
+    if (address >= 0xc000 && win3 !== null) { pages.get(win3)[address - 0xc000] = value; return; }
+    if (address < 0x4000 && win0 !== null) { pages.get(win0)[address] = value; return; }
     if (address >= 0x4000 && address < 0x8000 && win1 !== null) { pages.get(win1)[address - 0x4000] = value; return; }
     if (address >= 0x8000 && address < 0xc000 && win2 !== null) { pages.get(win2)[address - 0x8000] = value; return; }
     ram[address] = value;
@@ -1588,7 +1593,10 @@ function runExe(exePath, args = '', inputScenario = {}) {
     mem_write: wr,
     io_read: (port) => {
       port &= 0xffff;
-      if (port === 0x00e2) return page3;
+      if ((port & 0xff) === 0x82) return page0;
+      if ((port & 0xff) === 0xa2) return page1;
+      if ((port & 0xff) === 0xc2) return page2;
+      if ((port & 0xff) === 0xe2) return page3;
       throw new Error(`unknown I/O read ${port.toString(16)}`);
     },
     io_write: (port, value) => {
@@ -1602,8 +1610,24 @@ function runExe(exePath, args = '', inputScenario = {}) {
         else throw new Error(`unknown PORT_SYSTEM value ${value.toString(16)}`);
         return;
       }
-      if (port === 0x00e2) {
+      if ((port & 0xff) === 0x82) {
+        page0 = value;
+        win0 = allocated(value) ? value : null;
+        return;
+      }
+      if ((port & 0xff) === 0xa2) {
+        page1 = value;
+        win1 = allocated(value) ? value : null;
+        return;
+      }
+      if ((port & 0xff) === 0xc2) {
+        page2 = value;
+        win2 = allocated(value) ? value : null;
+        return;
+      }
+      if ((port & 0xff) === 0xe2) {
         page3 = value;
+        win3 = allocated(value) ? value : null;
         if (systemIsa && (value === 0xd4 || value === 0xd6)) selectedSlot = (value - 0xd4) >> 1;
         return;
       }
@@ -1815,32 +1839,43 @@ function runExe(exePath, args = '', inputScenario = {}) {
         const base = nextBlock; nextBlock += count;
         allocations.set(base, count);
         for (let i = 0; i < count; i++) pages.set(base + i, freshPage(0x4000));
+        if (scenario.traceDss) dssEvents.push(`GETMEM ${base}+${count}`);
         s.a = base; setCarry(s, false); return ret(s);
       }
       case 0x39: {
         const page = s.a + s.b;
         if (!allocated(page)) throw new Error(`SETWIN1 of unallocated page ${page}`);
         if (loadAddress < 0x8000) throw new Error('SETWIN1 would remap the image window');
-        win1 = page; setCarry(s, false); return ret(s);
+        page1 = page; win1 = page; setCarry(s, false); return ret(s);
       }
       case 0x3a: {
         const page = s.a + s.b;
         if (!allocated(page)) throw new Error(`SETWIN2 of unallocated page ${page}`);
         if (loadAddress >= 0x8000) throw new Error('SETWIN2 would remap the image window');
-        win2 = page; setCarry(s, false); return ret(s);
+        page2 = page; win2 = page; setCarry(s, false); return ret(s);
+      }
+      case 0x3b: {
+        const page = s.a + s.b;
+        if (!allocated(page)) throw new Error(`SETWIN3 of unallocated page ${page}`);
+        if (isaOpen) throw new Error('SETWIN3 while ISA window is open');
+        page3 = page; win3 = page; setCarry(s, false); return ret(s);
       }
       case 0x3e: {
         const countPages = allocations.get(s.a);
         if (!countPages) throw new Error(`FREEMEM of unknown block ${s.a}`);
+        if (scenario.traceDss) dssEvents.push(`FREEMEM ${s.a}+${countPages}`);
         for (let i = 0; i < countPages; i++) pages.delete(s.a + i);
         allocations.delete(s.a);
+        if (!allocated(win0)) win0 = null;
         if (!allocated(win1)) win1 = null;
         if (!allocated(win2)) win2 = null;
+        if (!allocated(win3)) win3 = null;
         setCarry(s, false); return ret(s);
       }
       case 0x46: {
         if (s.b === 1) {
           const name = envKey(cstr((s.h << 8) | s.l));
+          if (scenario.traceDss) dssEvents.push(`GETENV ${name}`);
           if (!Object.prototype.hasOwnProperty.call(environment, name)) {
             s.a = 0; setCarry(s, false); return ret(s);
           }
@@ -1869,7 +1904,9 @@ function runExe(exePath, args = '', inputScenario = {}) {
       case 0x41:
         exitCode = s.b;
         if (isaOpen) throw new Error('EXIT with ISA window open');
-        if (allocations.size) throw new Error('EXIT with unreleased DSS pages');
+        if (allocations.size) throw new Error(`EXIT with unreleased DSS pages: ${
+          [...allocations.entries()].map(([id, count]) => `${id}+${count}`).join(', ')}; ` +
+          `output=${JSON.stringify(stdout)} events=${JSON.stringify(dssEvents)}`);
         if (openFiles.size) throw new Error('EXIT with unclosed files');
         cpu.setState(s);
         throw {dssExit: true};
@@ -1880,6 +1917,17 @@ function runExe(exePath, args = '', inputScenario = {}) {
           `trace=${pcTrace.map((value) => value.toString(16)).join(',')}`);
       }
     }
+  };
+
+  const bios = () => {
+    if (isaOpen) throw new Error('BIOS call while ISA window is open');
+    const s = cpu.getState();
+    spendCallerStack(s.sp);
+    if (s.c !== 0xc4) throw new Error(`unknown BIOS call ${s.c.toString(16)} ` +
+      `SP=${s.sp.toString(16)} trace=${pcTrace.map((value) => value.toString(16)).join(',')}`);
+    const page = s.a + s.b;
+    if (!allocated(page)) throw new Error(`BIOS EMM_FN4 of unallocated page ${page}`);
+    s.a = page; setCarry(s, false); return ret(s);
   };
 
   try {
@@ -1902,7 +1950,7 @@ function runExe(exePath, args = '', inputScenario = {}) {
           `stack=${Array.from({length: 8}, (_, offset) => rd((stopped.sp + offset) & 0xffff).toString(16).padStart(2, '0')).join('')} ` +
           `trace=${pcTrace.map((v) => v.toString(16)).join(',')}`);
       }
-      if (scenario.strictPc && cpu.getState().pc !== 0x0010 &&
+      if (scenario.strictPc && cpu.getState().pc !== 0x0008 && cpu.getState().pc !== 0x0010 &&
           (cpu.getState().pc < loadAddress || cpu.getState().pc >= loadAddress + exe.length))
         throw new Error(`PC escaped image: PC=${cpu.getState().pc.toString(16)} SP=${cpu.getState().sp.toString(16)} trace=${pcTrace.map((v) => v.toString(16)).join(',')}`);
       if (scenario.traceCpu) { pcTrace.push(cpu.getState().pc); if (pcTrace.length > 32) pcTrace.shift(); }
@@ -1918,7 +1966,9 @@ function runExe(exePath, args = '', inputScenario = {}) {
         delay.b = 0; delay.c = 1; cpu.setState(delay);
         delayLoops++;
       }
-      if (cpu.getState().pc === 0x0010) dss(); else cpu.run_instruction();
+      if (cpu.getState().pc === 0x0008 && win0 === null) bios();
+      else if (cpu.getState().pc === 0x0010 && win0 === null) dss();
+      else cpu.run_instruction();
       if (++steps > limit) throw new Error(`step limit at PC=${cpu.getState().pc.toString(16)} SP=${cpu.getState().sp.toString(16)} trace=${pcTrace.map((v) => v.toString(16)).join(',')}`);
     }
   } catch (error) {

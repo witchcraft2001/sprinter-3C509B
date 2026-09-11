@@ -526,12 +526,12 @@ assert.deepStrictEqual(outputFile(result, 'BEYOND.BIN'), BEYOND_WINDOW);
 checked(result);
 
 // ------------------------------------------------------------------
-// DLSPEED.EXE. Same stage, same acceptance run, so its scenarios live here
+// DLDIRECT.EXE. Same stage, same acceptance run, so its scenarios live here
 // rather than in a file of their own. The harness clock advances one second
 // per DSS_SYSTIME read unless a scenario freezes it, which is exactly the
 // knob the RTC-edge alignment and the zero-second rejection turn on.
 // ------------------------------------------------------------------
-const speedExe = path.join(root, 'build', 'DLSPEED.EXE');
+const speedExe = path.join(root, 'build', 'DLDIRECT.EXE');
 function speedScenario(tcp = {}, extra = {}) {
   return {
     strictPc: true, environment: staticEnv(), arp: {mac: [2, 0, 0, 0, 0, 44]},
@@ -542,7 +542,7 @@ function speedChecked(result) {
   assert.deepStrictEqual(result.cleanup, {isaClosed: true, pagesFreed: true, done: true});
   assert.strictEqual(result.minimumPageSp, null);
   assert.ok(result.minimumSp >= 0xbf00,
-    `DLSPEED stack reached the command copy: #${result.minimumSp.toString(16)}`);
+    `DLDIRECT stack reached the command copy: #${result.minimumSp.toString(16)}`);
   cases++;
 }
 
@@ -550,6 +550,84 @@ const speedImage = fs.readFileSync(speedExe);
 assert.strictEqual(speedImage.subarray(0, 4).toString('binary'), 'EXE\x01');
 assert.strictEqual(speedImage.readUInt16LE(16), 0x4100);
 assert.strictEqual(speedImage.readUInt16LE(20), 0xbff0);
+cases++;
+
+// The public-path client has the standard WIN2 EXE layout and performs its
+// APPINFO-near-EXE then cwd loader fallback before any network call. Full DLL
+// call semantics are covered by Stage 14 relocated-image vectors; these cases
+// verify CLI and loader cleanup in the actual DLSPEED image.
+const dllSpeedExe = path.join(root, 'build', 'DLSPEED.EXE');
+const dllSpeedImage = fs.readFileSync(dllSpeedExe);
+assert.strictEqual(dllSpeedImage.subarray(0, 4).toString('binary'), 'EXE\x01');
+assert.strictEqual(dllSpeedImage.readUInt16LE(16), 0x8100);
+assert.strictEqual(dllSpeedImage.readUInt16LE(20), 0x9ff0);
+cases++;
+
+result = runExe(dllSpeedExe, '/?', {strictPc: true});
+assert.strictEqual(result.exitCode, 0, result.output);
+assert.match(result.output, /public UNET509B\.DLL download path/);
+assert.match(result.output, /RESULT OK/);
+assert.deepStrictEqual(result.cleanup, {isaClosed: true, pagesFreed: true, done: true});
+cases++;
+
+result = runExe(dllSpeedExe, '', {strictPc: true});
+assert.strictEqual(result.exitCode, 1, result.output);
+assert.match(result.output, /missing or invalid URL/);
+assert.match(result.output, /RESULT FAIL/);
+assert.deepStrictEqual(result.cleanup, {isaClosed: true, pagesFreed: true, done: true});
+cases++;
+
+for (const url of ['http://192.168.7.44:0/BIG.BIN',
+  'http://192.168.7.44:65536/BIG.BIN']) {
+  result = runExe(dllSpeedExe, url, {strictPc: true});
+  assert.strictEqual(result.exitCode, 1, result.output);
+  assert.match(result.output, /missing or invalid URL/);
+  assert.match(result.output, /RESULT FAIL/);
+  assert.deepStrictEqual(result.cleanup, {isaClosed: true, pagesFreed: true, done: true});
+  cases++;
+}
+
+result = runExe(dllSpeedExe, 'http://192.168.7.44/BIG.BIN', {strictPc: true});
+assert.strictEqual(result.exitCode, 2, result.output);
+assert.match(result.output, /could not load UNET509B\.DLL/);
+assert.match(result.output, /RESULT FAIL/);
+assert.deepStrictEqual(result.cleanup, {isaClosed: true, pagesFreed: true, done: true});
+cases++;
+
+const unetDllImage = fs.readFileSync(path.join(root, 'build', 'UNET509B.DLL'));
+function assertBalancedDssBlocks(value) {
+  const allocated = value.dssEvents.filter((event) => event.startsWith('GETMEM '))
+    .map((event) => event.slice(7)).sort();
+  const freed = value.dssEvents.filter((event) => event.startsWith('FREEMEM '))
+    .map((event) => event.slice(8)).sort();
+  assert.deepStrictEqual(freed, allocated, value.dssEvents.join('\n'));
+}
+
+// Execute the real libman loader and UNET INIT/GETCAPS/SETOPT/NETINIT path.
+// No NET_* environment is supplied deliberately: NETINIT must fail cleanly,
+// and l_free must release both the DLL and its temporary cold-overlay page.
+result = runExe(dllSpeedExe, 'http://192.168.7.44/BIG.BIN', {
+  files: {'UNET509B.DLL': unetDllImage}, traceDss: true,
+  pageFill: 'random', pageSeed: 0x1357, dssStackBytes: 64,
+  stepLimit: 2_000_000_000,
+});
+assert.strictEqual(result.exitCode, 4, result.output);
+assert.match(result.output, /NETINIT failed/);
+assert.match(result.output, /RESULT FAIL/);
+assert.deepStrictEqual(result.cleanup, {isaClosed: true, pagesFreed: true, done: true});
+assertBalancedDssBlocks(result);
+cases++;
+
+// Once INIT has created a lib_table slot, even an error closing the source DLL
+// file must unload that slot instead of orphaning its DSS allocation.
+result = runExe(dllSpeedExe, 'http://192.168.7.44/BIG.BIN', {
+  files: {'UNET509B.DLL': unetDllImage}, traceDss: true,
+  fileCloseFailAt: 1, stepLimit: 2_000_000_000,
+});
+assert.strictEqual(result.exitCode, 2, result.output);
+assert.match(result.output, /could not load UNET509B\.DLL/);
+assert.deepStrictEqual(result.cleanup, {isaClosed: true, pagesFreed: true, done: true});
+assertBalancedDssBlocks(result);
 cases++;
 
 result = runExe(speedExe, '/?', speedScenario());
@@ -576,7 +654,7 @@ assert.match(result.output, /^ {2}\d+ bytes in \d+ sec, \d+ (?:KB|B)\/s$/m,
   `no honest rate line in:\n${result.output}`);
 assert.match(result.output, /RESULT OK/);
 // The measurement must never write the body to disk -- that is the whole
-// difference between DLSPEED and timing WGET.
+// difference between DLDIRECT and timing WGET.
 assert.deepStrictEqual(result.files, {});
 speedChecked(result);
 
@@ -646,7 +724,7 @@ const FAULT_BODY = Buffer.alloc(5000, 0x5a);
 // undamaged segment's checksum. FAST_RECEIVE must reject it (commit nothing,
 // send no ACK) and accept the good copy behind it, so the body still arrives
 // whole. Offset 9 is the first digit of the status code in "HTTP/1.0 200 OK":
-// DLSPEED discards the body, so only a corruption inside the header it does
+// DLDIRECT discards the body, so only a corruption inside the header it does
 // parse is observable at all -- accepting the damaged copy makes it print
 // "[E] HTTP/1.0 <garbage>00 OK" and fail, which is what makes this control
 // bite rather than pass either way.
@@ -658,7 +736,7 @@ for (const tcp of [{duplicateData: true}, {outOfOrderBeforeData: true},
   }));
   if (tcp.resetOnData) {
     // A mid-transfer RST is a real transfer failure, not a fault the
-    // download recovers from -- DLSPEED must report it, not hang or
+    // download recovers from -- DLDIRECT must report it, not hang or
     // silently under-report bytes.
     assert.notStrictEqual(result.exitCode, 0, `${JSON.stringify(tcp)}: ${result.output}`);
   } else {
@@ -669,7 +747,7 @@ for (const tcp of [{duplicateData: true}, {outOfOrderBeforeData: true},
   speedChecked(result);
 }
 
-// Response framing. Until this was fixed, DLSPEED ignored Content-Length
+// Response framing. Until this was fixed, the direct benchmark ignored Content-Length
 // entirely and treated the peer's FIN as the only end-of-body marker, so any
 // server that kept the connection open (HTTP/1.1 keep-alive is the default in
 // Python's own http.server, and "Connection: close" is only a request) made a
@@ -695,9 +773,9 @@ assert.match(result.output, /RESULT OK/);
 // Ended by the declared length, so the peer gets an orderly FIN and never an
 // RST -- the client must not abort a connection it finished with cleanly.
 const keepFlags = clientTcpFlags(result);
-assert.ok(keepFlags.some((flags) => flags & 0x01), 'DLSPEED never sent a FIN');
+assert.ok(keepFlags.some((flags) => flags & 0x01), 'DLDIRECT never sent a FIN');
 assert.ok(!keepFlags.some((flags) => flags & 0x04),
-  `DLSPEED reset a completed keep-alive connection: ${keepFlags.map((f) => f.toString(16))}`);
+  `DLDIRECT reset a completed keep-alive connection: ${keepFlags.map((f) => f.toString(16))}`);
 speedChecked(result);
 
 // A declared length the server never delivers is a truncated transfer, not a
@@ -732,6 +810,28 @@ assert.strictEqual(result.exitCode, 0, result.output);
 assert.match(result.output, /Received: 400 bytes/);
 speedChecked(result);
 
+// Header bytes may arrive in any segmentation, including one byte per TCP
+// segment. This exercises parser state across every CR/LF and field boundary.
+result = runExe(speedExe, 'http://192.168.7.44/SPLIT.BIN', speedScenario({
+  response: {raw: `HTTP/1.0 200 OK\r\nContent-Length: 400\r\n\r\n${'s'.repeat(400)}`},
+  responseChunkSize: 1, keepOpen: true,
+}));
+assert.strictEqual(result.exitCode, 0, result.output);
+assert.match(result.output, /Received: 400 bytes/);
+speedChecked(result);
+
+for (const response of [
+  {raw: 'HTTP/1.0 404 Not Found\r\nContent-Length: 0\r\n\r\n'},
+  {raw: 'HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nx\r\n0\r\n\r\n'},
+  {raw: 'HTTP/1.0 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 4\r\n\r\ngzip'},
+]) {
+  result = runExe(speedExe, 'http://192.168.7.44/REJECT.BIN', speedScenario({response}));
+  assert.strictEqual(result.exitCode, 6, result.output);
+  assert.match(result.output, /invalid or unsupported HTTP response/);
+  assert.match(result.output, /RESULT FAIL/);
+  speedChecked(result);
+}
+
 // remoteFinAfterData attaches FIN to the *next* chunk drainConnectionSendQueue
 // sends regardless of queue depth (see harness.js), so it only mirrors
 // TCPTEST's "FIN on the one and only reply" case when the whole body fits in
@@ -746,4 +846,4 @@ assert.strictEqual(result.exitCode, 0, result.output);
 assert.match(result.output, new RegExp(`Received: ${FIN_BODY.length} bytes`));
 speedChecked(result);
 
-console.log(`Stage 13 actual EXE: ${cases} FTP CLI/control-dialog/GET/PUT/LIST/resume/fault and DLSPEED scenarios passed`);
+console.log(`Stage 13 actual EXE: ${cases} FTP/DLDIRECT and DLSPEED loader/cleanup scenarios passed`);

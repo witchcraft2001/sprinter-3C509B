@@ -74,8 +74,12 @@ l_info:	jp	_L_INFO
 
 max_count equ	64			; макс. число загр. библиотек
 
+	IFDEF LIBMAN_EXTERNAL_TABLE
+lib_table EQU LIBMAN_TABLE_BASE		; caller-owned, explicitly cleared BSS
+	ELSE
 lib_table:
 	ds	256			; размер таблицы
+	ENDIF
 
 
 
@@ -115,7 +119,7 @@ _L_LOAD:
 	; под загрузку файла библы.
 	ld      bc,003Bh		; подкл. 1-ю страницу блока в 3-е окно
 	rst     10h
-	jp      c,llerr1		; ошибка подключения
+	jp      c,llerr1f		; ошибка подключения после выделения блока
 	pop     hl
 	ld	a,LR_OPEN		; NET: stage = opening the DLL file (HL=name)
 	ld	(l_reason),a
@@ -123,7 +127,7 @@ _L_LOAD:
 	ld      a,1			; на чтение
 	ld      c,11h
 	rst     10h
-	jp      c,llerr2
+	jp      c,llerr2f
 	ld      (llhand),a		; дескр. открытой библы
 	ld	a,LR_IO			; NET: from here failures are seek/read I/O
 	ld	(l_reason),a
@@ -466,7 +470,10 @@ ll10:	push    de
 	ld      a,(llid)		; дескр. выдел. блока из 2-х страниц
 	ld      c,3Eh			; освободить блок памяти
 	rst     10h
-	jp      c,llmem0		; NET: ошибка освобождения (LR_MEMORY; was llerr5)
+	jr      nc,.staging_freed
+	pop	ix			; discard table pointer before common unwind
+	jp	llmem0			; retry cleanup, but keep the first DSS error
+.staging_freed
 	pop     hl
 	ld      bc,lib_table		; 256 байт таблица библ
 	sbc     hl,bc
@@ -484,7 +491,7 @@ lloldw:	ld      a,-1			; сохр. начальная Page3
 	ld      a,(llhand)		; дескр. библы
 	ld      c,12h			; закрыть файл
 	rst     10h
-	jr      c,llerr1		; ошибка закрытия
+	jr      c,llclose0		; loaded slot must be released on close failure
 	pop	hl
 	pop	af
 	pop	de
@@ -517,6 +524,24 @@ lloldw:	ld      a,-1			; сохр. начальная Page3
 	call	l_free			; выгрузить библу
 	pop	af
 	ret
+
+; The DLL is already allocated, entered in lib_table and INIT was called.
+; A file-close failure must not orphan that handle: remove the saved return
+; pair, unload the slot, then use the ordinary four-word entry unwind.
+llclose0:
+	ld	(l_dsserr),a
+	ld	a,LR_IO
+	ld	(l_reason),a
+	pop	hl			; loaded handle saved above the INIT result
+	call	l_free
+	ld	a,(llhand)		; one bounded best-effort retry of the failed close
+	ld	c,12h
+	rst	10h
+	pop	af			; discard saved INIT A/CF
+	pop	de			; requested window was already popped at ll8c
+	pop	iy
+	pop	ix
+	jr	llerr3
 	;
 	; NET: failure-reason ladder. Each entry records LIBMAN.l_reason (stage)
 	; and LIBMAN.l_dsserr (the raw DSS/INIT code) so a consumer can report WHY
@@ -547,6 +572,12 @@ llerr0c:
 	ld      a,(llhand)		; дескр. библы
 	ld      c,12h			; закрыть файл
 	rst     10h
+	jr	nc,.closed
+	ld	a,(llhand)		; bounded retry; the primary error is in l_dsserr
+	ld	c,12h
+	rst	10h
+.closed
+	call	llrelease		; release the two-page staging block + WIN3
 	jr      llerr2c			; NET: keep the recorded error (skip re-store)
 	;
 llerr1:	pop     hl
@@ -558,6 +589,25 @@ llerr2c:
 	pop	ix
 llerr3:	scf
 	ld	a,-1
+	ret
+
+; Failure after DSS_GETMEM succeeded. Preserve the primary DSS error while
+; releasing the temporary two-page loader block and restoring the caller's
+; WIN3 mapping. The upstream paths leaked both on SETWIN/OPEN failures.
+llerr1f:
+	pop	hl			; filename saved by _L_LOAD is still on stack
+llerr2f:
+	call	llrelease
+	jr	llerr2
+
+llrelease:
+	push	af
+	ld	a,(llid)
+	ld	c,3Eh
+	rst	10h
+	ld	a,(lloldw+1)
+	out	(0E2h),a
+	pop	af
 	ret
 
 llbuf:	ds	16			; буфер первых 16-ти байт заголовка
@@ -636,6 +686,7 @@ _L_FREE:
 	ld      b,max_count		; 64 макс. число загр. библиотек
 	ld      e,0
 lf1:	ld      a,(hl)
+	or	a			; LD does not set Z: test this slot's occupancy explicitly
 	jr      z,lf2
 	inc     hl
 	ld      a,(hl)

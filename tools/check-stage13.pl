@@ -13,7 +13,8 @@ sub slurp {
 }
 
 my @sources = qw(
-    src/apps/ftp.asm src/apps/dlspeed.asm src/lib/stage9_cli.asm
+    src/apps/ftp.asm src/apps/dlspeed.asm src/apps/dldirect.asm src/lib/http_stream.asm
+    src/lib/stage9_cli.asm src/lib/libman13.asm
     src/lib/file.asm src/lib/tcp_transport.asm src/lib/netdrv.asm
     src/include/memory.inc src/include/dss.inc tools/exe-harness/harness.js
 );
@@ -25,22 +26,43 @@ die "Stage 13 added EEPROM writes\n"
 
 my $ftp = slurp('src/apps/ftp.asm', 0);
 my $dlspeed = slurp('src/apps/dlspeed.asm', 0);
+my $dldirect = slurp('src/apps/dldirect.asm', 0);
+my $libman = slurp('src/lib/libman13.asm', 0);
 die "Stage 13 FTP contains an unbounded interrupt wait\n" if $ftp =~ /\b(?:HALT|EI)\b/;
 die "Stage 13 DLSPEED contains an unbounded interrupt wait\n" if $dlspeed =~ /\b(?:HALT|EI)\b/;
 
 die "FTP is not polling-only with finite control/data timeouts\n"
     unless $ftp =~ /FTP_REPLY_TIMEOUT_MS\s+EQU\s+\d+/ &&
            $ftp =~ /FTP_DATA_IDLE_MS\s+EQU\s+\d+/;
-die "DLSPEED RTC alignment is not finitely bounded\n"
-    unless $dlspeed =~ /RTC_ALIGN_TIMEOUT_MS\s+EQU\s+\d+/ &&
-           $dlspeed =~ /WAIT_RTC_EDGE/;
+die "DLDIRECT RTC alignment is not finitely bounded\n"
+    unless $dldirect =~ /RTC_ALIGN_TIMEOUT_MS\s+EQU\s+\d+/ &&
+           $dldirect =~ /WAIT_RTC_EDGE/;
 # The countdown that bounds WAIT_RTC_EDGE must live in memory, not a register
 # kept live across @S9APP.SECONDS: that call's own RST DSS returns HL as part
 # of DSS_SYSTIME's result, so a live-in-HL countdown is silently clobbered
 # every iteration and the loop never reaches zero on a frozen/unavailable
 # clock -- exactly the hang this bound exists to prevent.
-die "DLSPEED's WAIT_RTC_EDGE keeps its timeout bound in a register instead of memory\n"
-    unless $dlspeed =~ /LD\s+\(W12_WORK32\),HL\s*\n\.LOOP/;
+die "DLDIRECT's WAIT_RTC_EDGE keeps its timeout bound in a register instead of memory\n"
+    unless $dldirect =~ /LD\s+\(W12_WORK32\),HL\s*\n\.LOOP/;
+die "DLSPEED DLL receive is not a single finite 15-second wait\n"
+    unless $dlspeed =~ /HTTP_IDLE_MS\s+EQU\s+15000/ &&
+           $dlspeed =~ /LD\s+IY,HTTP_IDLE_MS/ &&
+           $dlspeed =~ /JP\s+Z,RECV_IDLE_FAIL/;
+for my $fn (qw(SETOPT NETINIT CONNECT SEND RECV CLOSE NETDONE)) {
+    die "DLSPEED does not use UNET $fn\n" unless $dlspeed =~ /UNET_FN_$fn/;
+}
+die "DLSPEED bypasses the public DLL path\n"
+    if $dlspeed =~ /tcp_transport\.asm|el3_io\.asm|TCPX[.]/i;
+die "DLSPEED does not free its libman handle in common cleanup\n"
+    unless $dlspeed =~ /CLEANUP[\s\S]*?CALL\s+LIBMAN\.l_free/;
+die "libman l_free still tests stale flags instead of slot occupancy\n"
+    unless $libman =~ /lf1:\s*ld\s+a,\(hl\)\s*\n\s*or\s+a[^\n]*\n\s*jr\s+z,lf2/;
+die "libman close-failure path does not unload an allocated DLL slot\n"
+    unless $libman =~ /llclose0:[\s\S]*?call\s+l_free[\s\S]*?pop\s+de[\s\S]*?pop\s+iy[\s\S]*?pop\s+ix[\s\S]*?jr\s+llerr3/;
+die "direct benchmark lost its throughput feature set\n"
+    unless $dldirect =~ /DEFINE\s+FAST_DATAPATH/ &&
+           $dldirect =~ /DEFINE\s+TCPX_DIRECT_RX/ &&
+           $dldirect =~ /DEFINE\s+EL3_SESSION_RX/;
 
 die "FTP client is not PASV-only (found an active-mode PORT command or a LISTEN call)\n"
     if $ftp =~ /DB\s+"PORT[\s"]|CMD_PORT|\bLISTEN\b/;
@@ -74,7 +96,7 @@ die "FTP golden outputs are not pinned to the sibling revision\n"
 die "FTP golden lost the 226 the two-channel design exists to preserve\n"
     unless $golden =~ /"get":[^\n]*226 Transfer complete/;
 
-for my $exe_name (qw(FTP DLSPEED)) {
+for my $exe_name (qw(FTP DLDIRECT)) {
     my $exe = slurp("build/$exe_name.EXE", 1);
     die "$exe_name.EXE has invalid DSS header\n"
         unless substr($exe, 0, 4) eq "EXE\x01" && unpack('v', substr($exe, 4, 2)) == 128 &&
@@ -85,18 +107,33 @@ for my $exe_name (qw(FTP DLSPEED)) {
     my $payload = substr($exe, 128);
     die "$exe_name.EXE contains zero-filled runtime BSS\n" if $payload =~ /\x00{128}/;
 }
+{
+    my $exe = slurp('build/DLSPEED.EXE', 1);
+	die "DLSPEED.EXE has invalid standard DSS header\n"
+		unless substr($exe, 0, 4) eq "EXE\x01" && unpack('v', substr($exe, 4, 2)) == 128 &&
+		       unpack('v', substr($exe, 16, 2)) == 0x8100 &&
+		       unpack('v', substr($exe, 20, 2)) == 0x9FF0;
+	die "DLSPEED.EXE overlaps its 256-byte ABI stack reserve\n"
+		if 0x8080 + length($exe) > 0x9EF0;
+    die "DLSPEED.EXE contains zero-filled runtime BSS\n"
+        if substr($exe, 128) =~ /\x00{128}/;
+}
 
 die "FTP usage string missing\n" unless $ftp =~ /Usage:/;
 for my $text ('"anonymous"', '"anonymous@"') {
     die "FTP default login string missing: $text\n" unless $code =~ /\Q$text\E/;
 }
-for my $text ('Usage:', 'RTC edge') {
+for my $text ('Usage:', 'RTC edge', 'UNET509B.DLL') {
     die "DLSPEED user string missing: $text\n" unless $dlspeed =~ /\Q$text\E/;
+}
+for my $text ('Usage:', 'RTC edge', 'DLDIRECT') {
+    die "DLDIRECT user string missing: $text\n" unless $dldirect =~ /\Q$text\E/;
 }
 
 my $artifacts = slurp('tools/artifacts.sh', 0);
 for my $required ('build/FTP.EXE|FTP.EXE', 'docs/FTP.md|FTP.TXT',
                   'build/DLSPEED.EXE|DLSPEED.EXE', 'docs/DLSPEED.md|DLSPEED.TXT',
+                  'build/DLDIRECT.EXE|DLDIRECT.EXE',
                   'docs/STAGE13_TESTING_RU.md|S13TEST.TXT') {
     die "Stage 13 IMG artifact missing: $required\n"
         unless $artifacts =~ /IMG_ARTIFACTS[\s\S]*?\Q$required\E/;
@@ -105,7 +142,7 @@ my ($zip) = $artifacts =~ /(ZIP_ARTIFACTS[\s\S]*)/;
 die "FTP user artifacts are missing from ZIP\n"
     unless $zip && $zip =~ /build\/FTP\.EXE\|FTP\.EXE/ && $zip =~ /docs\/FTP\.md\|FTP\.TXT/;
 die "Stage 13 developer/test artifacts leaked into ZIP\n"
-    if $zip =~ /DLSPEED|S13TEST|STAGE13_TEST/i;
+    if $zip =~ /DLSPEED|DLDIRECT|S13TEST|STAGE13_TEST/i;
 
 if (-f File::Spec->catfile($root, 'tools/host/stage13_responder.py')) {
     my $responder = slurp('tools/host/stage13_responder.py', 0);

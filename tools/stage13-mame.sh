@@ -26,6 +26,14 @@ case "${1:-}" in
       --pcap "$evidence_dir/stage13.pcap" --log "$evidence_dir/stage13.log" \
       --profile "$profile"
     ;;
+  responder-http)
+    # Host TCP mode is intended for a real Sprinter.  Unlike the raw MAME
+    # responder it binds an address assigned to a physical interface.
+    http_bind="${2:-${STAGE13_HTTP_BIND:-192.168.7.44}}"
+    http_port="${3:-${STAGE13_HTTP_PORT:-8080}}"
+    exec python3 "$script_dir/host/stage13_http_server.py" \
+      --bind "$http_bind" --port "$http_port"
+    ;;
   mame)
     [ -f "$image" ] || { echo "Run tools/stage13-mame.sh prepare first" >&2; exit 2; }
     mkdir -p "$stage_dir/cfg"
@@ -42,14 +50,16 @@ case "${1:-}" in
     cmp "$repo_root/build/FTP.EXE" "$stage_dir/extracted/FTP.EXE"
     mcopy -i "$image" -o ::DLSPEED.EXE "$stage_dir/extracted/DLSPEED.EXE"
     cmp "$repo_root/build/DLSPEED.EXE" "$stage_dir/extracted/DLSPEED.EXE"
+    mcopy -i "$image" -o ::DLDIRECT.EXE "$stage_dir/extracted/DLDIRECT.EXE"
+    cmp "$repo_root/build/DLDIRECT.EXE" "$stage_dir/extracted/DLDIRECT.EXE"
     python3 "$script_dir/host/stage13_responder.py" \
       --check-pcap "$evidence_dir/stage13.pcap"
     hash_tool=(shasum -a 256)
     if command -v sha256sum >/dev/null 2>&1; then hash_tool=(sha256sum); fi
     {
       echo "Stage 13 evidence summary"
-      echo "Verification: PASS (fixtures, extracted IMG files, FTP/DLSPEED copies and pcap contract)"
-      "${hash_tool[@]}" "$image" "$repo_root/build/FTP.EXE" "$repo_root/build/DLSPEED.EXE" \
+      echo "Verification: PASS (fixtures, extracted IMG files, FTP/DLSPEED/DLDIRECT copies and pcap contract)"
+      "${hash_tool[@]}" "$image" "$repo_root/build/FTP.EXE" "$repo_root/build/DLSPEED.EXE" "$repo_root/build/DLDIRECT.EXE" \
         "$fixture_dir"/*.BIN "$stage_dir/extracted"/*.BIN \
         "$evidence_dir/stage13.log" "$evidence_dir/stage13.pcap"
     } > "$evidence_dir/SUMMARY.txt"
@@ -60,7 +70,7 @@ case "${1:-}" in
       --check-pcap "${2:-$evidence_dir/stage13.pcap}"
     ;;
   *)
-    echo "usage: tools/stage13-mame.sh {prepare|responder|mame|verify|pcap-check [PCAP]}" >&2
+    echo "usage: tools/stage13-mame.sh {prepare|responder|responder-http [BIND [PORT]]|mame|verify|pcap-check [PCAP]}" >&2
     exit 2
     ;;
 esac

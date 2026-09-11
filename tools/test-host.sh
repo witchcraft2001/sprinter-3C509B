@@ -55,7 +55,8 @@ python3 -c 'import ast,sys; [ast.parse(open(p, encoding="utf-8").read(), filenam
 python3 -c 'import ast,sys; [ast.parse(open(p, encoding="utf-8").read(), filename=p) for p in sys.argv[1:]]' \
   "$script_dir/host/stage12_responder.py" "$script_dir/host/test_stage12_responder.py"
 python3 -c 'import ast,sys; [ast.parse(open(p, encoding="utf-8").read(), filename=p) for p in sys.argv[1:]]' \
-  "$script_dir/host/stage13_responder.py" "$script_dir/host/test_stage13_responder.py"
+  "$script_dir/host/stage13_responder.py" "$script_dir/host/test_stage13_responder.py" \
+  "$script_dir/host/stage13_http_server.py"
 python3 -c 'import ast,sys; [ast.parse(open(p, encoding="utf-8").read(), filename=p) for p in sys.argv[1:]]' \
   "$script_dir/host/stage14_responder.py" "$script_dir/host/test_stage14_responder.py"
 sh -n "$script_dir/3com.sh"
@@ -128,6 +129,7 @@ node "$script_dir/test-stage9-exe.js"
 node "$script_dir/test-stage10-exe.js"
 node "$script_dir/test-stage11-exe.js"
 node "$script_dir/test-stage12-exe.js"
+"$script_dir/test-http-stream-asm.sh"
 node "$script_dir/test-stage13-exe.js"
 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$script_dir/host" \
   python3 "$script_dir/host/test_ethernet_helper.py"
@@ -158,7 +160,7 @@ text_copy="$(mktemp "${TMPDIR:-/tmp}/sprinter-509b-text.XXXXXX")"
 binary_copy="$(mktemp "${TMPDIR:-/tmp}/sprinter-509b-binary.XXXXXX")"
 trap 'rm -f "$expected_img" "$expected_zip" "$actual_names" "$text_copy" "$binary_copy"' EXIT
 
-printf '%s\n' ARP.EXE ARP.TXT CONNECT.BAT DLSPEED.EXE DLSPEED.TXT EL3EEP.EXE EL3INFO.EXE EL3INFO.TXT EL3LB.EXE EL3LB.TXT EL3REG.EXE EL3REG.TXT EL3RX.EXE EL3RX.TXT EL3TX.EXE EL3TX.TXT FTP.EXE FTP.TXT HELLO.EXE HOWTO.TXT IFUP.EXE IFUP.TXT ISAPROBE.EXE \
+printf '%s\n' ARP.EXE ARP.TXT CONNECT.BAT DLDIRECT.EXE DLSPEED.EXE DLSPEED.TXT EL3EEP.EXE EL3INFO.EXE EL3INFO.TXT EL3LB.EXE EL3LB.TXT EL3REG.EXE EL3REG.TXT EL3RX.EXE EL3RX.TXT EL3TX.EXE EL3TX.TXT FTP.EXE FTP.TXT HELLO.EXE HOWTO.TXT IFUP.EXE IFUP.TXT ISAPROBE.EXE \
   LICENSE.TXT NETCFG.EXE NETCFG.TXT NETPROF.EXE NETSMPL.CFG NSLOOKUP.EXE NSLOOKUP.TXT NTP.EXE NTP.TXT PING.EXE PING.TXT PINGALT.EXE README.TXT READMERU.TXT S10TEST.TXT S11TEST.TXT S12TEST.TXT S13TEST.TXT S14TEST.TXT S9TEST.TXT TCPTEST.EXE TCPTEST.TXT TESTING.TXT TFTP.EXE TFTP.TXT UDPTEST.EXE UDPTEST.TXT UNET509B.DLL UNET509B.TXT UNETTEST.EXE USAGE.TXT WGET.EXE WGET.TXT \
   | LC_ALL=C sort > "$expected_img"
 artifact_names IMG | LC_ALL=C sort > "$actual_names"
@@ -197,7 +199,7 @@ if artifact_names ZIP | grep -Eq '^S12TEST\.'; then
   echo "Error: Stage 12 developer testing document found in ZIP manifest" >&2
   exit 1
 fi
-if artifact_names ZIP | grep -Eq '^(DLSPEED|S13TEST)\.'; then
+if artifact_names ZIP | grep -Eq '^(DLSPEED|DLDIRECT|S13TEST)\.'; then
   echo "Error: Stage 13 developer artifacts found in ZIP manifest" >&2
   exit 1
 fi
@@ -222,7 +224,7 @@ if iconv -f CP866 -t UTF-8 "$text_copy" | grep -Eqi \
   exit 1
 fi
 
-for binary in HELLO EL3INFO EL3EEP EL3REG EL3LB EL3TX EL3RX ISAPROBE NETCFG IFUP ARP PING PINGALT UDPTEST TFTP NSLOOKUP NTP TCPTEST WGET FTP DLSPEED UNETTEST; do
+for binary in HELLO EL3INFO EL3EEP EL3REG EL3LB EL3TX EL3RX ISAPROBE NETCFG IFUP ARP PING PINGALT UDPTEST TFTP NSLOOKUP NTP TCPTEST WGET FTP DLSPEED DLDIRECT UNETTEST; do
   artifact_copy binary "$repo_root/build/$binary.EXE" "$binary_copy" "$script_dir"
   cmp "$repo_root/build/$binary.EXE" "$binary_copy"
 done
@@ -235,7 +237,7 @@ if [ "$version" != "0.0.1" ] || ! grep -q 'PACKAGE_VERSION.*"0.0.1"' \
   echo "Error: package version declarations disagree" >&2
   exit 1
 fi
-for binary in EL3INFO EL3EEP EL3REG EL3LB EL3TX EL3RX ISAPROBE NETCFG IFUP ARP PING PINGALT UDPTEST TFTP NSLOOKUP NTP TCPTEST WGET FTP DLSPEED UNETTEST; do
+for binary in EL3INFO EL3EEP EL3REG EL3LB EL3TX EL3RX ISAPROBE NETCFG IFUP ARP PING PINGALT UDPTEST TFTP NSLOOKUP NTP TCPTEST WGET FTP DLSPEED DLDIRECT UNETTEST; do
   if ! grep -a -q "v0.0.1" "$repo_root/build/$binary.EXE"; then
     echo "Error: $binary banner is not version 0.0.1" >&2
     exit 1

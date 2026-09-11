@@ -39,15 +39,17 @@ BANNER = b"220 Stage13 test FTP ready.\r\n"
 # (see specs.md) doesn't need a second responder process: any GET gets
 # HTTP_LARGE back as a 200 with Content-Length, which is all DLSPEED asks of
 # a server (no Range, no redirects, no chunking -- see docs/DLSPEED.md). This
-# is deliberately its own, much bigger fixture, not FTP's 3000-byte LARGE:
+# response deliberately stays open after its declared body so both clients
+# prove that Content-Length, not FIN, stops the timed interval. It is its own,
+# much bigger fixture, not FTP's 3000-byte LARGE:
 # DSS's RTC has one-second resolution, so a transfer that completes inside
 # one tick (as FTP's LARGE.BIN does over a 100 Mbit/s virtual link) is
 # rejected by DLSPEED itself as "sample too short" and, even when it isn't,
 # a one-second sample is too quantized to trust -- docs/DLSPEED.md asks for
-# "at least 512 KiB". Bumping FTP's own LARGE instead would also perturb the
+# "4 MiB". Bumping FTP's own LARGE instead would also perturb the
 # 5-MSS-window assertions the FTP data-channel tests are built around.
 HTTP_PORT = 80
-HTTP_LARGE = bytes((index * 37 + 11) & 0xFF for index in range(524288))
+HTTP_LARGE = bytes((index * 37 + 11) & 0xFF for index in range(4 * 1024 * 1024))
 # docs/STAGE13_TESTING_RU.md tells the operator to run FTP/NSLOOKUP against
 # this name; DNS resolution has to actually work for that procedure to mean
 # anything.
@@ -218,7 +220,7 @@ class Responder:
             payload = bytes(connection.send_queue[:size])
             del connection.send_queue[:size]
             sent_any = True
-            finish = (kind in ("data", "http") and not connection.send_queue and
+            finish = (kind == "data" and not connection.send_queue and
                       not connection.fin_sent)
             flags = 0x19 if finish else 0x18
             reply = stage11.build_tcp(request, connection.server_next,
@@ -288,7 +290,7 @@ class Responder:
         self.event(f"HTTP {line!r}")
         body = HTTP_LARGE
         head = (f"HTTP/1.0 200 OK\r\nContent-Length: {len(body)}\r\n"
-                "Connection: close\r\n\r\n").encode("ascii")
+                "Connection: keep-alive\r\n\r\n").encode("ascii")
         connection.send_queue.extend(head + body)
 
     def _reply_for(self, line):

@@ -32,11 +32,11 @@
   dropped): ____________________
 - Flag before the positional path (`FTP host -p pass FILE.BIN`) still fetches
   `FILE.BIN`, not the flag's own value: ____________________
-- `DLSPEED /?` and invalid-URL usage text: ____________________
-- `DLSPEED` against `LARGE.BIN`: RTC-aligned start, byte count, elapsed
-  seconds, KB/s printed, `RESULT OK`: ____________________
-- Joint speed comparison against the pre-fix baseline (~3 KB/s): DLSPEED
-  measured rate ____________________, qualitatively higher: yes/no
+- `DLSPEED /?`, `DLDIRECT /?` and invalid-URL usage text: ____________________
+- Alternating `DLDIRECT`, `DLSPEED`, `DLSPEED`, `DLDIRECT` against the same
+  4 MiB URL, at least five successful results each: ____________________
+- Exact 4194304-byte counts, per-run seconds/KB/s, medians, FIN without RST,
+  and successful repeated launch: ____________________
 
 ## Pcap checks
 
@@ -52,6 +52,7 @@ ____________________  SMALL.BIN
 ____________________  LARGE.BIN
 ____________________  FTP.EXE
 ____________________  DLSPEED.EXE
+____________________  DLDIRECT.EXE
 ```
 
 ## Notes
