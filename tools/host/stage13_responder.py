@@ -70,12 +70,19 @@ def fixtures():
 
 
 class Connection:
-    def __init__(self, isn, client_next, window):
+    def __init__(self, isn, client_next, window, mss=stage11.TCP_MSS):
         self.server_isn = isn
         self.server_next = (isn + 1) & 0xFFFFFFFF
         self.server_acked = (isn + 1) & 0xFFFFFFFF
         self.client_next = client_next
         self.client_window = window
+        # The MSS option on the client's SYN caps what this responder may put
+        # in one segment.  DLDIRECT asks for whole Ethernet payloads (1460)
+        # because the emulated network charges per frame, not per byte; a
+        # responder hard-wired to 536 would quietly deny it that and make the
+        # MAME measurement disagree with a real HTTP server for no visible
+        # reason.  Everything else here still advertises 536 and is unaffected.
+        self.client_mss = mss or stage11.TCP_MSS
         self.established = False
         self.send_queue = bytearray()
         self.fin_sent = False
@@ -145,7 +152,7 @@ class Responder:
             ordinal = len(self.connections) + 1
             isn = (0x13B00000 + ordinal * 0x10000) & 0xFFFFFFFF
             connection = Connection(isn, (request["sequence"] + 1) & 0xFFFFFFFF,
-                                     request["window"])
+                                     request["window"], request["mss"])
             connection.last_request = request
             self.connections[key] = connection
             if kind == "control":
@@ -216,7 +223,7 @@ class Responder:
             available = max(0, connection.client_window - in_flight)
             if not available:
                 break
-            size = min(stage11.TCP_MSS, available, len(connection.send_queue))
+            size = min(connection.client_mss, available, len(connection.send_queue))
             payload = bytes(connection.send_queue[:size])
             del connection.send_queue[:size]
             sent_any = True

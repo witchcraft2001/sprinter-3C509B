@@ -20,6 +20,23 @@ EXE_VERSION	EQU 1
 	; in-line. FTP does not define this and keeps the byte-identical old
 	; behavior -- its image has no room to spare for this yet.
 	DEFINE TCPX_DIRECT_RX
+	; Announce a whole-Ethernet-payload receive MSS (tcp.inc). Unlike the
+	; two-phase receive, this costs essentially no image bytes -- it is
+	; constants plus buffer sizes, and the buffers live in the WIN2 data page,
+	; which has room. The receive path is charged per *segment* (ISA sessions,
+	; frame parse, checksum seed, the ACK's own build and transmit), so moving
+	; the same payload in 2.7x fewer segments is the one lever that fits
+	; inside WGET's remaining image budget.
+	DEFINE TCPX_LARGE_MSS
+	; The session receive path (one ISA session per frame, payload summed and
+	; delivered straight into the disk buffer in a single pass) -- the 2x on
+	; the Z80 side of the download that FTP and DLDIRECT already have. Its
+	; 1.3 KiB of image is paid for by WGET_LAYOUT: memory.inc starts the WIN2
+	; data area 2 KiB above PAGE_BASE and the image may run to
+	; S12_IMAGE_LIMIT. The disk batch buffer gave up those 2 KiB; live FTP
+	; runs showed that DSS_WRITE costs per byte, not per call.
+	DEFINE WGET_LAYOUT
+	DEFINE EL3_SESSION_RX
 
 	DEVICE NOSLOT64K
 	INCLUDE "version.inc"
@@ -153,9 +170,63 @@ HOP_LOOP
 	CALL	RESET_HOP_STATE
 
 .RX_LOOP
+	; Once the header state machine has reached its terminal state and this
+	; hop is the one being saved, the body goes straight into the disk
+	; buffer, the way FTP's GET_LOOP already receives. Routing it through
+	; S11_APP_BUFFER cost twice over: that buffer is 544 bytes, so a
+	; whole-MSS segment needed three RECV calls to come out of the pending
+	; queue, and every byte was then copied a second time into
+	; STAGE9_FILE_BUFFER. Receiving into the disk buffer directly asks for
+	; the whole free tail at once and leaves the copy out entirely --
+	; measured at about a tenth of the executable's total work on a 200 KiB
+	; download. Everything before the body still needs the staging buffer:
+	; PROCESS_CHUNK scans the header bytes one at a time and the segment
+	; that carries the header/body boundary carries both.
+	LD	A,(W12_HTTP_STATE)
+	CP	4
+	JR	NZ,.RX_STAGED
+	LD	A,(W12_HOP_DONE)
+	OR	A
+	JR	NZ,.RX_STAGED		; a redirect/error body is counted, not saved
+	; Exactly one whole segment per request, as FTP's GET_LOOP: under
+	; EL3_SESSION_RX a segment lands straight in the buffer only while a
+	; whole TCP_MSS fits, and a smaller request would route it through the
+	; pending queue and copy it out again. When one no longer fits, the whole
+	; sectors staged are written and the sub-sector remainder slides down.
+	LD	DE,(W12_BUFFER_USED)
+	LD	HL,STAGE9_FILE_CAPACITY-TCP_MSS
+	OR	A
+	SBC	HL,DE			; CF: less than one segment free
+	JR	NC,.RX_DIRECT
+	CALL	FLUSH_SECTORS
+	JP	C,FILE_FAIL
+	JR	.RX_LOOP
+.RX_DIRECT
+	LD	HL,STAGE9_FILE_BUFFER
+	ADD	HL,DE
+	LD	BC,TCP_MSS
+	LD	DE,HTTP_IDLE_MS
+	XOR	A
+	CALL	@TCPX.RECV
+	JR	C,.RX_END_OR_FAIL
+	LD	HL,(W12_BUFFER_USED)
+	ADD	HL,BC
+	LD	(W12_BUFFER_USED),HL
+	LD	D,B
+	LD	E,C
+	LD	HL,W12_BODY_RECEIVED
+	CALL	ADD16_TO_32
+	CALL	BODY_COMPLETE
+	JR	C,.RX_LOOP
+	JR	.RX_BODY_DONE
+.RX_STAGED
 	XOR	A
 	LD	HL,S11_APP_BUFFER
-	LD	BC,TCP_MSS
+	; Bound by the buffer, not by TCP_MSS: with a whole-Ethernet MSS a segment
+	; is larger than this staging area, and RECV fills exactly the capacity it
+	; is given (the rest stays queued in the channel's pending region for the
+	; next call). Passing TCP_MSS here would overrun S11_APP_BUFFER.
+	LD	BC,S11_APP_CAPACITY
 	LD	DE,HTTP_IDLE_MS
 	CALL	@TCPX.RECV
 	JR	C,.RX_END_OR_FAIL
@@ -167,6 +238,7 @@ HOP_LOOP
 	JP	Z,HTTP_FAIL
 	CALL	BODY_COMPLETE
 	JR	C,.RX_LOOP
+.RX_BODY_DONE
 	; The declared Content-Length has arrived, so the response is over by
 	; its own framing. Waiting for a FIN here instead would stall for
 	; HTTP_IDLE_MS and then report a receive timeout on a download that in
@@ -630,7 +702,8 @@ COPY_BOUNDED_Z
 	LD	(DE),A
 	RET
 
-; Append a chunk while preserving a truly continuous 8192-byte disk buffer.
+; Append a chunk while keeping the disk buffer continuous (STAGE9_FILE_CAPACITY,
+; a whole number of sectors, so its full-buffer flush is sector-aligned too).
 APPEND_BODY
 	LD	(W12_HEADER_BYTES),HL
 	LD	(W12_REQUEST_LENGTH),BC
@@ -701,23 +774,65 @@ ADD16_TO_32
 	INC	(HL)
 	RET
 
+; FLUSH_BUFFER writes everything staged: APPEND_BODY's full-buffer flush (the
+; capacity is a whole number of sectors), the end of the transfer, and error
+; cleanup, where the file's last sector is allowed to be partial.
 FLUSH_BUFFER
+	LD	DE,(W12_BUFFER_USED)
+	LD	A,D
+	OR	E
+	RET	Z
+	CALL	WRITE_STAGED
+	RET	C
+	LD	HL,0
+	LD	(W12_BUFFER_USED),HL
+	RET
+
+; FLUSH_SECTORS writes only the whole sectors staged (W12_BUFFER_USED rounded
+; down to 512) and moves the remainder to the start of the buffer, so every
+; DSS_WRITE of the body stays sector-aligned. .RX_LOOP calls it when less
+; than a segment is free, and memory.inc's capacity ASSERT guarantees at
+; least one whole sector is staged by then, so the loop always progresses.
+; Out: CF=1/A=NETDRV_ERR_FILE_IO on a write failure. Clobbers all.
+FLUSH_SECTORS
 	LD	HL,(W12_BUFFER_USED)
+	LD	A,H
+	AND	0xFE
+	LD	D,A
+	LD	E,0			; DE = whole sectors staged
+	PUSH	HL
+	PUSH	DE
+	CALL	WRITE_STAGED
+	POP	DE
+	POP	HL
+	RET	C
+	OR	A
+	SBC	HL,DE			; HL = remainder, under one sector
+	LD	(W12_BUFFER_USED),HL
 	LD	A,H
 	OR	L
 	RET	Z
-	CALL	PROGRESS_TICK
+	LD	B,H
+	LD	C,L
 	LD	HL,STAGE9_FILE_BUFFER
-	LD	DE,(W12_BUFFER_USED)
+	ADD	HL,DE
+	LD	DE,STAGE9_FILE_BUFFER
+	LDIR
+	XOR	A
+	RET
+
+; WRITE_STAGED: one DSS_WRITE of DE bytes from the start of the buffer,
+; preceded by the progress tick. In: DE=length (>0).
+; Out: CF=1/A=NETDRV_ERR_FILE_IO on failure. Clobbers all.
+WRITE_STAGED
+	PUSH	DE
+	CALL	PROGRESS_TICK
+	POP	DE
+	LD	HL,STAGE9_FILE_BUFFER
 	LD	A,(W12_FILE_HANDLE)
 	LD	C,DSS_WRITE
 	RST	DSS
-	JR	C,.BAD
-	LD	HL,0
-	LD	(W12_BUFFER_USED),HL
-	XOR	A
-	RET
-.BAD
+	RET	NC
 	LD	A,NETDRV_ERR_FILE_IO
 	SCF
 	RET
@@ -1107,21 +1222,29 @@ SHIFT_WORK32
 	RL	(HL)
 	RET
 
-; PROGRESS_TICK is called once per disk-buffer flush, so the counter it keeps is
-; a count of flushes. Repainting on every one puts an update on screen each
-; buffer -- a few KiB -- which is what makes a download look like it is
-; progressing. Printing every fourth flush instead meant one repaint per four
-; buffers, so a transfer showed two or three figures for its whole length and
-; read as a stall between them; the repaint itself is a carriage return and one
-; short line, nothing against the disk write that precedes it.
+; PROGRESS_TICK is called once per disk-buffer flush, so the counter it keeps
+; is a count of flushes, and only every sixteenth one repaints -- the same
+; decimation the sibling RTL8019A kit applies, adopted here after measuring
+; how much of a transfer goes into console output. A repaint is a carriage
+; return, about a dozen DSS console characters and two 32-bit decimal
+; conversions, and at one per flush it competes with the transfer itself.
+;
+; A flush now happens about once per received segment (.RX_LOOP writes whole
+; sectors as soon as the next segment would not fit), so sixteen of them is
+; roughly 20 KiB -- the same interval the fourth-of-5-KiB decimation gave,
+; which at any rate worth watching is several updates a second. The final
+; repaint is forced when the transfer ends, so the last figure is exact
+; either way.
 PROGRESS_TICK
 	LD	A,(W12_FLAGS)
 	BIT	2,A
 	JR	NZ,.DOT
-	CALL	PRINT_PROGRESS
 	LD	HL,W12_PROGRESS_COUNT
 	INC	(HL)
-	RET
+	LD	A,(HL)
+	AND	15
+	RET	NZ
+	JP	PRINT_PROGRESS
 .DOT
 	LD	A,'.'
 	JP	@CONSOLE.CHAR
@@ -1633,9 +1756,9 @@ SAVED_EXIT_CODE EQU S10_COMMAND_BUFFER
 
 
 	; The image is code and rodata only. What bounds it is the runtime data
-	; area, which starts at PAGE_BASE -- not the entry stack, which now sits a
-	; whole window above at the top of WIN2.
-	ASSERT $ <= PAGE_BASE
+	; area, which starts 2 KiB above PAGE_BASE (memory.inc's WGET_LAYOUT) --
+	; not the entry stack, which sits a whole window above at the top of WIN2.
+	ASSERT $ <= S12_IMAGE_LIMIT
 	; ... and the command record and exit code below the load address are not
 	; code either.
 	ASSERT S10_COMMAND_BUFFER + 0x0100 <= 0x4100

@@ -7,16 +7,47 @@
 TCP_PROTOCOL		EQU 6
 TCP_HEADER_LENGTH	EQU 20
 TCP_SYN_HEADER_LENGTH	EQU 24
+; TCPX_LARGE_MSS raises the advertised receive MSS to a whole Ethernet payload.
+; The receive path is charged per *segment*, not per byte: the ISA sessions,
+; the frame parse, the checksum seed and the acknowledgement's own build and
+; transmit all cost the same whether the segment carried 536 bytes or 1460, so
+; a whole payload amortises that fixed part over 2.7x more data. It costs no
+; image bytes -- only constants and the buffer geometry in memory.inc -- which
+; is why it is the one throughput lever that fits DLDIRECT, WGET and FTP alike.
+;
+; Any client defining it needs a private receive page whose staging buffers can
+; hold a whole 1,514-byte frame and whose durable queue is a whole multiple of
+; the new MSS. UNET509B.DLL has neither: its queue is a single MSS-sized slot
+; per channel carved out of the consumer's address space, and at 1460 that
+; degenerates into a zero-window stop/start cycle. The sibling RTL8019A kit
+; draws the line in exactly the same place, and for the same reason -- its
+; direct clients announce 1460 while UNETRTL.DLL stays at 536.
+	IFDEF TCPX_LARGE_MSS
+TCP_MSS			EQU 1460
+	ELSE
 TCP_MSS			EQU 536
+	ENDIF
 TCP_RECV_MAX_SEGMENTS	EQU 5
 TCP_RECV_MAX_WINDOW	EQU TCP_RECV_MAX_SEGMENTS * TCP_MSS
 	IFDEF TCPX_WIDE_DIRECT_WINDOW
 ; DLDIRECT reads Window 3 Free Receive Bytes once while the initialized FIFO
-; is empty. Eight maximum frames need 4,736 FIFO bytes and fit a 5 KiB RX
-; partition; eleven need 6,512 and are enabled only when the card reports at
-; least that much room (MAME reports its full 16 KiB RX partition).
+; is empty, and promises only what that FIFO can really hold: the window is the
+; backstop for frames that arrive while the application is between RECV calls,
+; and a promise the card cannot store becomes a drop and a retransmit.
+	IFDEF TCPX_LARGE_MSS
+; At 1460 a stored frame costs 1,516 FIFO bytes. Three need 4,548 and still fit
+; the smallest legal 5 KiB RX share of an 8 KiB card -- which is also exactly
+; the three-segment window the sibling kit's direct client settled on. Eight
+; need 12,128 and are enabled only when the card reports at least that much.
+TCP_DIRECT_RECV_SAFE_SEGMENTS EQU 3
+TCP_DIRECT_RECV_WIDE_SEGMENTS EQU 8
+	ELSE
+; Eight maximum frames need 4,736 FIFO bytes and fit a 5 KiB RX partition;
+; eleven need 6,512 and are enabled only when the card reports at least that
+; much room (MAME reports its full 16 KiB RX partition).
 TCP_DIRECT_RECV_SAFE_SEGMENTS EQU 8
 TCP_DIRECT_RECV_WIDE_SEGMENTS EQU 11
+	ENDIF
 TCP_DIRECT_RECV_SAFE_WINDOW EQU TCP_DIRECT_RECV_SAFE_SEGMENTS * TCP_MSS
 TCP_DIRECT_RECV_WIDE_WINDOW EQU TCP_DIRECT_RECV_WIDE_SEGMENTS * TCP_MSS
 TCP_DIRECT_RECV_FIFO_FRAME EQU (14 + 20 + TCP_HEADER_LENGTH + TCP_MSS + 3) & 0xFFFC
@@ -45,7 +76,18 @@ TCP_DIRECT_RECV_WIDE_FIFO_MIN EQU TCP_DIRECT_RECV_WIDE_SEGMENTS * TCP_DIRECT_REC
 TCP_RECV_SEGMENTS	EQU 1
 	ELSE
 	IFDEF STAGE12_LAYOUT
+	IFDEF TCPX_LARGE_MSS
+; Two whole 1460-byte segments (2,920 bytes) is what the receive page has left
+; for a durable queue once the RX/TX staging buffers grow to hold a full-size
+; frame -- see memory.inc. In bytes that is slightly deeper than the five
+; 536-byte segments it replaces, so the peer may still keep more than one
+; segment in flight. DLDIRECT additionally overrides the advertised value from
+; the card FIFO (TCPX_WIDE_DIRECT_WINDOW above); WGET and FTP advertise this
+; queue's own free space, which is what SEND_SEGMENT_COMMON computes.
+TCP_RECV_SEGMENTS	EQU 2
+	ELSE
 TCP_RECV_SEGMENTS	EQU 5
+	ENDIF
 	ELSE
 TCP_RECV_SEGMENTS	EQU 1
 	ENDIF

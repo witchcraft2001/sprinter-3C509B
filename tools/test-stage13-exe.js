@@ -73,7 +73,9 @@ assert.strictEqual(image.subarray(0, 4).toString('binary'), 'EXE\x01');
 assert.strictEqual(image.readUInt16LE(4), 128);
 assert.strictEqual(image.readUInt16LE(16), 0x4100);
 assert.strictEqual(image.readUInt16LE(20), 0xbff0);
-assert.ok(0x4080 + image.length <= 0x8000, 'FTP image runs into its runtime data area');
+// FTP's WIN2 data area starts at 0x8800 (memory.inc's S13_IMAGE_LIMIT), 2 KiB
+// above PAGE_BASE: the room its session receive path is paid with.
+assert.ok(0x4080 + image.length <= 0x8800, 'FTP image runs into its runtime data area');
 cases++;
 
 // ------------------------------------------------------------------
@@ -136,6 +138,37 @@ assert.strictEqual(result.exitCode, 0, result.output);
 assert.strictEqual(sha256(outputFile(result, 'NEAR.BIN')), sha256(NEAR_WINDOW));
 assert.ok(result.maxInFlight >= 5 * 536,
   `peer kept only ${result.maxInFlight} bytes in flight, expected a 5-segment window`);
+checked(result);
+
+// RETR asks RECV for exactly one segment at a time so that every segment is
+// delivered from the card's FIFO straight into the 2 KiB disk buffer, and it
+// flushes as soon as another segment would not fit: whole 512-byte sectors
+// go to DSS_WRITE and the sub-sector remainder slides down to the start of
+// the buffer. So every write is sector-aligned and the sizes follow the
+// segment cadence -- 1024 or 1536 per 1460-byte segment, one more whole-
+// sector flush after the last segment (the loop cannot know it was the last
+// until the next RECV reports the close), then the sub-sector tail. Pin the
+// exact sequence: it is what proves no segment took the pending-queue route
+// (which would show up as a different split), and that no write ever
+// straddles a sector.
+//
+// The counter line is repainted on every sixteenth flush and once more when
+// the transfer ends. This body is eleven flushes, so the forced end repaint
+// is the only figure it prints -- without it a short transfer would finish
+// showing nothing at all.
+const BATCH_BODY = Buffer.from(Array.from({length: 14000}, (_, i) => (i * 13 + 7) & 0xff));
+result = run('192.168.7.44 BATCH.BIN', scenario({
+  fixtures: {'BATCH.BIN': BATCH_BODY}, fixtureSizes: {'BATCH.BIN': BATCH_BODY.length},
+}, {traceDss: true}));
+assert.strictEqual(result.exitCode, 0, result.output);
+assert.strictEqual(sha256(outputFile(result, 'BATCH.BIN')), sha256(BATCH_BODY));
+assert.deepStrictEqual(
+  result.dssEvents.filter((event) => event.startsWith('WRITE '))
+    .map((event) => Number(event.split(' ').pop())),
+  [1024, 1536, 1536, 1536, 1536, 1536, 1024, 1536, 1536, 1024, 176],
+  'RETR no longer writes whole sectors per received segment');
+assert.strictEqual((result.output.match(/KB \/ /g) || []).length, 1,
+  `expected one forced final repaint of the counter, got:\n${result.output}`);
 checked(result);
 
 // The same transfer with the clock left running: the summary line reports a
@@ -409,22 +442,23 @@ checked(result);
 // ------------------------------------------------------------------
 // Mid-GET cancel: partial file preserved, DSS_EXIT_CANCELLED.
 // ------------------------------------------------------------------
+// Its own fixture, deliberately several windows long. The harness pushes a
+// whole advertised window in one synchronous burst, so the cancel threshold
+// has to sit past that burst or it fires before the guest has drained and
+// buffered anything and the abort path has nothing to flush. The receive
+// window is two whole 1460-byte segments now, so a 3 KiB fixture no longer
+// leaves room for a threshold between "one burst" and "the whole file".
+const CANCEL_BODY = Buffer.from(Array.from({length: 12000}, (_, i) => (i * 37 + 11) & 0xff));
 for (const key of ['escape', 'ctrl-c']) {
-  result = run('192.168.7.44 NEAR.BIN', scenario({
-    fixtures: {'NEAR.BIN': NEAR_WINDOW}, fixtureSizes: {'NEAR.BIN': NEAR_WINDOW.length},
-    dataWindow: 5 * 536,
-    // Past the first full 2680-byte window: the harness pushes a whole
-    // window in one synchronous burst (matching WGET's own equivalent
-    // scenario/comment in test-stage12-exe.js), so a smaller threshold
-    // fires the cancel before the guest has ever drained/buffered anything,
-    // leaving nothing for the abort path to flush.
-  }, {key, keyAfterFtpBytes: 2700}));
+  result = run('192.168.7.44 CANCEL.BIN', scenario({
+    fixtures: {'CANCEL.BIN': CANCEL_BODY}, fixtureSizes: {'CANCEL.BIN': CANCEL_BODY.length},
+  }, {key, keyAfterFtpBytes: 6000}));
   assert.strictEqual(result.exitCode, 7, result.output);
   assert.match(result.output, /Aborted \(Esc\/\^C\)\./);
-  const partial = outputFile(result, 'NEAR.BIN') || Buffer.alloc(0);
-  assert.ok(partial.length > 0 && partial.length < NEAR_WINDOW.length,
+  const partial = outputFile(result, 'CANCEL.BIN') || Buffer.alloc(0);
+  assert.ok(partial.length > 0 && partial.length < CANCEL_BODY.length,
     `expected a genuine partial file, got ${partial.length} bytes`);
-  assert.deepStrictEqual(partial, NEAR_WINDOW.subarray(0, partial.length));
+  assert.deepStrictEqual(partial, CANCEL_BODY.subarray(0, partial.length));
   checked(result);
 }
 
@@ -682,9 +716,36 @@ function clientTcpSegments(value) {
         tcpLength >> 8, tcpLength & 255]), tcp]);
       assert.strictEqual(internetChecksum(pseudo), 0,
         'UNET509B emitted an invalid TCP checksum');
+      const headerLength = (tcp[12] >> 4) * 4;
+      let mss = 0;
+      for (let at = 20; at < headerLength;) {
+        const kind = tcp[at];
+        if (!kind) break;
+        if (kind === 1) { at++; continue; }
+        if (kind === 2 && tcp[at + 1] === 4) mss = tcp.readUInt16BE(at + 2);
+        at += tcp[at + 1];
+      }
       return {flags: tcp[13], sequence: tcp.readUInt32BE(4), acknowledgement: tcp.readUInt32BE(8),
-        window: tcp.readUInt16BE(14), payloadLength: tcpLength - ((tcp[12] >> 4) * 4)};
+        window: tcp.readUInt16BE(14), payloadLength: tcpLength - headerLength, mss};
     });
+}
+// The frames the modelled peer put on the wire, as opposed to the ones the
+// client sent. Needed to assert what the client actually *received*: an
+// advertised MSS the peer ignores buys nothing, and the only way to see the
+// difference is to measure the segments coming the other way.
+function serverTcpSegments(value) {
+  return value.generatedFrames.map((frame) => Buffer.from(frame, 'hex'))
+    .filter((frame) => frame.length >= 54 && frame.readUInt16BE(12) === 0x0800 && frame[23] === 6)
+    .map((frame) => {
+      const ipLength = frame.readUInt16BE(16), tcp = frame.subarray(34, 34 + ipLength - 20);
+      return {flags: tcp[13], sequence: tcp.readUInt32BE(4),
+        payloadLength: (ipLength - 20) - ((tcp[12] >> 4) * 4)};
+    });
+}
+function clientSyn(value) {
+  const syn = clientTcpSegments(value).find((segment) => segment.flags & 0x02);
+  assert.ok(syn, 'client sent no SYN');
+  return syn;
 }
 function assertDllTransfer(value, bodyLength) {
   assert.strictEqual(value.exitCode, 0, value.output);
@@ -933,7 +994,7 @@ for (const key of ['escape', 'ctrl-c']) {
 // throughput work targets, and gives the harness-side memoryAccesses/
 // isaSessions counters (tools/exe-harness/harness.js) a realistic baseline
 // to compare across steps instead of only the small fixed-size scenarios
-// above. 256 KiB is 512 MSS segments -- enough that a per-segment regression
+// above. 256 KiB is 180 MSS segments -- enough that a per-segment regression
 // is visible in the accesses-per-byte ratio, not lost in fixed overhead.
 const LARGE_BODY = Buffer.alloc(262144, 0x5a);
 result = runExe(speedExe, 'http://192.168.7.44/BIG.BIN', speedScenario({
@@ -944,28 +1005,43 @@ assert.match(result.output, new RegExp(`Received: ${LARGE_BODY.length} bytes`));
 assert.ok(result.memoryAccesses > 0, 'harness did not report memoryAccesses');
 assert.ok(result.isaSessions > 0, 'harness did not report isaSessions');
 // The live pcap showed that almost the entire elapsed time was a sequence of
-// host-network scheduling gaps after a five-MSS burst drained. The harness
-// models MAME's 16 KiB RX partition, so DLDIRECT selects eleven MSS from the
-// idle Window 3 Free Receive Bytes value and keeps it across short RECV
-// boundaries. It acknowledges each pair before the window empties.
+// host-network scheduling gaps after a burst drained, and that the gap costs
+// the same whatever the frame carried -- so the segment size, not the byte
+// window, is what decides how much payload each round trip moves. DLDIRECT
+// therefore announces MSS 1460 and the peer must actually use it: a responder
+// that ignored the advertised MSS would keep this test green while the real
+// network path got none of the benefit, so assert the segment size directly.
+// The harness models MAME's 16 KiB RX partition, so DLDIRECT selects eight MSS
+// from the idle Window 3 Free Receive Bytes value and keeps it across short
+// RECV boundaries. It acknowledges each pair before the window empties.
+const DIRECT_MSS = 1460;
+const directData = serverTcpSegments(result).filter((segment) => segment.payloadLength);
+assert.ok(directData.length > 8, 'DLDIRECT received too few data segments to judge');
+assert.ok(directData.filter((segment) => segment.payloadLength === DIRECT_MSS).length >
+  directData.length / 2,
+  `DLDIRECT did not receive whole-MSS segments: ${
+    [...new Set(directData.map((segment) => segment.payloadLength))].join(',')}`);
+assert.strictEqual(clientSyn(result).mss, DIRECT_MSS,
+  'DLDIRECT did not advertise MSS 1460 on its SYN');
 const directAcks = clientTcpSegments(result)
   .filter((segment) => segment.flags === 0x10 && !segment.payloadLength);
 const directWindows = directAcks.map((segment) => segment.window);
-assert.ok(result.maxInFlight >= 11 * 536,
+assert.ok(result.maxInFlight >= 8 * DIRECT_MSS,
   `DLDIRECT reached only ${result.maxInFlight} bytes in flight`);
-assert.ok(directWindows.every((window) => window === 11 * 536),
-  `DLDIRECT did not select its eleven-MSS window: ${directWindows.join(',')}`);
+assert.ok(directWindows.every((window) => window === 8 * DIRECT_MSS),
+  `DLDIRECT did not select its eight-MSS window: ${directWindows.join(',')}`);
 const directAdvances = directAcks.slice(1).map((segment, index) =>
   (segment.acknowledgement - directAcks[index].acknowledgement) >>> 0);
-assert.ok(directAdvances.some((advance) => advance === 2 * 536),
+assert.ok(directAdvances.some((advance) => advance === 2 * DIRECT_MSS),
   `DLDIRECT never advanced its sliding window by two MSS: ${directAdvances.join(',')}`);
-assert.ok(directAdvances.every((advance) => advance <= 2 * 536),
+assert.ok(directAdvances.every((advance) => advance <= 2 * DIRECT_MSS),
   `DLDIRECT let its sliding-window ACK debt grow too far: ${directAdvances.join(',')}`);
 speedChecked(result);
 
-// A physical 8 KiB card may expose only a 5 KiB RX partition. Eleven frames
-// would not fit there, so the same executable must fall back to eight MSS
-// without relying on a separate hardware build.
+// A physical 8 KiB card may expose only a 5 KiB RX partition. Eight 1460-byte
+// frames need 12,128 FIFO bytes and would not fit there, so the same
+// executable must fall back to three MSS -- the same window the sibling
+// RTL8019A kit's direct client uses -- without a separate hardware build.
 const SMALL_FIFO_BODY = Buffer.alloc(32768, 0x6b);
 result = runExe(speedExe, 'http://192.168.7.44/BIG.BIN', speedScenario({
   response: {status: '200 OK', body: SMALL_FIFO_BODY, headers: {}, closeDelimited: false},
@@ -975,9 +1051,9 @@ assert.match(result.output, new RegExp(`Received: ${SMALL_FIFO_BODY.length} byte
 const smallFifoAcks = clientTcpSegments(result)
   .filter((segment) => segment.flags === 0x10 && !segment.payloadLength);
 assert.ok(smallFifoAcks.length > 1, 'small-FIFO DLDIRECT emitted no data ACKs');
-assert.ok(smallFifoAcks.every((segment) => segment.window === 8 * 536),
-  `small-FIFO DLDIRECT exceeded eight MSS: ${smallFifoAcks.map((segment) => segment.window).join(',')}`);
-assert.ok(result.maxInFlight >= 8 * 536 && result.maxInFlight < 11 * 536,
+assert.ok(smallFifoAcks.every((segment) => segment.window === 3 * DIRECT_MSS),
+  `small-FIFO DLDIRECT exceeded three MSS: ${smallFifoAcks.map((segment) => segment.window).join(',')}`);
+assert.ok(result.maxInFlight >= 3 * DIRECT_MSS && result.maxInFlight < 8 * DIRECT_MSS,
   `small-FIFO DLDIRECT reached unsafe in-flight size ${result.maxInFlight}`);
 speedChecked(result);
 

@@ -28,7 +28,14 @@ EXE_VERSION	EQU 1
 	; in-line. FTP does not define this and keeps the byte-identical old
 	; behavior -- its image has no room to spare for this yet.
 	DEFINE TCPX_DIRECT_RX
-	; Select an eight- or eleven-MSS streaming window from the card's idle RX
+	; Announce a whole-Ethernet-payload receive MSS (tcp.inc). The receive
+	; path is bound by frames per second, not bytes per second: the host
+	; network round trip costs the same whether the frame carries 536 bytes or
+	; 1460, so this is the one change that moves the same payload in 2.7x
+	; fewer of them. Only a direct client with its own receive page may do
+	; this; UNET509B.DLL, WGET and FTP stay at 536.
+	DEFINE TCPX_LARGE_MSS
+	; Select a three- or eight-MSS streaming window from the card's idle RX
 	; capacity. Genuine pending-space backpressure still closes the window.
 	DEFINE TCPX_WIDE_DIRECT_WINDOW
 	; One ISA-window session per receive step (el3_io.asm's RX_BEGIN/

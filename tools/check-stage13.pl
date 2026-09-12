@@ -29,6 +29,7 @@ my $dlspeed = slurp('src/apps/dlspeed.asm', 0);
 my $dldirect = slurp('src/apps/dldirect.asm', 0);
 my $libman = slurp('src/lib/libman13.asm', 0);
 my $transport = slurp('src/lib/tcp_transport.asm', 0);
+my $memory = slurp('src/include/memory.inc', 0);
 my $tcpinc = slurp('src/include/tcp.inc', 0);
 my $el3inc = slurp('src/include/el3.inc', 0);
 die "Stage 13 FTP contains an unbounded interrupt wait\n" if $ftp =~ /\b(?:HALT|EI)\b/;
@@ -80,6 +81,42 @@ die "DLDIRECT no longer selects safe/wide windows from RX FIFO capacity\n"
            $tcpinc =~ /^TCP_DIRECT_RECV_WIDE_SEGMENTS\s+EQU\s+11\s*$/m &&
            $tcpinc =~ /^TCP_DIRECT_RECV_WIDE_FIFO_MIN\s+EQU\s+TCP_DIRECT_RECV_WIDE_SEGMENTS\s*\*\s*TCP_DIRECT_RECV_FIFO_FRAME\s*$/m;
 
+die "FTP's two durable receive queues are the same size again\n"
+    unless $ftp =~ /DEFINE\s+TCPX_SPLIT_PENDING/ &&
+           $transport =~ /TCPX_SPLIT_PENDING[\s\S]*?S11_PENDING1_CAPACITY/;
+# The control queue is the shallow one and the data queue the deep one, which
+# only holds because FTP_DATA_CHANNEL is 1. Swapping them assembles and runs
+# and simply makes the transfer slower, so pin the pairing here rather than
+# leaving it to a benchmark.
+die "FTP gave the shallow receive queue to its data channel\n"
+    unless $ftp =~ /FTP_DATA_CHANNEL\s+EQU\s+1/ &&
+           $memory =~ /S11_PENDING_CAPACITY\s+EQU\s+0x05B4[\s\S]{0,120}?S11_PENDING1_CAPACITY\s+EQU\s+0x0B68/;
+# FTP runs the same receive path as DLDIRECT and the DLL, paid for by starting
+# its WIN2 data area 2 KiB above PAGE_BASE. Pin all three halves: the defines,
+# the layout that makes room for them, and the image bound that uses it.
+die "FTP lost the session receive path\n"
+    unless $ftp =~ /DEFINE\s+TCPX_DIRECT_RX/ &&
+           $ftp =~ /DEFINE\s+EL3_SESSION_RX/ &&
+           $ftp =~ /DEFINE\s+FAST_DATAPATH/;
+die "FTP's data area no longer starts 2 KiB above PAGE_BASE\n"
+    unless $memory =~ /IFDEF TCPX_LARGE_MSS\n[\s\S]*?STAGE9_TX_BUFFER\s+EQU\s+PAGE_BASE \+ 0x0800[\s\S]*?STAGE9_FILE_CAPACITY\s+EQU\s+0x0800[\s\S]*?S13_IMAGE_LIMIT\s+EQU\s+STAGE9_TX_BUFFER/ &&
+           $ftp =~ /ASSERT \$ <= S13_IMAGE_LIMIT/ &&
+           slurp('src/lib/stage11_app.asm', 0) =~ /LD\s+HL,STAGE9_TX_BUFFER\s*\n\s*LD\s+DE,STAGE9_TX_BUFFER\+1/;
+# One whole segment per RECV lands straight in the disk buffer; a partial
+# request would route a segment through the pending queue and copy it twice.
+# The flush keeps DSS_WRITE sector-aligned by writing whole sectors only.
+die "FTP RETR no longer requests exactly one segment per RECV\n"
+    unless $ftp =~ /GET_LOOP\n[\s\S]{0,400}?LD\s+BC,TCP_MSS\s*\n[\s\S]{0,80}?CALL\s+\@TCPX\.RECV/;
+die "FTP RETR no longer writes whole sectors and slides the remainder\n"
+    unless $ftp =~ /FLUSH_SECTORS\n[\s\S]{0,200}?AND\s+0xFE[\s\S]{0,300}?LDIR/;
+# The window-closed latch must be settled before RECV decides it has no room
+# for another segment, or the reopening update is never sent (see the comment
+# in tcp_transport.asm's RECV): pin the order.
+die "RECV decides on room before reopening a closed window\n"
+    unless $transport =~ /BIT\s+0,\(IX\+CTX_WINDOW_CLOSED\)\s*\n\s*JR\s+Z,\.RECV_ROOM_DECIDED\s*\n\s*PUSH\s+AF[\s\S]{0,120}?POP\s+AF\s*\n\.RECV_ROOM_DECIDED\s*\n\s*JR\s+C,\.RECV_SUCCESS/;
+die "the single-slot DLL took the split-queue capacities meant for FTP\n"
+    if slurp('src/dll/unet509b.asm', 0) =~ /DEFINE\s+TCPX_SPLIT_PENDING/;
+
 die "FTP client is not PASV-only (found an active-mode PORT command or a LISTEN call)\n"
     if $ftp =~ /DB\s+"PORT[\s"]|CMD_PORT|\bLISTEN\b/;
 die "FTP does not implement REST + RETR\n"
@@ -119,8 +156,10 @@ for my $exe_name (qw(FTP DLDIRECT)) {
         unless substr($exe, 0, 4) eq "EXE\x01" && unpack('v', substr($exe, 4, 2)) == 128 &&
                unpack('v', substr($exe, 16, 2)) == 0x4100 &&
                unpack('v', substr($exe, 20, 2)) == 0xBFF0;
+    # FTP's data area starts at 0x8800 (memory.inc's S13_IMAGE_LIMIT), the
+    # direct benchmark's at PAGE_BASE.
     die "$exe_name.EXE runs into its runtime data area\n"
-        if 0x4080 + length($exe) > 0x8000;
+        if 0x4080 + length($exe) > ($exe_name eq 'FTP' ? 0x8800 : 0x8000);
     my $payload = substr($exe, 128);
     die "$exe_name.EXE contains zero-filled runtime BSS\n" if $payload =~ /\x00{128}/;
 }

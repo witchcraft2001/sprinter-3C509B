@@ -14,17 +14,38 @@ DLSPEED  http://host[:port]/path
 direct delivery into the application buffer. It keeps `FAST_DATAPATH`,
 `TCPX_DIRECT_RX` and `EL3_SESSION_RX` enabled and represents the current upper
 bound of this direct TCP receive path (not a raw Ethernet-controller limit).
+
+It announces a whole-Ethernet-payload receive MSS of 1,460 (`TCPX_LARGE_MSS`).
+This is the single largest lever on the receive rate, and it is a processing
+cost rather than a wire cost: roughly 55% of the work a segment costs is
+per-segment rather than per-byte (the ISA sessions, the 54-byte header read,
+the fast-path predicate, and the acknowledgement's own build and transmit), so
+a 1,460-byte segment amortizes that fixed part over 2.7x more payload. It costs
+no image bytes, only constants and the receive page's geometry, which is why
+`WGET` and `FTP` announce it too even though neither has room for the two-phase
+receive. `UNET509B.DLL` stays at 536: its durable queue is one MSS-sized slot
+per channel carved out of the consumer's address space, and at 1,460 that
+degenerates into a zero-window stop/start cycle. The sibling RTL8019A kit draws
+the line in the same place, and its direct client has run 1,460 against a
+536-byte DLL throughout.
+
 It keeps a FIFO-qualified receive window across its short `RECV` boundaries.
 Before any network traffic it reads the documented Window 3 Free Receive Bytes
-register: at least 6,512 free bytes selects eleven MSS (the MAME model exposes
-a 16 KiB RX partition), otherwise it uses eight MSS. Eight maximum-size stored
-frames occupy 4,736 bytes and fit the smallest legal 5 KiB RX share of an
+register: at least 12,128 free bytes selects eight MSS (the MAME model exposes
+a 16 KiB RX partition), otherwise it uses three MSS. Three maximum-size stored
+frames occupy 4,548 bytes and fit the smallest legal 5 KiB RX share of an
 8 KiB 3C509B configuration; a genuinely full software pending area still
-closes the window. The 6 KiB caller buffer remains a separate eleven-segment
-batching boundary. Every outgoing frame retains the checked, finitely bounded
+closes the window. The 5 KiB caller buffer remains a separate three-segment
+batching boundary, and the durable software pending region holds two whole
+segments. Every outgoing frame retains the checked, finitely bounded
 transmit-completion path. Clean in-order data is acknowledged every two
 segments so the selected window slides while the peer refills it; slow-path,
 loss, FIN and an early/partial return still force a cumulative ACK.
+
+Because the advertised MSS only matters if the peer honours it, both test peers
+do: the raw MAME responder (`tools/host/stage13_responder.py`) and the
+actual-EXE harness size each segment by the option on the client's own SYN, and
+the Stage 13 EXE test asserts the segments actually arrive at 1,460.
 
 `DLSPEED.EXE` loads `UNET509B.DLL` into WIN1 through libman 1.3. It first tries
 the DLL beside the executable using DSS `APPINFO`, then retries
@@ -112,6 +133,13 @@ The mandatory MAME gates are:
   `DLSPEED / DLDIRECT >= 40%`;
 - fast image: median `DLDIRECT >= 180 KB/s` and median
   `DLSPEED >= 76 KB/s`.
+
+For the `DLDIRECT` trace, record that its SYN advertises MSS 1460, that the
+body segments really are 1460 bytes, that the advertised window is 11,680
+(eight MSS) on the 16 KiB MAME partition or 4,380 (three MSS) on a 5 KiB one,
+and that cumulative ACKs normally advance by 2,920. A run that still shows
+536-byte segments means the responder ignored the MSS option, not that the
+client failed to ask.
 
 For the DLL trace, also record that at most five MSSes (2680 bytes) are in
 flight, the first direct segment opens the initial one-MSS window, subsequent

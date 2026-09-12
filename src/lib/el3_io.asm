@@ -500,7 +500,7 @@ RXS_POINTER
 ; tcp_transport.asm's .WAIT_LOOP under TCPX_DIRECT_RX, in place of the
 ; RX_PENDING+READ_FRAME pair -- RX_PENDING/READ_FRAME themselves are
 ; untouched and keep serving every other caller (ARP, PING, IFUP, DNS/UDP,
-; and FTP, which does not define EL3_SESSION_RX at all).
+; and every frame the session builds' own fast predicate declines).
 ;
 ; RX_BEGIN
 ; In: HL=header destination, BC=header capacity (>0).

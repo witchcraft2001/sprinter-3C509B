@@ -4,6 +4,8 @@
 *.bak
 *.swp
 *~
+__pycache__/
+*.py[cod]
 .mame-cfg/
 /cfg/
 /nvram/

@@ -128,7 +128,10 @@ NETDRV_MEMORY_BLOCK	EQU RUNTIME_BASE + 0x251
 NETDRV_PAGE_ALLOCATED	EQU RUNTIME_BASE + 0x252
 	IFDEF STAGE10_PAGE_LAYOUT
 	IFDEF STAGE13_LAYOUT
-NETDRV_FAIL_CODE	EQU PAGE_BASE + 0x2E3E ; page-backed; see the STAGE13_LAYOUT S11 block below
+; FTP's copy is defined in the STAGE13_LAYOUT F13 block below, next to the
+; reserve it is carved from. A literal here is what silently walked it into
+; the middle of S11_APP_BUFFER the first time the S11 block moved: the
+; address kept assembling and kept pointing at a live receive buffer.
 	ELSE
 	IFDEF STAGE12_LAYOUT
 NETDRV_FAIL_CODE	EQU PAGE_BASE + 0x2D5F ; page-backed; Stage 12 cleanup keeps status on stack
@@ -242,6 +245,37 @@ NETTIME_ELAPSED_MS	EQU NETTIME_STATE_BASE + 0x15 ; word
 	; one mapped DSS page; this bookkeeping is resident and below STACK_TOP.
 	IFDEF STAGE9_LAYOUT
 	IFDEF STAGE13_LAYOUT
+	IFDEF TCPX_LARGE_MSS
+; FTP at MSS 1460. This page is the tightest in the kit -- it carries two
+; pending regions and two contexts -- so the staging buffers grow to hold a
+; whole 1,514-byte frame (mandatory: READ_FRAME rejects a frame larger than
+; the capacity it is given, which at 1024 would drop every data segment) and
+; the file buffer pays for it.
+;
+; The data area starts 2 KiB into WIN2, not at PAGE_BASE. In the standard
+; DSS layout WIN1+WIN2 are one contiguous 0x4100..0xBFFF region the program
+; owns outright, so where code ends and data begins is this file's choice,
+; and FTP's image runs to S13_IMAGE_LIMIT (ftp.asm's ASSERT). Those 2 KiB
+; are what pay for EL3_SESSION_RX, TCPX_DIRECT_RX and FAST_DATAPATH in FTP:
+; measured on the actual EXE, the fused read+checksum+deliver receive path
+; is the 2x on the CPU side of RETR, and nothing cheaper fits.
+;
+; They come out of the file buffer, which measured as free to give: halving
+; the number of DSS_WRITE calls (2 KiB -> 4 KiB) changed the live rate by
+; nothing, so the write cost is per byte, not per call. What the size must
+; still allow is one whole segment delivered straight into the buffer plus a
+; sector of carry-over (GET_LOOP writes whole sectors and slides the
+; remainder down), which is the ASSERT below.
+STAGE9_TX_BUFFER	EQU PAGE_BASE + 0x0800
+STAGE9_TX_CAPACITY	EQU 0x0600
+STAGE9_RX_BUFFER	EQU PAGE_BASE + 0x0E00
+STAGE9_RX_CAPACITY	EQU 0x0600
+STAGE9_FILE_BUFFER	EQU PAGE_BASE + 0x1400
+STAGE9_FILE_CAPACITY	EQU 0x0800	; 4 * 512
+STAGE9_MAX_FRAME	EQU 14 + 20 + 20 + 1460
+S13_IMAGE_LIMIT		EQU STAGE9_TX_BUFFER
+	ASSERT STAGE9_FILE_CAPACITY >= 1460 + 512
+	ELSE
 ; Same TX/RX split as STAGE12_LAYOUT (WGET); the file buffer is smaller
 ; because it doubles as STOR's read-chunk source and the page also carries a
 ; second full pending region and context for the data channel.
@@ -252,8 +286,45 @@ STAGE9_RX_CAPACITY	EQU 0x0400
 STAGE9_FILE_BUFFER	EQU PAGE_BASE + 0x0800
 STAGE9_FILE_CAPACITY	EQU 0x1000
 STAGE9_MAX_FRAME	EQU 14 + 20 + 20 + 536
+	ENDIF
 	ELSE
 	IFDEF STAGE12_LAYOUT
+	IFDEF TCPX_LARGE_MSS
+; DLDIRECT at MSS 1460 (tcp.inc): both staging buffers have to hold a whole
+; 1,514-byte Ethernet frame, not a 590-byte one. The receive buffer matters
+; most -- the two-phase receive only reads a 54-byte header into it for a fast
+; in-order data segment, but a segment the fast predicate declines is read
+; whole and handed to PROCESS_FRAME, and a capacity below the frame length
+; would drop it into an endless drop/retransmit loop instead. The 2 KiB the
+; two buffers gain comes out of the caller batching buffer, which still takes
+; three whole segments (4,380 of 5,120 bytes) per public RECV -- more payload
+; per call than the eleven 536-byte segments it batched before.
+	IFDEF WGET_LAYOUT
+; WGET: the same arrangement as FTP's (see the STAGE13_LAYOUT block above).
+; The data area starts 2 KiB into WIN2 so the image can carry EL3_SESSION_RX,
+; and the 2 KiB come out of the disk batch buffer, whose size is not a lever
+; (DSS_WRITE cost is per byte). 3 KiB still takes one whole segment straight
+; from the FIFO plus a sector of carry-over, which is all the whole-sector
+; flush needs (wget.asm's FLUSH_SECTORS).
+STAGE9_TX_BUFFER	EQU PAGE_BASE + 0x0800
+STAGE9_TX_CAPACITY	EQU 0x0600
+STAGE9_RX_BUFFER	EQU PAGE_BASE + 0x0E00
+STAGE9_RX_CAPACITY	EQU 0x0600
+STAGE9_FILE_BUFFER	EQU PAGE_BASE + 0x1400
+STAGE9_FILE_CAPACITY	EQU 0x0C00	; 6 * 512
+STAGE9_MAX_FRAME	EQU 14 + 20 + 20 + 1460
+S12_IMAGE_LIMIT		EQU STAGE9_TX_BUFFER
+	ASSERT STAGE9_FILE_CAPACITY >= 1460 + 512
+	ELSE
+STAGE9_TX_BUFFER	EQU PAGE_BASE + 0x0000
+STAGE9_TX_CAPACITY	EQU 0x0600
+STAGE9_RX_BUFFER	EQU PAGE_BASE + 0x0600
+STAGE9_RX_CAPACITY	EQU 0x0600
+STAGE9_FILE_BUFFER	EQU PAGE_BASE + 0x0C00
+STAGE9_FILE_CAPACITY	EQU 0x1400
+STAGE9_MAX_FRAME	EQU 14 + 20 + 20 + 1460
+	ENDIF
+	ELSE
 ; WGET batches disk writes in 6 KiB and spends the two KiB that used to sit
 ; here on the TCP receive window instead: write batching only saves DSS calls,
 ; while the window decides how many segments the peer may keep in flight, and
@@ -266,6 +337,7 @@ STAGE9_RX_CAPACITY	EQU 0x0400
 STAGE9_FILE_BUFFER	EQU PAGE_BASE + 0x0800
 STAGE9_FILE_CAPACITY	EQU 0x1800
 STAGE9_MAX_FRAME	EQU 14 + 20 + 20 + 536
+	ENDIF
 	ELSE
 STAGE9_TX_BUFFER	EQU PAGE_BASE + 0x0000
 STAGE9_TX_CAPACITY	EQU 0x0800
@@ -309,7 +381,7 @@ S9_RX_LENGTH		EQU S9_STATE_BASE + 0x023 ; word
 S9_DRAIN_LEFT		EQU S9_STATE_BASE + 0x025
 	IFDEF STAGE10_PAGE_LAYOUT
 	IFDEF STAGE13_LAYOUT
-S9_EXIT_CODE		EQU PAGE_BASE + 0x2E3F ; page-backed; see the STAGE13_LAYOUT S11 block below
+; As with NETDRV_FAIL_CODE above: defined in the F13 block below.
 	ELSE
 	IFDEF STAGE12_LAYOUT
 S9_EXIT_CODE		EQU PAGE_BASE + 0x2D5E
@@ -479,14 +551,35 @@ S10_RUNTIME_STACK_TOP	EQU 0xC000
 ; with no slack, so
 ; NETDRV_FAIL_CODE/S9_EXIT_CODE above are carved out of F13_STATE_BASE's own
 ; reserve instead of a gap in this block.
+	IFDEF TCPX_LARGE_MSS
+; At MSS 1460 the data channel's durable queue is two whole segments (2,920)
+; and the control channel's is one (TCPX_SPLIT_PENDING, tcp_transport.asm).
+; The asymmetry is the whole point: the control channel only ever queues the
+; one reply line that lands while the data channel is being drained -- a
+; "226 Transfer complete" -- so a second 2,920-byte region was 1.4 KiB of
+; this page held for a few dozen bytes, and this page is the only place the
+; disk buffer can come from. The application buffer then takes what is left
+; below RUNTIME_BASE: it stages one control reply or one LIST chunk at a
+; time and both are read in a loop, so shrinking it costs extra RECV calls
+; on paths that are not the transfer.
+; Region 0 belongs to FTP's control channel and region 1 to its data channel
+; (FTP_CTRL_CHANNEL/FTP_DATA_CHANNEL in ftp.asm), which is why the deep one
+; is the second.
+S11_PENDING0		EQU PAGE_BASE + 0x1C00
+S11_PENDING_CAPACITY	EQU 0x05B4	; 1 * 1460, control channel
+S11_PENDING1_CAPACITY	EQU 0x0B68	; 2 * 1460, data channel
+S11_APP_CAPACITY	EQU 0x0194
+	ELSE
 S11_PENDING0		EQU PAGE_BASE + 0x1800
 S11_PENDING_CAPACITY	EQU 0x0A78	; TCP_RECV_SEGMENTS * TCP_MSS; see tcp_transport.asm's ASSERT
+S11_PENDING1_CAPACITY	EQU 0x0A78
+S11_APP_CAPACITY	EQU 0x01C0	; flush: S11_APP_BUFFER + S11_APP_CAPACITY = RUNTIME_BASE exactly
+	ENDIF
 S11_PENDING1		EQU S11_PENDING0 + S11_PENDING_CAPACITY
-S11_CONTEXT0		EQU S11_PENDING1 + S11_PENDING_CAPACITY
+S11_CONTEXT0		EQU S11_PENDING1 + S11_PENDING1_CAPACITY
 S11_CONTEXT1		EQU S11_CONTEXT0 + S11_CONTEXT_SIZE
 S11_STATE_BASE		EQU S11_CONTEXT1 + S11_CONTEXT_SIZE
 S11_APP_BUFFER		EQU S11_STATE_BASE + 0x0100
-S11_APP_CAPACITY	EQU 0x01C0	; flush: S11_APP_BUFFER + S11_APP_CAPACITY = RUNTIME_BASE exactly
 	ELSE
 	IFDEF STAGE12_LAYOUT
 ; WGET's channel never selects context 1 (see SELECT_CONTEXT's
@@ -501,7 +594,11 @@ S11_PENDING0		EQU PAGE_BASE + 0x2000
 S11_PENDING1		EQU S11_PENDING0	; PENDING_BASE's IX==CONTEXT0 branch always
 						; fires under STAGE12_LAYOUT; this alias only
 						; keeps the shared unconditional code assembling
+	IFDEF TCPX_LARGE_MSS
+S11_PENDING_CAPACITY	EQU 0x0B68	; 2 * 1460; see tcp_transport.asm's ASSERT
+	ELSE
 S11_PENDING_CAPACITY	EQU 0x0A78	; TCP_RECV_SEGMENTS * TCP_MSS; see tcp_transport.asm's ASSERT
+	ENDIF
 S11_CONTEXT0		EQU PAGE_BASE + 0x2C40
 S11_STATE_BASE		EQU PAGE_BASE + 0x2C80
 S11_APP_BUFFER		EQU PAGE_BASE + 0x2D80
@@ -599,7 +696,7 @@ S11_REMOTE_TEXT		EQU PAGE_BASE + 0x3700
 
 	IFDEF STAGE13_LAYOUT
 	ASSERT S11_PENDING0 + S11_PENDING_CAPACITY <= S11_PENDING1
-	ASSERT S11_PENDING1 + S11_PENDING_CAPACITY <= S11_CONTEXT0
+	ASSERT S11_PENDING1 + S11_PENDING1_CAPACITY <= S11_CONTEXT0
 	ASSERT S11_CONTEXT0 + S11_CONTEXT_SIZE <= S11_CONTEXT1
 	ASSERT S11_CONTEXT1 + S11_CONTEXT_SIZE <= S11_STATE_BASE
 	ASSERT S11_STATE_BASE + 0x0100 <= S11_APP_BUFFER
@@ -661,8 +758,16 @@ F13_TOTAL_WRITTEN	EQU F13_STATE_BASE + 0x43 ; four bytes LE, progress display on
 ; readers can take it as one 32-bit load: nothing writes +3 and the page is
 ; cleared at startup, so the top byte is structurally zero.
 F13_ELAPSED		EQU F13_STATE_BASE + 0x47 ; four bytes LE, seconds
-; F13_STATE_BASE+0x4B .. +0x5D remains free for further scalars; +0x5E/+0x5F
-; are NETDRV_FAIL_CODE/S9_EXIT_CODE (memory.inc, above).
+; F13_STATE_BASE+0x4B .. +0x5D remains free for further scalars. The last two
+; bytes of the reserve are the page-backed status pair every STAGE10_PAGE
+; layout needs somewhere; they are written here, relative to the reserve, so
+; that moving the S11 block moves them with it. Spelling them as an absolute
+; PAGE_BASE offset (which is what the two IFDEFs near the top of this file
+; used to do) survived the MSS change as a still-assembling address that had
+; drifted 542 bytes into S11_APP_BUFFER -- onto bytes a long LIST or a long
+; control reply writes.
+NETDRV_FAIL_CODE	EQU F13_STATE_BASE + 0x5E
+S9_EXIT_CODE		EQU F13_STATE_BASE + 0x5F
 F13_HOST		EQU PAGE_BASE + 0x3800 ; 64 bytes
 F13_REMOTE_PATH	EQU PAGE_BASE + 0x3840 ; 256 bytes, RETR/STOR/LIST argument
 F13_LOCAL_OUTPUT	EQU PAGE_BASE + 0x3940 ; 96 bytes

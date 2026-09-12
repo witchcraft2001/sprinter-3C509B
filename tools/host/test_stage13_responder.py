@@ -37,9 +37,10 @@ def mirror(destination_port):
             "ether_source": bytes.fromhex("02608c123456")}
 
 
-def client_frame(destination_port, seq, ack, flags, payload=b"", window=4096):
+def client_frame(destination_port, seq, ack, flags, payload=b"", window=4096,
+                 mss=stage11.TCP_MSS):
     return stage11.build_tcp(mirror(destination_port), seq, ack, flags, payload,
-                              window=window)
+                              window=window, mss=mss)
 
 
 def payloads_of(replies):
@@ -349,6 +350,33 @@ class Stage13ResponderTest(unittest.TestCase):
         sequences = [stage11.parse_tcp(frame)["sequence"] for frame in data_frames]
         for previous, following, payload in zip(sequences, sequences[1:], payloads):
             self.assertEqual(following, previous + len(payload))
+
+    def test_http_honours_a_large_client_mss(self):
+        # DLDIRECT advertises MSS 1460 because the emulated and physical
+        # network paths charge per frame, not per byte.  A responder that
+        # ignored the option would keep every other test green while silently
+        # denying the client the whole point of the change, so pin it: a
+        # 1460-MSS client must get 1460-byte segments, and a 536-MSS one must
+        # still get 536.
+        for mss in (536, 1460):
+            responder = stage13.Responder()
+            window = 8 * mss
+            synack = responder.handle(client_frame(
+                stage13.HTTP_PORT, 5000, 0, 0x02, window=window, mss=mss))
+            server_isn = stage11.parse_tcp(synack[0][1])["sequence"]
+            responder.handle(client_frame(stage13.HTTP_PORT, 5001, server_isn + 1,
+                                          0x10, window=window, mss=mss))
+            request = b"GET / HTTP/1.0\r\nHost: h\r\n\r\n"
+            replies = responder.handle(client_frame(
+                stage13.HTTP_PORT, 5001, server_isn + 1, 0x18, request, window=window,
+                mss=mss))
+            payloads = [stage11.parse_tcp(frame)["payload"]
+                        for label, frame in replies if label == "HTTP"]
+            self.assertTrue(payloads, f"no HTTP data for mss={mss}")
+            # The first segment carries the response head, so measure the
+            # full-size ones behind it.
+            self.assertEqual(max(len(p) for p in payloads), mss)
+            self.assertEqual(sum(len(p) for p in payloads), window)
 
 
 if __name__ == "__main__":

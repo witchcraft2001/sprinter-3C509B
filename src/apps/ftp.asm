@@ -23,6 +23,33 @@ EXE_VERSION	EQU 1
 ; DLSPEED send nothing but a request line and would carry the code for
 ; nothing.
 	DEFINE TCPX_SEND_BURST
+	; Announce a whole-Ethernet-payload receive MSS (tcp.inc). Costs no image
+	; bytes -- constants plus the WIN2 page layout (memory.inc) -- which is
+	; what makes it the one throughput lever that fits FTP, whose image has
+	; three bytes of headroom. The receive path is charged per segment, so
+	; 2.7x fewer segments is 2.7x less of that fixed cost per byte delivered.
+	DEFINE TCPX_LARGE_MSS
+	; Give the two channels differently sized durable queues
+	; (tcp_transport.asm's PENDING_FREE). FTP is the only image with two live
+	; channels and they are nothing alike: the data channel wants room for
+	; every segment its window promises, the control channel only ever queues
+	; the reply that arrives mid-transfer. Sizing both for the data channel
+	; spent 1.4 KiB of the WIN2 page on a queue that holds a single line --
+	; and that page is the only place RETR's disk buffer can grow, which is
+	; what decides how often the transfer stops to call DSS_WRITE.
+	DEFINE TCPX_SPLIT_PENDING
+	; The receive path DLDIRECT and the DLL already run: one ISA session per
+	; frame, the payload read out of the FIFO with its TCP checksum summed in
+	; the same pass and landed straight in GET_LOOP's disk buffer, ACKs sent
+	; from .WAIT_LOOP rather than from inside frame dispatch, and the eight-
+	; byte FIFO burst. Together they halve the Z80 time per received byte,
+	; which is where most of RETR's wall time went once the DSS_WRITE batch
+	; and the progress repaints had been shown to move nothing. They cost
+	; about 1.5 KiB of image, paid for by starting the WIN2 data area 2 KiB
+	; above PAGE_BASE (memory.inc's S13_IMAGE_LIMIT).
+	DEFINE TCPX_DIRECT_RX
+	DEFINE EL3_SESSION_RX
+	DEFINE FAST_DATAPATH
 
 	DEVICE NOSLOT64K
 	INCLUDE "version.inc"
@@ -325,6 +352,14 @@ START
 	JP	Z,LIST_LOOP
 	JP	GET_LOOP
 
+; FINAL_PROGRESS repaints the counter one last time, unconditionally, and
+; falls into TRANSFER_DONE. GET and PUT both enter here rather than through
+; TRANSFER_DONE directly: PROGRESS_TICK only repaints every fourth flush, so
+; without this the last figure on screen would be whatever the last
+; multiple-of-four flush showed -- or, on a transfer shorter than four
+; flushes, nothing at all. LIST has no counter and still enters below.
+FINAL_PROGRESS
+	CALL	PRINT_PROGRESS
 ; TRANSFER_DONE is the common landing point once GET_LOOP/PUT_LOOP/LIST_LOOP
 ; finish normally (peer closed the data channel / local EOF reached).
 TRANSFER_DONE
@@ -372,25 +407,29 @@ TRANSFER_SUMMARY
 	CALL	@TCPX.CLOSE
 	JP	SUCCESS_NO_FILE
 
-; GET_LOOP receives directly into STAGE9_FILE_BUFFER+used, so a single RECV
-; can drain the whole pending TCP window instead of copying it in from
-; S11_APP_BUFFER one chunk at a time. The buffer is flushed *before* a
-; request when it is already full, because RECV rejects a zero capacity with
-; NETDRV_ERR_PARAMETER.
+; GET_LOOP receives directly into STAGE9_FILE_BUFFER+used. Under
+; EL3_SESSION_RX a segment goes from the card's FIFO straight to that address
+; only while a whole TCP_MSS still fits there; anything smaller is promised
+; from the durable pending queue and copied out of it, an extra pass over
+; every byte that takes that route. So the request is always exactly one
+; whole segment, and the buffer is flushed as soon as one no longer fits:
+; FLUSH_SECTORS writes the whole 512-byte sectors staged so far and slides
+; the sub-sector remainder down to the start of the buffer, which keeps every
+; DSS_WRITE sector-aligned (the file position only ever advances by whole
+; sectors) without ever asking RECV for a partial segment.
 GET_LOOP
 	LD	DE,(F13_BUFFER_USED)
-	LD	HL,STAGE9_FILE_CAPACITY
+	LD	HL,STAGE9_FILE_CAPACITY-TCP_MSS
 	OR	A
-	SBC	HL,DE			; HL = free bytes, DE = write offset
-	JR	NZ,.REQUEST
-	CALL	FLUSH_BUFFER		; full: write it out, then re-derive
+	SBC	HL,DE			; CF: less than one segment free
+	JR	NC,.REQUEST
+	CALL	FLUSH_SECTORS
 	JP	C,FILE_FAIL
 	JR	GET_LOOP
 .REQUEST
-	LD	B,H
-	LD	C,L
 	LD	HL,STAGE9_FILE_BUFFER
 	ADD	HL,DE
+	LD	BC,TCP_MSS
 	LD	DE,FTP_DATA_IDLE_MS
 	LD	A,FTP_DATA_CHANNEL
 	CALL	@TCPX.RECV
@@ -412,8 +451,7 @@ GET_LOOP
 .PEER_CLOSED
 	CALL	FLUSH_BUFFER
 	JP	C,FILE_FAIL
-	CALL	PRINT_PROGRESS
-	JP	TRANSFER_DONE
+	JP	FINAL_PROGRESS
 
 ; LIST_LOOP streams the data channel straight to the console instead of a
 ; file. One byte of the request capacity is held back so the in-place NUL
@@ -453,7 +491,7 @@ PRINT_DATA_CHUNK
 	RET
 .SAVE	DB 0
 
-; PUT_LOOP fills STAGE9_FILE_BUFFER with one DSS read (4 KiB) and hands the
+; PUT_LOOP fills STAGE9_FILE_BUFFER with one DSS read (2 KiB) and hands the
 ; whole chunk to one SEND call; TCPX.SEND segments and ACKs it internally,
 ; so there is no manual per-MSS slicing to do here.
 PUT_LOOP
@@ -464,7 +502,7 @@ PUT_LOOP
 	JP	C,FILE_FAIL
 	LD	A,D
 	OR	E
-	JP	Z,TRANSFER_DONE
+	JP	Z,FINAL_PROGRESS
 	LD	(F13_CHUNK_LEN),DE
 	PUSH	DE
 	POP	BC
@@ -501,23 +539,67 @@ ADD16_TO_32
 	INC	(HL)
 	RET
 
+; FLUSH_BUFFER writes everything staged; the transfer's end and error
+; cleanup use it, since the file's last sector is allowed to be partial.
 FLUSH_BUFFER
+	LD	DE,(F13_BUFFER_USED)
+	LD	A,D
+	OR	E
+	RET	Z
+	CALL	WRITE_STAGED
+	RET	C
+	LD	HL,0
+	LD	(F13_BUFFER_USED),HL
+	RET
+
+; FLUSH_SECTORS writes only the whole sectors staged (F13_BUFFER_USED rounded
+; down to 512) and moves the remainder to the start of the buffer. GET_LOOP
+; calls it when less than a segment is free, and the capacity ASSERT in
+; memory.inc guarantees that at least one whole sector is staged by then,
+; so the loop always makes progress. The slide is under 512 bytes per
+; segment received -- a small fraction of the copy the alternative (asking
+; RECV for the partial remainder, which routes a whole segment through the
+; pending queue) would cost.
+; Out: CF=1/A=NETDRV_ERR_FILE_IO on a write failure. Clobbers all.
+FLUSH_SECTORS
 	LD	HL,(F13_BUFFER_USED)
+	LD	A,H
+	AND	0xFE
+	LD	D,A
+	LD	E,0			; DE = whole sectors staged
+	PUSH	HL
+	PUSH	DE
+	CALL	WRITE_STAGED
+	POP	DE
+	POP	HL
+	RET	C
+	OR	A
+	SBC	HL,DE			; HL = remainder, under one sector
+	LD	(F13_BUFFER_USED),HL
 	LD	A,H
 	OR	L
 	RET	Z
-	CALL	PROGRESS_TICK
+	LD	B,H
+	LD	C,L
 	LD	HL,STAGE9_FILE_BUFFER
-	LD	DE,(F13_BUFFER_USED)
+	ADD	HL,DE
+	LD	DE,STAGE9_FILE_BUFFER
+	LDIR
+	XOR	A
+	RET
+
+; WRITE_STAGED: one DSS_WRITE of DE bytes from the start of the buffer,
+; preceded by the progress tick. In: DE=length (>0).
+; Out: CF=1/A=NETDRV_ERR_FILE_IO on failure. Clobbers all.
+WRITE_STAGED
+	PUSH	DE
+	CALL	PROGRESS_TICK
+	POP	DE
+	LD	HL,STAGE9_FILE_BUFFER
 	LD	A,(F13_FILE_HANDLE)
 	LD	C,DSS_WRITE
 	RST	DSS
-	JR	C,.BAD
-	LD	HL,0
-	LD	(F13_BUFFER_USED),HL
-	XOR	A
-	RET
-.BAD
+	RET	NC
 	LD	A,NETDRV_ERR_FILE_IO
 	SCF
 	RET
@@ -538,15 +620,31 @@ FLUSH_BUFFER_QUIET
 	LD	(F13_BUFFER_USED),HL
 	RET
 
+; PROGRESS_TICK runs once per disk-buffer flush or upload chunk, with the
+; ISA window closed. Only every sixteenth one repaints the counter, for the
+; reason the sibling RTL8019A kit decimates its own: the repaint is a
+; carriage return plus a dozen DSS console characters and two 32-bit decimal
+; conversions on the transfer's critical path. RETR now flushes about once
+; per received segment (see GET_LOOP), so sixteen flushes is roughly 20 KiB
+; -- the same cadence the sibling's fourth-of-8-KiB gives, still a few
+; updates a second at any rate worth watching. The final repaint is forced
+; by the transfer's own end, so the last figure is always exact.
+;
+; .DOT is placed first so the common path falls straight through into
+; PRINT_PROGRESS instead of spending a CALL/RET on it.
+PROGRESS_DOT
+	LD	A,'.'
+	JP	@CONSOLE.CHAR
 PROGRESS_TICK
 	LD	A,(F13_FLAGS)
 	BIT	2,A
-	JR	NZ,.DOT
-	CALL	PRINT_PROGRESS
-	RET
-.DOT
-	LD	A,'.'
-	JP	@CONSOLE.CHAR
+	JR	NZ,PROGRESS_DOT
+	LD	HL,F13_PROGRESS_COUNT
+	INC	(HL)
+	LD	A,(HL)
+	AND	15
+	RET	NZ
+	; fall through into PRINT_PROGRESS
 
 ; PRINT_PROGRESS prints an in-place "X / Y" line. Unlike WGET's HTTP
 ; Content-Length under a partial 206, FTP's SIZE reply is always the whole
@@ -1711,6 +1809,6 @@ SAVED_EXIT_CODE EQU S10_COMMAND_BUFFER
 	INCLUDE "stage11_app.asm"
 	INCLUDE "stage12_dns.asm"
 
-	; Same bound as WGET: the image is code and rodata only, and PAGE_BASE
-	; is where the runtime data area starts.
-	ASSERT $ <= PAGE_BASE
+	; The image is code and rodata only and must end where the WIN2 data
+	; area starts. For FTP that is 2 KiB past PAGE_BASE (memory.inc).
+	ASSERT $ <= S13_IMAGE_LIMIT

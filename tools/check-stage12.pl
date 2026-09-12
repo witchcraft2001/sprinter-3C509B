@@ -36,10 +36,23 @@ die "Stage 12 may call DSS with the ISA window open\n"
 die "WGET resume does not use DSS MOVE_FP/206 gating\n"
     unless $code =~ /DSS_MOVE_FP/ && $code =~ /SEEK_END/ &&
            $code =~ /LD\s+DE,206/ && $code =~ /Range: bytes=/;
-die "WGET 6 KiB disk buffer or shared 2 KiB work area changed\n"
-    unless $code =~ /STAGE9_FILE_CAPACITY\s+EQU\s+0x1800/ &&
-           $code =~ /STAGE9_TX_CAPACITY\s+EQU\s+0x0400/ &&
-           $code =~ /STAGE9_RX_CAPACITY\s+EQU\s+0x0400/;
+# WGET announces a 1460-byte MSS, so both staging buffers must hold a whole
+# 1,514-byte Ethernet frame. The receive one is load-bearing: READ_FRAME
+# rejects a frame larger than the capacity it is handed, so a 1 KiB buffer
+# here would drop every full-size data segment instead of merely being slow.
+# The disk buffer pays for the extra KiB and is the right thing to spend: it
+# only batches DSS writes, while the frame buffers decide whether the fast
+# path works at all.
+die "WGET frame staging buffers no longer hold a whole 1514-byte frame\n"
+    unless $code =~ /IFDEF WGET_LAYOUT\n[\s\S]*?STAGE9_TX_BUFFER\s+EQU\s+PAGE_BASE \+ 0x0800\n[\s\S]*?STAGE9_TX_CAPACITY\s+EQU\s+0x0600[\s\S]*?STAGE9_RX_CAPACITY\s+EQU\s+0x0600[\s\S]*?STAGE9_FILE_CAPACITY\s+EQU\s+0x0C00[\s\S]*?STAGE9_MAX_FRAME\s+EQU\s+14 \+ 20 \+ 20 \+ 1460\nS12_IMAGE_LIMIT\s+EQU\s+STAGE9_TX_BUFFER/;
+# WGET runs the session receive path; its image is paid for by the data area
+# starting 2 KiB above PAGE_BASE (S12_IMAGE_LIMIT), and the body is received one
+# whole segment per RECV straight into the disk buffer, flushed in whole sectors.
+die "WGET lost the session receive path or its layout\n"
+    unless slurp('src/apps/wget.asm', 0) =~ /DEFINE\s+WGET_LAYOUT\s*\n\s*DEFINE\s+EL3_SESSION_RX/ &&
+           slurp('src/apps/wget.asm', 0) =~ /ASSERT \$ <= S12_IMAGE_LIMIT/ &&
+           slurp('src/apps/wget.asm', 0) =~ /\.RX_DIRECT\n[\s\S]{0,120}?LD\s+BC,TCP_MSS\s*\n[\s\S]{0,80}?CALL\s+\@TCPX\.RECV/ &&
+           slurp('src/apps/wget.asm', 0) =~ /FLUSH_SECTORS\n[\s\S]{0,200}?AND\s+0xFE[\s\S]{0,300}?LDIR/;
 # The advertised receive window is the whole point of the Stage 12 transport
 # tuning: it must be the room actually left in the pending region, never the
 # full-or-nothing value it started as, which closed the window on every accepted
@@ -49,10 +62,33 @@ die "Stage 12 advertises a binary receive window instead of real free space\n"
     unless $transport =~ /HL = free = CAPACITY - OFF - LEN/ &&
            $transport !~ /LD\s+HL,TCP_RECV_WINDOW\s*\n\s*JP\s+Z,\.WINDOW_OPEN/ &&
            $transport =~ /silly window syndrome/;
+# The receive window must stay several whole segments deep in both arms: that
+# is what lets the peer keep more than one segment in flight instead of
+# stopping for each acknowledgement.
+my $tcp_inc = slurp('src/include/tcp.inc', 0);
 die "Stage 12 receive window is no longer several segments deep\n"
-    unless slurp('src/include/tcp.inc', 0) =~
-           /IFDEF STAGE12_LAYOUT\nTCP_RECV_SEGMENTS\s+EQU\s+[2-9]/ &&
-           $code =~ /S11_PENDING_CAPACITY\s+EQU\s+0x0A78/;
+    unless $tcp_inc =~
+           /IFDEF STAGE12_LAYOUT\n\tIFDEF TCPX_LARGE_MSS\n[\s\S]*?\nTCP_RECV_SEGMENTS\s+EQU\s+[2-9]\n\tELSE\nTCP_RECV_SEGMENTS\s+EQU\s+[2-9]\n/ &&
+           $code =~ /IFDEF TCPX_LARGE_MSS\nS11_PENDING_CAPACITY\s+EQU\s+0x0B68/;
+# WGET raises its MSS; UNET509B.DLL must not. The DLL's durable queue is one
+# MSS-sized slot per channel, and at 1460 that degenerates into a zero-window
+# stop/start cycle -- the sibling RTL8019A kit draws the same line for the same
+# reason. Pin both halves: the constant itself, and who is allowed to ask.
+die "WGET no longer announces the whole-Ethernet MSS\n"
+    unless $tcp_inc =~ /IFDEF TCPX_LARGE_MSS\nTCP_MSS\s+EQU\s+1460\n\tELSE\nTCP_MSS\s+EQU\s+536\n/ &&
+           slurp('src/apps/wget.asm', 0) =~ /DEFINE\s+TCPX_LARGE_MSS/;
+die "UNET509B.DLL must stay at the 536-byte MSS\n"
+    if slurp('src/dll/unet509b.asm', 0) =~ /DEFINE\s+TCPX_LARGE_MSS/;
+# The body must land in the disk buffer directly. Routing it through
+# S11_APP_BUFFER chopped every whole-MSS segment into three RECV calls (that
+# buffer is 544 bytes) and copied every byte a second time on the way out --
+# about a tenth of WGET's total work on a 200 KiB download. Only the headers,
+# which PROCESS_CHUNK scans a byte at a time, still go through the staging
+# buffer.
+die "WGET no longer receives the body straight into its disk buffer\n"
+    unless slurp('src/apps/wget.asm', 0) =~
+        /\.RX_DIRECT\n[\s\S]{0,200}?LD\s+HL,STAGE9_FILE_BUFFER[\s\S]{0,200}?CALL\s+\@TCPX\.RECV/;
+
 die "Stage 12 test responders answer one segment per frame\n"
     unless slurp('tools/host/stage12_responder.py', 0) =~ /while connection\["pending"\]:/ &&
            $code =~ /Keep sending while the window the client advertised still has room/;
@@ -60,7 +96,7 @@ die "Stage 12 test responders answer one segment per frame\n"
 die "Stage 12 layout assertions are incomplete\n"
     unless $code =~ /W12_STATE_BASE \+ 0x40 <= S11_APP_BUFFER/ &&
            $code =~ /S9_TFTP_ERROR_DESC \+ 10 <= S10_RUNTIME_STACK_TOP - 0x0100/ &&
-           $code =~ /ASSERT \$ <= PAGE_BASE/;
+           $code =~ /ASSERT \$ <= S12_IMAGE_LIMIT/;
 die "Stage 12 does not preserve the IX command record before its first DSS call\n"
     unless $code =~ /SAVE_COMMAND[\s\S]*LDIR[\s\S]*ALLOCATE_FRESH[\s\S]*DSS_GETMEM/ &&
            $code =~ /S10_COMMAND_BUFFER\s+EQU\s+0x4000/;
@@ -87,11 +123,12 @@ die "WGET.EXE has invalid DSS header\n"
     unless substr($exe, 0, 4) eq "EXE\x01" && unpack('v', substr($exe, 4, 2)) == 128 &&
            unpack('v', substr($exe, 16, 2)) == 0x4100 &&
            unpack('v', substr($exe, 20, 2)) == 0xBFF0;
-# The image is code and rodata loaded at 4080h; PAGE_BASE (8000h) is where the
-# runtime data area starts, so that bounds it. The header stack sits at the top
-# of WIN2, a whole window above, and must stay clear of the data area's top.
+# The image is code and rodata loaded at 4080h; the runtime data area starts
+# 2 KiB above PAGE_BASE (8800h, memory.inc's S12_IMAGE_LIMIT), so that bounds
+# it. The header stack sits at the top of WIN2, a whole window above, and must
+# stay clear of the data area's top.
 die "WGET.EXE runs into its runtime data area\n"
-    if 0x4080 + length($exe) > 0x8000;
+    if 0x4080 + length($exe) > 0x8800;
 die "WGET.EXE entry stack is not at the top of WIN2\n"
     if unpack('v', substr($exe, 20, 2)) != 0xBFF0;
 my $payload = substr($exe, 128);

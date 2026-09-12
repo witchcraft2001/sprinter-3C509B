@@ -24,9 +24,14 @@ missing, or malformed `Location` fails without writing the response body.
 HTTP error pages are not stored. A new empty output is removed after an HTTP
 failure; a pre-existing resume file is retained unchanged.
 
-Normal progress is repainted after every 6 KiB disk-buffer flush, then once at
-completion. `-d` prints one dot per flush instead of the KB counter; the final
-time/rate summary is still printed. Esc or Ctrl+C, timeout, and a premature
+Normal progress is repainted every sixteenth disk-buffer flush — the body
+is received one segment at a time straight into the buffer and whole 512-byte
+sectors are written as soon as the next segment would not fit, so a flush is
+about one segment and the repaint interval roughly 20 KiB — and once more at
+completion. Repainting on every flush cost measurable transfer time: the
+counter is a carriage return, a dozen console characters and two 32-bit
+decimal conversions, all of it on the download's critical path. `-d` prints one dot per flush instead of the KB
+counter; the final time/rate summary is still printed. Esc or Ctrl+C, timeout, and a premature
 close retain already received bytes for a later `-r` run.
 
 A response carrying `Content-Length` is finished the moment that many body

@@ -834,6 +834,12 @@ class EtherLinkIII {
         const serverIsn = ((options.serverIsn ?? 0x10203040) + ordinal * 0x10000) >>> 0;
         connection = {serverIsn, serverNext: (serverIsn + 1) >>> 0,
           serverAcked: (serverIsn + 1) >>> 0, clientNext: (segment.sequence + 1) >>> 0,
+          // The MSS option on the client's SYN is a ceiling on what this peer
+          // may put in one segment -- a real sender never exceeds it. Recording
+          // it is what lets a client that asks for whole-Ethernet payloads
+          // actually receive them here instead of silently being fed 536-byte
+          // segments no matter what it advertised.
+          clientMss: segment.mss || 536,
           sendQueue: Buffer.alloc(0), clientWindow: segment.window, established: false,
           advertisedWindow: options.zeroWindowProbes ? 0 : (options.window ?? 4096), finSent: false,
           httpRequest: Buffer.alloc(0), httpReady: false};
@@ -1010,8 +1016,12 @@ class EtherLinkIII {
       const inFlight = (connection.serverNext - connection.serverAcked) >>> 0;
       const available = Math.max(0, connection.clientWindow - inFlight);
       if (!connection.sendQueue.length || !available) break;
-      const size = Math.min(options.responseChunkSize || options.mss || 536,
-        available, connection.sendQueue.length);
+      // Honour the peer's advertised MSS, capped by this responder's own limit.
+      // responseChunkSize still overrides both, for scenarios that deliberately
+      // dribble a body out in odd-sized pieces.
+      const sendMss = options.responseChunkSize ||
+        Math.min(connection.clientMss || 536, options.maxSendMss || 1460);
+      const size = Math.min(sendMss, available, connection.sendQueue.length);
       sentAny = true;
       const payload = connection.sendQueue.subarray(0, size);
       connection.sendQueue = connection.sendQueue.subarray(size);

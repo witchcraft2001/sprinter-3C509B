@@ -30,8 +30,15 @@ offset sent to the server and the starting point of the on-screen byte count.
 A server that refuses `REST` fails without downloading anything. `PUT` never
 resumes.
 
-Progress repaints after every 4 KiB disk-buffer flush (`GET`) or upload chunk
-(`PUT`); `-l`/`-n` streams the listing straight to the console instead.
+Progress repaints every sixteenth disk-buffer flush (`GET`) or upload
+chunk (`PUT`) — roughly every 20–32 KiB — and once more when the transfer
+ends, so the last figure shown is always exact. Repainting on every flush
+cost measurable transfer time: the counter is a carriage return, a dozen
+console characters and two 32-bit decimal conversions, all on the transfer's
+critical path. `GET` receives each segment straight from the card into its
+disk buffer and writes whole 512-byte sectors as soon as the next segment
+would not fit, so a flush happens about once per segment and every write is
+sector-aligned. `-l`/`-n` streams the listing straight to the console instead.
 `-d` prints one dot per flush instead of the KB counter. Esc or Ctrl+C keeps
 whatever `GET` has already written, so a later `-r` run continues it; `PUT`
 and listings have nothing to preserve on cancel.

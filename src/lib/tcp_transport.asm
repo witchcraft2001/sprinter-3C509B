@@ -14,7 +14,16 @@
 ; The pending buffer must hold a whole TCP_RECV_WINDOW so a burst of segments
 ; arriving before the app drains via RECV can be appended rather than
 ; rejected -- see PROCESS_FRAME's accept path.
+	IFDEF TCPX_SPLIT_PENDING
+; Only the bulk channel carries a window's worth. The other advertises its
+; own free space and never promises more than it can store (PENDING_FREE),
+; so one whole segment is all it owes; below that a single arriving segment
+; could never be queued at all.
+	ASSERT S11_PENDING1_CAPACITY >= TCP_RECV_WINDOW
+	ASSERT S11_PENDING_CAPACITY >= TCP_MSS
+	ELSE
 	ASSERT S11_PENDING_CAPACITY >= TCP_RECV_WINDOW
+	ENDIF
 	ENDIF
 
 ; TCPX_TX_BUFFER: every outgoing TCP segment (SYN/data/ACK/FIN/RST) this
@@ -629,20 +638,34 @@ RECV
 	SBC	HL,DE			; remaining capacity
 	LD	DE,TCP_MSS
 	OR	A
-	SBC	HL,DE
-	JR	C,.RECV_SUCCESS		; no whole segment can be promised
-	ENDIF
+	SBC	HL,DE			; CF: no whole segment can be promised
+	; The window-closed latch is settled *before* that decision is acted on.
+	; A latched close means the peer is stopped on a zero window and only an
+	; update sent from here restarts it, and that is true whether or not this
+	; RECV has room for another segment. Acting on the room first, as this
+	; used to, dropped the update whenever the caller's buffer filled on the
+	; very drain that emptied the queue -- and then the next RECV waited on a
+	; peer that was waiting on us. FTP's one-segment RECV met it on the first
+	; two segments, which had queued up while it was still reading the "150"
+	; reply. BIT leaves CF alone, so the room verdict survives the send.
+	BIT	0,(IX+CTX_WINDOW_CLOSED)
+	JR	Z,.RECV_ROOM_DECIDED
+	PUSH	AF
+	LD	A,TCP_FLAG_ACK
+	LD	BC,0
+	CALL	SEND_SEGMENT		; best-effort window update
+	POP	AF
+.RECV_ROOM_DECIDED
+	JR	C,.RECV_SUCCESS
+	JP	.RECV_CHECK
+	ELSE
 	IFDEF	STAGE12_LAYOUT
 	; A multi-segment window only closes once the pending region is full,
 	; so draining it does not by itself mean the peer is blocked. Spend the
 	; extra round trip on a window update only when we really did advertise
 	; zero; SEND_SEGMENT_COMMON below clears the latch as it reopens.
 	BIT	0,(IX+CTX_WINDOW_CLOSED)
-	IFDEF EL3_SESSION_RX
-	JP	Z,.RECV_CHECK
-	ELSE
 	JP	Z,.RECV_SUCCESS
-	ENDIF
 	ELSE
 	; The one-MSS window closes on every accepted segment, so a drained
 	; pending slot always means the window just reopened from zero.
@@ -650,8 +673,6 @@ RECV
 	LD	A,TCP_FLAG_ACK
 	LD	BC,0
 	CALL	SEND_SEGMENT		; best-effort window update
-	IFDEF EL3_SESSION_RX
-	JP	.RECV_CHECK
 	ENDIF
 .RECV_SUCCESS
 	IFDEF EL3_SESSION_RX
@@ -1136,27 +1157,36 @@ CHOOSE_BURST
 	LD	(S11_ACTIVE_LENGTH),HL
 	LD	(S11_BURST_FIRST),HL
 	XOR	A
-	LD	(S11_BURST_PAIR),A	; also leaves CF clear for the compare
-	LD	DE,TCP_MSS		; below; neither store touches the flags
-	SBC	HL,DE
-	RET	NZ			; a short first segment ends the buffer or
-					; rides a squeezed window: send it alone
+	LD	(S11_BURST_PAIR),A
+	; Everything below is expressed in whole multiples of the length
+	; CHOOSE_SEGMENT_LENGTH just picked, never in TCP_MSS. That constant is
+	; our *receive* MSS; what bounds a segment we send is the peer's, which
+	; CHOOSE_SEGMENT_LENGTH already applied (CTX_PEER_MSS). While the two
+	; happened to be equal the difference was invisible -- once they differ,
+	; comparing against TCP_MSS matches nothing and the pair silently never
+	; forms, dropping the upload back to stop-and-wait.
+	;
+	; A first segment shortened by the buffer or by a squeezed window needs no
+	; separate test: doubling it then fails one of the two checks below.
+	ADD	HL,HL			; HL = DE = two whole first segments
+	RET	C
+	LD	D,H
+	LD	E,L
 	LD	HL,(S11_SEND_REMAINING)
-	LD	DE,TCP_MSS*2
 	OR	A
 	SBC	HL,DE
 	RET	C			; fewer than two whole segments left
-	; The peer must be able to hold both at once. Testing the high byte alone
-	; rounds that requirement up to the next 256 bytes, which costs nothing
-	; real: a window between two MSS and that boundary simply keeps the old
-	; one-segment behaviour, and no peer advertises one.
-	LD	A,(IX+CTX_REMOTE_WINDOW+1)
-	CP	(TCP_MSS*2+255)/256
+	; The peer must be able to hold both at once. This is now an exact 16-bit
+	; compare rather than the old high-byte approximation, which only existed
+	; to keep the constant form cheap.
+	LD	L,(IX+CTX_REMOTE_WINDOW)
+	LD	H,(IX+CTX_REMOTE_WINDOW+1)
+	OR	A
+	SBC	HL,DE
 	RET	C
 	LD	A,1
 	LD	(S11_BURST_PAIR),A
-	LD	HL,TCP_MSS*2
-	LD	(S11_ACTIVE_LENGTH),HL
+	LD	(S11_ACTIVE_LENGTH),DE
 	RET
 
 ; SEND_BURST copies and transmits the burst CHOOSE_BURST picked. Both segments
@@ -1187,12 +1217,12 @@ SEND_BURST
 	OR	A
 	RET	Z			; single segment: CF is clear, A is zero
 	LD	DE,STAGE9_TX_BUFFER+14+IPV4_HEADER_LENGTH+TCP_HEADER_LENGTH
-	LD	BC,TCP_MSS
-	LDIR
+	LD	BC,(S11_BURST_FIRST)	; the pair is two equal segments, and that
+	LDIR				; length came from the peer's MSS, not ours
 	LD	A,SEQUENCE_FROM_BURST
 	LD	(S11_SEQUENCE_OVERRIDE),A
 	LD	A,TCP_FLAG_PSH|TCP_FLAG_ACK
-	LD	BC,TCP_MSS
+	LD	BC,(S11_BURST_FIRST)
 	JP	SEND_SEGMENT_COMMON
 	ENDIF
 
@@ -1372,6 +1402,9 @@ SEND_SEGMENT_COMMON
 	; and it keeps the promise exact without moving bytes around. Under one
 	; MSS the answer is zero -- a dribbling window is silly window syndrome --
 	; and the latch is what tells RECV such a close needs an explicit reopen.
+	IFDEF TCPX_SPLIT_PENDING
+	CALL	PENDING_FREE
+	ELSE
 	LD	HL,S11_PENDING_CAPACITY
 	LD	E,(IX+CTX_PENDING_OFF)
 	LD	D,(IX+CTX_PENDING_OFF+1)
@@ -1380,6 +1413,7 @@ SEND_SEGMENT_COMMON
 	LD	E,(IX+CTX_PENDING_LEN)
 	LD	D,(IX+CTX_PENDING_LEN+1)
 	SBC	HL,DE			; HL = free = CAPACITY - OFF - LEN
+	ENDIF
 	LD	DE,TCP_MSS
 	OR	A
 	SBC	HL,DE
@@ -1861,6 +1895,9 @@ FAST_RECEIVE
 	LD	(S11_FAST_DIRECT),A
 	JR	.FAST_DEST_READY
 .FAST_TRY_PENDING
+	IFDEF TCPX_SPLIT_PENDING
+	CALL	PENDING_FREE		; the two queues differ in size (FTP)
+	ELSE
 	LD	HL,S11_PENDING_CAPACITY
 	LD	E,(IX+CTX_PENDING_OFF)
 	LD	D,(IX+CTX_PENDING_OFF+1)
@@ -1869,6 +1906,7 @@ FAST_RECEIVE
 	LD	E,(IX+CTX_PENDING_LEN)
 	LD	D,(IX+CTX_PENDING_LEN+1)
 	SBC	HL,DE			; HL = CAPACITY - OFF - LEN
+	ENDIF
 	LD	DE,(S11_FAST_LENGTH)
 	OR	A
 	SBC	HL,DE
@@ -2311,6 +2349,9 @@ HANDLE_SEGMENT
 	; next in-order segment can legitimately arrive before RECV drains the
 	; previous one. Reject (re-ACK, unmodified) only if it will not fit;
 	; the peer's own retransmit timer recovers a rejected segment.
+	IFDEF TCPX_SPLIT_PENDING
+	CALL	PENDING_FREE
+	ELSE
 	LD	HL,S11_PENDING_CAPACITY
 	LD	E,(IX+CTX_PENDING_OFF)
 	LD	D,(IX+CTX_PENDING_OFF+1)
@@ -2319,6 +2360,7 @@ HANDLE_SEGMENT
 	LD	E,(IX+CTX_PENDING_LEN)
 	LD	D,(IX+CTX_PENDING_LEN+1)
 	SBC	HL,DE			; HL = available = CAPACITY - OFF - LEN
+	ENDIF
 	LD	DE,(S11_SEGMENT_LENGTH)
 	OR	A
 	SBC	HL,DE
@@ -2662,6 +2704,50 @@ PENDING_BASE
 	RET	Z
 	LD	DE,S11_PENDING1
 	RET
+
+; PENDING_FREE: how many more bytes this context's durable queue can take.
+;   In:  IX = context.
+;   Out: HL = CAPACITY - PENDING_OFF - PENDING_LEN, carry clear.
+;        A and DE are trashed.
+; The region is linear and the head a partial drain leaves behind is not
+; reused until the whole region empties, so OFF counts against the free
+; space exactly like LEN does.
+;
+; TCPX_SPLIT_PENDING gives the two channels different capacities. FTP is the
+; only client with two live channels, and they are not alike: the data
+; channel wants every segment the window promises to have somewhere to land,
+; while the control channel only ever queues the one reply line that arrives
+; while the data channel is being drained. Sizing both for the data channel
+; spent 1.4 KiB of the page on a queue that never holds more than a reply,
+; and that page is where the disk buffer has to come from. The smaller
+; capacity is not a correctness risk: this value is what SEND_SEGMENT_COMMON
+; advertises and what the append below refuses to exceed, so a peer that
+; somehow sent more would meet a rejected segment and its own retransmit,
+; never an overrun.
+	IFDEF TCPX_SPLIT_PENDING
+PENDING_FREE
+	IFDEF TCPX_SPLIT_PENDING
+	; The two contexts are one CTX_SIZE apart, so their low address bytes
+	; always differ; the ASSERT is what keeps that true if the block moves.
+	ASSERT (S11_CONTEXT0 & 0xFF) != (S11_CONTEXT1 & 0xFF)
+	LD	A,IXL
+	CP	S11_CONTEXT0 & 0xFF
+	LD	HL,S11_PENDING_CAPACITY
+	JR	Z,.HAVE_CAPACITY
+	LD	HL,S11_PENDING1_CAPACITY
+.HAVE_CAPACITY
+	ELSE
+	LD	HL,S11_PENDING_CAPACITY
+	ENDIF
+	LD	E,(IX+CTX_PENDING_OFF)
+	LD	D,(IX+CTX_PENDING_OFF+1)
+	OR	A
+	SBC	HL,DE
+	LD	E,(IX+CTX_PENDING_LEN)
+	LD	D,(IX+CTX_PENDING_LEN+1)
+	SBC	HL,DE
+	RET
+	ENDIF
 
 ABORT_CONTEXT
 	LD	A,(IX+CTX_STATE)

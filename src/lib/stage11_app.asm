@@ -37,16 +37,19 @@ ALLOCATE_FRESH
 	; No GETMEM: WIN2 is the program's own second window. It still holds
 	; whatever the previous program left there, and the code below expects the
 	; zero-filled page a fresh GETMEM used to hand back, so clear it -- up to
-	; the command copy only, since the live stack sits above that.
-	LD	HL,PAGE_BASE
-	LD	DE,PAGE_BASE+1
+	; the command copy only, since the live stack sits above that. The clear
+	; starts at the first data buffer, not at PAGE_BASE: FTP's image runs
+	; 2 KiB past PAGE_BASE (memory.inc's S13_IMAGE_LIMIT), and the two are
+	; the same address in every other standard-layout build.
+	LD	HL,STAGE9_TX_BUFFER
+	LD	DE,STAGE9_TX_BUFFER+1
 	IFDEF STAGE13_LAYOUT
 	; FTP's string block runs past S10_PAGE_COMMAND_BUFFER (F13_USER starts
 	; exactly there), so clear through its end instead and leave the record
 	; where SAVE_COMMAND put it -- see the command-copy branch below.
-	LD	BC,F13_OUTPUT_OVERRIDE+96-PAGE_BASE-1
+	LD	BC,F13_OUTPUT_OVERRIDE+96-STAGE9_TX_BUFFER-1
 	ELSE
-	LD	BC,S10_PAGE_COMMAND_BUFFER-PAGE_BASE-1
+	LD	BC,S10_PAGE_COMMAND_BUFFER-STAGE9_TX_BUFFER-1
 	ENDIF
 	LD	(HL),0
 	LDIR

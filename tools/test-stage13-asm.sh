@@ -17,10 +17,12 @@ sjasmplus --nologo --fullpath -I "$repo_root/src/include" -I "$repo_root/src/lib
   "$repo_root/src/apps/dldirect.asm" >"$tmp_dir/dldirect-assembly.log"
 
 # Both load at 4080h and, in the standard layout, own WIN1+WIN2 outright. The
-# image is code and rodata; PAGE_BASE (8000h) is where the runtime data area
-# begins, so that is what bounds it -- crossing it overwrites buffers silently.
+# image is code and rodata; the runtime data area bounds it -- crossing it
+# overwrites buffers silently. For DLDIRECT that is PAGE_BASE (8000h); FTP's
+# data area starts 2 KiB higher (memory.inc's S13_IMAGE_LIMIT, 8800h), which
+# is what pays for its session receive path.
 ftp_size="$(wc -c < "$tmp_dir/FTP.EXE" | tr -d ' ')"
-[ "$ftp_size" -le $((0x8000 - 0x4080)) ]
+[ "$ftp_size" -le $((0x8800 - 0x4080)) ]
 dldirect_size="$(wc -c < "$tmp_dir/DLDIRECT.EXE" | tr -d ' ')"
 [ "$dldirect_size" -le $((0x8000 - 0x4080)) ]
 dlspeed_size="$(wc -c < "$tmp_dir/DLSPEED.EXE" | tr -d ' ')"
@@ -42,7 +44,15 @@ if tail -c +129 "$tmp_dir/DLSPEED.EXE" | perl -0777 -ne 'exit(/\x00{128}/ ? 0 : 
 fi
 
 # FTP: two real TCP contexts (STAGE13_LAYOUT), not WGET's single-channel fold.
-grep -Fq 'S11_CONTEXT1: EQU 0x0000AD18' "$tmp_dir/ftp.sym"
+# The two durable queues are deliberately different sizes (TCPX_SPLIT_PENDING):
+# region 0 is the control channel at one 1460-byte segment, region 1 the data
+# channel at two. The block starts where the 4 KiB disk buffer ends and is
+# still packed flush against RUNTIME_BASE, so these three addresses together
+# pin the whole asymmetric layout: a regression that sized both queues alike
+# would move every one of them.
+grep -Fq 'S11_PENDING0: EQU 0x00009C00' "$tmp_dir/ftp.sym"
+grep -Fq 'S11_PENDING1: EQU 0x0000A1B4' "$tmp_dir/ftp.sym"
+grep -Fq 'S11_CONTEXT1: EQU 0x0000AD44' "$tmp_dir/ftp.sym"
 grep -Fq 'F13_HOST: EQU 0x0000B800' "$tmp_dir/ftp.sym"
 # Resident below the load address, 16 KiB clear of every stack.
 grep -Fq 'S10_COMMAND_BUFFER: EQU 0x00004000' "$tmp_dir/ftp.sym"

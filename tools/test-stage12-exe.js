@@ -48,6 +48,27 @@ function response(status, body = Buffer.alloc(0), headers = {}, closeDelimited =
   return {status, body, headers, closeDelimited};
 }
 function outputFile(result, name) { return result.files[`C:\\NET\\${name.toUpperCase()}`]; }
+// The MSS option off the client's own SYN. WGET announces a whole Ethernet
+// payload, and that only pays off if the option is really on the wire.
+function clientSyn(result) {
+  for (const hex of result.transmittedFrames) {
+    const frame = Buffer.from(hex, 'hex');
+    if (frame.length < 54 || frame.readUInt16BE(12) !== 0x0800 || frame[23] !== 6) continue;
+    const tcp = frame.subarray(34, 34 + frame.readUInt16BE(16) - 20);
+    if (!(tcp[13] & 0x02)) continue;
+    const headerLength = (tcp[12] >> 4) * 4;
+    let mss = 0;
+    for (let at = 20; at < headerLength;) {
+      const kind = tcp[at];
+      if (!kind) break;
+      if (kind === 1) { at++; continue; }
+      if (kind === 2 && tcp[at + 1] === 4) mss = tcp.readUInt16BE(at + 2);
+      at += tcp[at + 1];
+    }
+    return {mss};
+  }
+  throw new Error('client sent no SYN');
+}
 function sha256(value) { return crypto.createHash('sha256').update(value).digest('hex'); }
 
 assert.strictEqual(golden.reference,
@@ -63,10 +84,11 @@ assert.strictEqual(image.readUInt16LE(16), 0x4100);
 // already. The standard layout hands the program WIN1+WIN2 as one region, so
 // the stack sits at the top of WIN2 -- a whole window clear of the image.
 assert.strictEqual(image.readUInt16LE(20), 0xbff0);
-// The image holds code and rodata only; PAGE_BASE (0x8000) is where the
-// runtime data area begins, so that is what bounds it. Keep this strict: an
-// image crossing it silently overwrites buffers instead of failing to load.
-assert.ok(0x4080 + image.length <= 0x8000,
+// The image holds code and rodata only; the runtime data area begins 2 KiB
+// above PAGE_BASE (0x8800, memory.inc's S12_IMAGE_LIMIT), so that is what
+// bounds it. Keep this strict: an image crossing it silently overwrites
+// buffers instead of failing to load.
+assert.ok(0x4080 + image.length <= 0x8800,
   'WGET image runs into its runtime data area');
 let longest = 0, zeroRun = 0;
 for (const byte of image.subarray(128)) {
@@ -143,7 +165,13 @@ assert.strictEqual(result.exitCode, 0, result.output);
 assert.match(result.httpRequests[0], /Range: bytes=70003-/);
 assert.strictEqual(sha256(outputFile(result, 'resumed.bin')),
   sha256(Buffer.concat([prior, remainder])));
-assert.ok(result.dssEvents.includes('WRITE C:\\NET\\RESUMED.BIN 6144'));
+// 137-byte segments: each RECV delivers one, the buffer is flushed in whole
+// sectors as soon as a full MSS no longer fits, and only the final flush is
+// allowed to be partial.
+assert.deepStrictEqual(
+  result.dssEvents.filter((event) => event.startsWith('WRITE C:\\NET\\RESUMED.BIN '))
+    .map((event) => Number(event.split(' ').pop())),
+  [1536, 1536, 1536, 1536, 1536, 1337]);
 checked(result);
 
 result = run('http://192.168.7.44/keep.bin -r', scenario({
@@ -263,18 +291,32 @@ result = run('http://192.168.7.44/LARGE.BIN -y', scenario({
   response: response('200 OK', large)}, {traceDss: true}));
 assert.strictEqual(result.exitCode, 0, result.output);
 assert.strictEqual(sha256(outputFile(result, 'large.bin')), sha256(large));
-const writes = result.dssEvents.filter((event) => event.startsWith('WRITE '));
-// The disk buffer is 6 KiB: the two KiB it gave up went to the TCP receive
-// window, which is worth more than larger write batches (memory.inc).
-assert.deepStrictEqual(writes.slice(0, 8).map((event) => Number(event.split(' ').pop())),
-  Array(8).fill(6144));
-assert.strictEqual(Number(writes.at(-1).split(' ').pop()), 2417); checked(result);
+const writes = result.dssEvents.filter((event) => event.startsWith('WRITE '))
+  .map((event) => Number(event.split(' ').pop()));
+// The disk buffer is 3 KiB: it gave 2 KiB to the image for the session
+// receive path, after live FTP runs showed DSS_WRITE costs per byte, not per
+// call. Each RECV takes one whole 1460-byte segment straight from the FIFO,
+// and as soon as another would not fit the whole sectors staged are written
+// and the sub-sector remainder slides down -- so every body write but the
+// last is 1536 or 2560 (the 2560 lands whenever the carry-over is small
+// enough for two segments to have fitted), and none straddles a sector.
+assert.strictEqual(writes.length, 40);
+assert.ok(writes.slice(0, -1).every((size) => size === 1536 || size === 2560),
+  `body writes are not whole sectors: ${writes}`);
+assert.strictEqual(writes.at(-1), 1905);
+assert.strictEqual(writes.reduce((sum, size) => sum + size, 0), large.length);
+// Sixteen flushes per repaint plus the forced final one: 40 flushes -> 3.
+assert.strictEqual((result.output.match(/KB \/ /g) || []).length, 3,
+  `expected three repaints of the counter, got:\n${result.output}`);
+checked(result);
 
 result = run('http://192.168.7.44/FULL.BIN -y', scenario({
   response: response('200 OK', Buffer.alloc(9000, 0x5a))},
   {diskFullAfter: 8192, traceDss: true}));
 assert.strictEqual(result.exitCode, 5); assert.match(result.output, /file create\/write failed/);
-assert.strictEqual(outputFile(result, 'full.bin').length, 6144); checked(result);
+// Four whole-sector writes (2560+1536+1536+1536) land before the fifth would
+// cross the 8192-byte limit.
+assert.strictEqual(outputFile(result, 'full.bin').length, 7168); checked(result);
 
 result = run('http://192.168.7.44/CLOSEERR.BIN -y', scenario({
   response: response('200 OK', 'complete')}, {fileCloseFailAt: 1}));
@@ -350,9 +392,14 @@ result = run('http://192.168.7.44/RATE.BIN -y', scenario({
   {clockFreezeAfterReads: undefined, timeStepSeconds: 1}));
 assert.match(result.output, /  5 bytes in [1-9][0-9]* sec, 0 B\/s\r\n/); checked(result);
 
+// 0.03 s per emulated clock read, not 0.01: the same 70 KiB now arrives in
+// roughly a third as many segments (MSS 1460), so it costs a third as many
+// polls and clock reads. At the old step the transfer finished inside one
+// emulated second and the rate line correctly suppressed itself, which is the
+// "sample too short" path rather than the formatting this case is here to pin.
 result = run('http://192.168.7.44/FAST.BIN -y', scenario({
   response: response('200 OK', Buffer.alloc(70001, 0x21))},
-  {clockFreezeAfterReads: undefined, timeStepSeconds: 0.01}));
+  {clockFreezeAfterReads: undefined, timeStepSeconds: 0.03}));
 assert.match(result.output, /  70001 bytes in [1-9][0-9]* sec, [1-9][0-9]* KB\/s\r\n/);
 // Two things are worth gating on a fixed 70 KiB download. Emulated CPU work is
 // one: the hot loops (ETHERNET.ACCUMULATE, EL3IO.FIFO_READ) brought it from
@@ -363,9 +410,14 @@ assert.ok(result.steps < 1_900_000,
 // The other is the depth of the receive pipe, which is what a latency-bound
 // link actually cares about and what CPU steps cannot see. The peer must be
 // able to keep a whole window in flight; a binary or one-MSS window shows up
-// here immediately.
-assert.ok(result.maxInFlight >= 5 * 536,
-  `peer kept only ${result.maxInFlight} bytes in flight, expected a 5-segment window`);
+// here immediately. The window is now two whole 1460-byte segments.
+assert.ok(result.maxInFlight >= 2 * 1460,
+  `peer kept only ${result.maxInFlight} bytes in flight, expected a 2-segment window`);
+// WGET asks for a whole Ethernet payload, and the peer must actually use it:
+// a responder that ignored the MSS option would leave every other assertion
+// here green while the transfer kept paying per-segment costs it need not.
+assert.strictEqual(clientSyn(result).mss, 1460,
+  'WGET did not advertise MSS 1460 on its SYN');
 checked(result);
 
 result = run('http://192.168.7.44/MIDNIGHT.BIN -y', scenario({
