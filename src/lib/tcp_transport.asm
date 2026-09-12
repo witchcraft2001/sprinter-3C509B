@@ -71,32 +71,7 @@ TCPX_TX_CAPACITY	EQU STAGE9_TX_CAPACITY
 	ENDIF
 
 	MODULE TCPX
-
-CTX_STATE		EQU 0
-CTX_REMOTE_IP		EQU 1
-CTX_REMOTE_MAC		EQU 5
-CTX_REMOTE_PORT	EQU 11
-CTX_LOCAL_PORT		EQU 13
-CTX_SND_UNA		EQU 15
-CTX_SND_NXT		EQU 19
-CTX_RCV_NXT		EQU 23
-CTX_PEER_MSS		EQU 27
-CTX_PENDING_LEN	EQU 29
-CTX_PENDING_OFF	EQU 31
-CTX_LAST_STATUS	EQU 33
-CTX_EVENT		EQU 34
-CTX_REMOTE_FIN		EQU 35
-CTX_REMOTE_WINDOW	EQU 36
-CTX_RETRY_LEFT		EQU 38
-CTX_WINDOW_CLOSED	EQU 39	; bit 0: the last segment sent advertised a zero
-				; window. Fits the trailing pad byte of the context.
-
-EVENT_ACK		EQU 0x01
-EVENT_DATA		EQU 0x02
-EVENT_FIN		EQU 0x04
-EVENT_RST		EQU 0x08
-EVENT_SYN_ACK		EQU 0x10
-EVENT_WINDOW		EQU 0x20
+	INCLUDE "tcpctx.inc"
 
 ; Ethernet + fixed IPv4 + fixed TCP header. The two-phase receive reads
 ; exactly this much of a frame before deciding what to do with the rest.
@@ -522,9 +497,23 @@ RECV
 	JP	C,.RECV_PARAMETER
 	LD	A,(S11_CHANNEL)
 	CALL	SELECT_CONTEXT
-	JP	NC,.RECV_CHECK
+	JP	NC,.RECV_SELECTED
 	LD	BC,0
 	JP	.RECV_RETURN
+.RECV_SELECTED
+	IFDEF EL3_SESSION_RX
+	LD	HL,(S11_SEND_POINTER)
+	LD	(S11_RX_DEST),HL
+	LD	HL,(S11_COPY_LENGTH)
+	LD	(S11_RX_FREE),HL
+	XOR	A
+	LD	L,A
+	LD	H,A
+	LD	(S11_RX_DELIVERED),HL
+	IFNDEF TCPX_WIDE_DIRECT_WINDOW
+	LD	(S11_FAST_LENGTH),A	; direct-segment count in this RECV scope
+	ENDIF
+	ENDIF
 .RECV_CHECK
 	LD	L,(IX+CTX_PENDING_LEN)
 	LD	H,(IX+CTX_PENDING_LEN+1)
@@ -547,22 +536,11 @@ RECV
 	POP	AF
 	LD	BC,(S11_TIMEOUT_MS)
 	IFDEF	EL3_SESSION_RX
-	; Open the direct-delivery window around this one wait: an in-order
-	; segment that fits goes straight into the caller's buffer instead of
-	; the pending slot, which saves copying it back out again. None of the
-	; stores below touch A (the event mask) or BC (the timeout).
-	LD	HL,(S11_SEND_POINTER)
-	LD	(S11_RX_DEST),HL
-	LD	HL,0
-	LD	(S11_RX_DELIVERED),HL
-	LD	HL,(S11_COPY_LENGTH)
-	LD	(S11_RX_FREE),HL
+	; The scope was opened once at .RECV_SELECTED and remains active while
+	; pending bytes and several FIFO segments fill the same caller buffer.
 	CALL	WAIT_FOR_EVENT
 	PUSH	AF
-	LD	HL,0
-	LD	(S11_RX_FREE),HL
 	LD	BC,(S11_RX_DELIVERED)
-	LD	(S11_RX_DELIVERED),HL	; HL is still 0: the count is consumed
 	LD	A,B
 	OR	C
 	JR	Z,.RECV_NO_DIRECT
@@ -580,12 +558,23 @@ RECV
 	JP	NZ,.RECV_RESET
 	JP	.RECV_CHECK
 .RECV_COPY
+	IFDEF EL3_SESSION_RX
+	LD	DE,(S11_RX_DELIVERED)
+	LD	HL,(S11_RX_FREE)
+	OR	A
+	SBC	HL,DE			; remaining caller capacity
+	EX	DE,HL
+	ELSE
 	LD	DE,(S11_COPY_LENGTH)
+	ENDIF
+	LD	L,(IX+CTX_PENDING_LEN)
+	LD	H,(IX+CTX_PENDING_LEN+1)
 	OR	A
 	SBC	HL,DE
 	JP	C,.CAPACITY_SMALLER
 	JP	Z,.CAPACITY_SMALLER
-	LD	HL,(S11_COPY_LENGTH)
+	LD	H,D
+	LD	L,E			; pending is larger: copy remaining capacity
 	JP	.COPY_READY
 .CAPACITY_SMALLER
 	ADD	HL,DE
@@ -595,7 +584,16 @@ RECV
 	LD	L,(IX+CTX_PENDING_OFF)
 	LD	H,(IX+CTX_PENDING_OFF+1)
 	ADD	HL,DE
+	IFDEF EL3_SESSION_RX
+	LD	DE,(S11_RX_DEST)
+	PUSH	HL
+	LD	HL,(S11_RX_DELIVERED)
+	ADD	HL,DE
+	EX	DE,HL
+	POP	HL
+	ELSE
 	LD	DE,(S11_SEND_POINTER)
+	ENDIF
 	LD	BC,(S11_COPY_LENGTH)
 	LDIR
 	LD	HL,(S11_COPY_LENGTH)
@@ -617,13 +615,34 @@ RECV
 	XOR	A
 	LD	(IX+CTX_PENDING_OFF),A
 	LD	(IX+CTX_PENDING_OFF+1),A
+	IFDEF EL3_SESSION_RX
+	LD	HL,(S11_RX_DELIVERED)
+	LD	DE,(S11_COPY_LENGTH)
+	ADD	HL,DE
+	LD	(S11_RX_DELIVERED),HL
+	LD	A,(IX+CTX_REMOTE_FIN)
+	OR	A
+	JR	NZ,.RECV_SUCCESS	; deliver the FIN-bearing tail before close
+	LD	DE,(S11_RX_FREE)
+	EX	DE,HL
+	OR	A
+	SBC	HL,DE			; remaining capacity
+	LD	DE,TCP_MSS
+	OR	A
+	SBC	HL,DE
+	JR	C,.RECV_SUCCESS		; no whole segment can be promised
+	ENDIF
 	IFDEF	STAGE12_LAYOUT
 	; A multi-segment window only closes once the pending region is full,
 	; so draining it does not by itself mean the peer is blocked. Spend the
 	; extra round trip on a window update only when we really did advertise
 	; zero; SEND_SEGMENT_COMMON below clears the latch as it reopens.
 	BIT	0,(IX+CTX_WINDOW_CLOSED)
+	IFDEF EL3_SESSION_RX
+	JP	Z,.RECV_CHECK
+	ELSE
 	JP	Z,.RECV_SUCCESS
+	ENDIF
 	ELSE
 	; The one-MSS window closes on every accepted segment, so a drained
 	; pending slot always means the window just reopened from zero.
@@ -631,10 +650,31 @@ RECV
 	LD	A,TCP_FLAG_ACK
 	LD	BC,0
 	CALL	SEND_SEGMENT		; best-effort window update
+	IFDEF EL3_SESSION_RX
+	JP	.RECV_CHECK
+	ENDIF
 .RECV_SUCCESS
+	IFDEF EL3_SESSION_RX
+	; Account for the final chunk if pending remains; the empty-pending path
+	; above already added it before deciding whether another MSS could fit.
+	LD	A,(IX+CTX_PENDING_LEN)
+	OR	(IX+CTX_PENDING_LEN+1)
+	JR	Z,.RECV_TOTAL_READY
+	LD	HL,(S11_RX_DELIVERED)
+	LD	DE,(S11_COPY_LENGTH)
+	ADD	HL,DE
+	LD	(S11_RX_DELIVERED),HL
+.RECV_TOTAL_READY
+	LD	BC,(S11_RX_DELIVERED)
+	IFNDEF TCPX_WIDE_DIRECT_WINDOW
+	LD	HL,S11_ACK_OWED		; publish the final ACK for this buffer drain
+	INC	(HL)			; even if the last threshold ACK just settled it
+	ENDIF
+	ELSE
 	LD	BC,(S11_COPY_LENGTH)
+	ENDIF
 	XOR	A
-	JP	.RECV_RETURN
+	JR	.RECV_RETURN
 .RECV_PARAMETER
 	LD	A,NETDRV_ERR_PARAMETER
 	LD	BC,0
@@ -669,6 +709,20 @@ RECV
 	LD	BC,0
 	SCF
 .RECV_RETURN
+	IFDEF EL3_SESSION_RX
+	; Close direct access to the caller before the final cumulative ACK. The DLL
+	; then advertises only durable pending capacity; DLDIRECT's explicit wider
+	; profile remains backed by the on-card RX FIFO across the short boundary.
+	PUSH	AF,BC
+	LD	HL,0
+	LD	(S11_RX_FREE),HL
+	CALL	SEND_OWED_ACK
+	XOR	A
+	LD	L,A
+	LD	H,A
+	LD	(S11_RX_DELIVERED),HL
+	POP	BC,AF
+	ENDIF
 	POP	IY,IX
 	RET
 
@@ -1225,6 +1279,16 @@ SEND_SEGMENT
 	LD	(S11_SEQUENCE_OVERRIDE),A
 	POP	AF
 SEND_SEGMENT_COMMON
+	IFDEF UNET_DLL
+	LD	D,A			; flags survive A becoming the cold function id
+	PUSH	IX
+	POP	IY			; selected context for the cold builder
+	LD	IX,UNET_COLD_CTX
+	LD	A,CFN_TCP_IP_BUILD
+	CALL	@COLD.RUN		; returns IX=context, HL=frame, BC=wire length
+	RET	C
+	JP	@NETDRV.SEND_FRAME
+	ELSE
 	LD	(S11_BUILD_FLAGS),A
 	LD	(S11_SEGMENT_LENGTH),BC
 	LD	HL,TCPX_TX_BUFFER+14+IPV4_HEADER_LENGTH
@@ -1321,6 +1385,14 @@ SEND_SEGMENT_COMMON
 	SBC	HL,DE
 	JP	C,.WINDOW_SHUT
 	ADD	HL,DE			; restore the count the compare consumed
+	IFDEF TCPX_WIDE_DIRECT_WINDOW
+	; DLDIRECT is a continuous single-channel drain. Keep its receive right
+	; edge at the FIFO-qualified value across public RECV boundaries; changing
+	; it back to five MSS after every buffer caused the live responder to
+	; alternate large bursts with one/two-frame scheduling ticks.
+	; A genuinely full pending area still took .WINDOW_SHUT above.
+	LD	HL,(TCP_DIRECT_WINDOW_VAR)
+	ENDIF
 	RES	0,(IX+CTX_WINDOW_CLOSED)
 	JP	.WINDOW_READY
 .WINDOW_SHUT
@@ -1391,6 +1463,7 @@ SEND_SEGMENT_COMMON
 	LD	C,L
 	LD	HL,TCPX_TX_BUFFER
 	JP	@NETDRV.SEND_FRAME
+	ENDIF
 
 ; WAIT_FOR_EVENT polls and dispatches all frames, including the other channel.
 ; In: A=event mask, BC=timeout ms. Out: A=event bits or explicit timeout.
@@ -1515,7 +1588,7 @@ WAIT_START
 ; by itself: RECV reports S11_RX_DELIVERED, not an event, so the loop keeps
 ; draining while another whole MSS still fits there. That is what turns one
 ; RECV per segment into one RECV per bufferful -- the DSS clock read and key
-; scan RECV makes are then paid once per eleven segments, not once per one.
+; scan RECV makes are then paid once per several segments, not once per one.
 ; The wait ends when the buffer can no longer take a full segment, when a poll
 ; finds the card empty, or on any event the slow path raises (FIN, RST, a
 ; segment that had to go to pending).
@@ -1523,6 +1596,31 @@ WAIT_START
 	LD	A,(S11_FAST_DIRECT)
 	OR	A
 	JP	Z,.SESSION_HANDLED	; landed in pending: unchanged behaviour
+	IFDEF TCPX_WIDE_DIRECT_WINDOW
+	; Keep the selected window sliding: acknowledge each pair while several
+	; frames can still be draining from the card. Waiting until the whole window
+	; was consumed turned the live transfer into one burst per host-network tick.
+	; Slow-path/loss traffic still requests an immediate ACK, and RECV_RETURN
+	; sends any partial debt when a drain ends early.
+	LD	HL,S11_ACK_OWED
+	INC	(HL)
+	LD	A,(HL)
+	CP	TCP_ACK_EVERY
+	JR	C,.SESSION_FAST_ROOM
+	CALL	SEND_OWED_ACK
+	RET	C
+	ELSE
+	LD	HL,S11_FAST_LENGTH
+	INC	(HL)
+	LD	A,(HL)
+	CP	1
+	JR	NZ,.SESSION_FAST_DEFER
+	LD	A,1
+	LD	(S11_ACK_OWED),A
+	CALL	SEND_OWED_ACK		; first direct segment expands the initial
+	RET	C			; one-MSS durable window immediately
+	JR	.SESSION_FAST_ROOM
+.SESSION_FAST_DEFER
 	LD	HL,S11_ACK_OWED
 	INC	(HL)
 	LD	A,(HL)
@@ -1530,6 +1628,7 @@ WAIT_START
 	JR	C,.SESSION_FAST_ROOM	; still under the threshold, stay quiet
 	CALL	SEND_OWED_ACK
 	RET	C
+	ENDIF
 .SESSION_FAST_ROOM
 	LD	HL,(S11_RX_FREE)
 	LD	DE,(S11_RX_DELIVERED)
@@ -1539,8 +1638,6 @@ WAIT_START
 	OR	A
 	SBC	HL,DE
 	JP	NC,.WAIT_PROGRESS	; another whole segment still fits
-	CALL	SEND_OWED_ACK		; settle the debt before handing the
-	RET	C			; bufferful back to RECV
 	XOR	A
 	RET
 .WAIT_IDLE
@@ -1548,8 +1645,6 @@ WAIT_START
 	LD	A,H
 	OR	L
 	JP	Z,.WAIT_TICK
-	CALL	SEND_OWED_ACK		; card empty and bytes already delivered:
-	RET	C			; settle the debt and hand them back
 	XOR	A
 	RET
 	ENDIF
@@ -1647,6 +1742,12 @@ SEND_OWED_ACK
 ;      CF=1 with A<>0 -- driver error, A is the EL3 status.
 ; Clobbers AF, BC, DE, HL, IX.
 FAST_RECEIVE
+	IFDEF	UNET_DLL
+	LD	IY,(S11_SELECTED_CONTEXT)
+	LD	IX,UNET_COLD_CTX
+	LD	A,CFN_TCP_FAST_RECEIVE
+	JP	@COLD.RUN
+	ELSE
 	LD	HL,(S11_SELECTED_CONTEXT)
 	LD	A,H
 	OR	L
@@ -1730,8 +1831,8 @@ FAST_RECEIVE
 	CALL	MATCH_CONTEXT
 	JP	NZ,.SLOW
 	LD	HL,STAGE9_RX_BUFFER+38
-	PUSH	IX
-	POP	DE
+	LD	D,IXH
+	LD	E,IXL			; avoid four stack-memory accesses in hot RX
 	LD	BC,CTX_RCV_NXT
 	EX	DE,HL
 	ADD	HL,BC
@@ -1852,8 +1953,8 @@ FAST_RECEIVE
 	LD	A,(STAGE9_RX_BUFFER+48)
 	LD	(S11_TCP_PARSE_DESC+TCPP_WINDOW+1),A
 	LD	HL,STAGE9_RX_BUFFER+42
-	PUSH	IX
-	POP	DE
+	LD	D,IXH
+	LD	E,IXL
 	LD	BC,CTX_SND_NXT
 	EX	DE,HL
 	ADD	HL,BC
@@ -1861,8 +1962,8 @@ FAST_RECEIVE
 	CALL	CMP4
 	JR	NZ,.FAST_ACK_OWED
 	LD	HL,STAGE9_RX_BUFFER+42
-	PUSH	IX
-	POP	DE
+	LD	D,IXH
+	LD	E,IXL
 	LD	BC,CTX_SND_UNA
 	EX	DE,HL
 	ADD	HL,BC
@@ -1872,9 +1973,9 @@ FAST_RECEIVE
 	LD	A,EVENT_ACK
 	CALL	SET_EVENT
 .FAST_ACK_OWED
-	PUSH	IX
-	POP	HL
-	LD	(S11_MATCH_CONTEXT),HL
+	LD	D,IXH
+	LD	E,IXL
+	LD	(S11_MATCH_CONTEXT),DE
 	LD	A,(S11_FAST_DIRECT)
 	OR	A
 	JR	NZ,.FAST_OWED_COUNTED	; .SESSION_FAST counts the debt instead,
@@ -1884,6 +1985,7 @@ FAST_RECEIVE
 	XOR	A
 	SCF
 	RET
+	ENDIF
 	ENDIF
 
 CHECK_WAIT_EVENTS

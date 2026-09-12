@@ -26,6 +26,9 @@
 - Scenario F: `UNETTEST -a 192.168.7.44 8080` against `tcp-stall`
   (`doautorcvbuf=0` confirmed, no auto-tuning warning in the responder log);
   `resumes needed: N` with N >= 1, `RESULT OK`: ____________________
+- Optimized DLL RX: Stage 13's release/fast DLSPEED matrix, five alternating
+  successful runs per executable and image, thresholds/window/ACK/checksum
+  evidence from `docs/DLSPEED.md`: ____________________
 
 ## Real Sprinter
 

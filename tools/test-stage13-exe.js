@@ -274,6 +274,20 @@ assert.ok(result.ftpRequests.includes(`REST ${PARTIAL.length}`),
   `expected a REST ${PARTIAL.length} request, got ${JSON.stringify(result.ftpRequests)}`);
 checked(result);
 
+// Repeating -r after the local file is already complete is a successful
+// no-op. In particular, do not open an empty data transfer at REST == SIZE:
+// some otherwise usable FTP servers leave that stream open indefinitely.
+result = run('192.168.7.44 SMALL.BIN -r', scenario({
+  fixtures: {'SMALL.BIN': FULL}, fixtureSizes: {'SMALL.BIN': FULL.length},
+}, {files: {'SMALL.BIN': FULL}}));
+assert.strictEqual(result.exitCode, 0, result.output);
+assert.deepStrictEqual(outputFile(result, 'SMALL.BIN'), FULL);
+assert.deepStrictEqual(result.ftpRequests.slice(-2), ['PASV', 'QUIT']);
+assert.ok(!result.ftpRequests.some((request) => /^(?:REST|RETR)\b/.test(request)),
+  `complete resume unexpectedly opened a transfer: ${JSON.stringify(result.ftpRequests)}`);
+assert.match(result.output, /Done\. 0 bytes recv\./);
+checked(result);
+
 // REST refused (350 withheld) is fatal, and must not touch the partial file.
 result = run('192.168.7.44 SMALL.BIN -r', scenario({
   fixtures: {'SMALL.BIN': REMAINDER}, restRefused: true,
@@ -630,6 +644,226 @@ assert.deepStrictEqual(result.cleanup, {isaClosed: true, pagesFreed: true, done:
 assertBalancedDssBlocks(result);
 cases++;
 
+// ------------------------------------------------------------------
+// DLSPEED through the real relocated UNET509B.DLL.  This is deliberately a
+// complete network transfer, not another loader smoke test: it executes the
+// hot page and the WIN0 cold page under strict-PC tracking, drains several
+// TCP segments per public RECV, and observes the advertised windows/ACKs on
+// the wire.  Explicit 1/#300 is the published performance profile.
+// ------------------------------------------------------------------
+function dllSpeedScenario(dll, tcp = {}, extra = {}) {
+  return {
+    strictPc: true,
+    files: {'UNET509B.DLL': dll},
+    environment: staticEnv({NET_HW: '1/#300'}),
+    arp: {mac: [2, 0, 0, 0, 0, 44]},
+    tcp: {mode: 'http', port: 80, ...tcp},
+    stepLimit: 2_000_000_000,
+    ...extra,
+  };
+}
+function internetChecksum(bytes) {
+  let sum = 0;
+  for (let at = 0; at < bytes.length; at += 2) {
+    sum += (bytes[at] << 8) | (bytes[at + 1] || 0);
+    sum = (sum & 0xffff) + (sum >>> 16);
+  }
+  return (~sum) & 0xffff;
+}
+function clientTcpSegments(value) {
+  return value.transmittedFrames.map((frame) => Buffer.from(frame, 'hex'))
+    .filter((frame) => frame.length >= 54 && frame.readUInt16BE(12) === 0x0800 && frame[23] === 6)
+    .map((frame) => {
+      const ipLength = frame.readUInt16BE(16), tcpOffset = 34;
+      const tcpLength = ipLength - 20, tcp = frame.subarray(tcpOffset, tcpOffset + tcpLength);
+      assert.strictEqual(internetChecksum(frame.subarray(14, 34)), 0,
+        'UNET509B emitted an invalid IPv4 checksum');
+      const pseudo = Buffer.concat([frame.subarray(26, 34), Buffer.from([0, 6,
+        tcpLength >> 8, tcpLength & 255]), tcp]);
+      assert.strictEqual(internetChecksum(pseudo), 0,
+        'UNET509B emitted an invalid TCP checksum');
+      return {flags: tcp[13], sequence: tcp.readUInt32BE(4), acknowledgement: tcp.readUInt32BE(8),
+        window: tcp.readUInt16BE(14), payloadLength: tcpLength - ((tcp[12] >> 4) * 4)};
+    });
+}
+function assertDllTransfer(value, bodyLength) {
+  assert.strictEqual(value.exitCode, 0, value.output);
+  assert.match(value.output, new RegExp(`Received: ${bodyLength} bytes`));
+  assert.match(value.output, /RESULT OK/);
+  assert.deepStrictEqual(value.cleanup, {isaClosed: true, pagesFreed: true, done: true});
+  assert.ok(value.mappedExecutableHits > 0, 'strict-PC never observed loaded DLL/cold code');
+  assert.ok(value.dllEntryCalls[7] >= 1, 'the public RECV entry was never called');
+  assert.ok(value.maxInFlight >= 2 * 536,
+    `DLL kept only ${value.maxInFlight} bytes in flight, expected at least two segments`);
+  const segments = clientTcpSegments(value);
+  const acks = segments.filter((segment) => segment.flags === 0x10 && !segment.payloadLength);
+  const windows = acks.map((segment) => segment.window);
+  assert.ok(windows.every((window) => window <= 5 * 536),
+    `DLL advertised more than five MSS: ${windows.join(',')}`);
+  assert.ok(windows.includes(5 * 536), `DLL never opened its five-MSS RECV window: ${windows.join(',')}`);
+  assert.ok(windows.filter((window) => window === 0).length <= 1,
+    `normal transfer closed the window once per MSS: ${windows.join(',')}`);
+  assert.strictEqual(acks[acks.length - 1].window, 536,
+    'final cumulative ACK retained transient caller-buffer capacity');
+  const advances = acks.slice(1).map((segment, index) =>
+    (segment.acknowledgement - acks[index].acknowledgement) >>> 0);
+  assert.ok(advances.some((advance) => advance >= 2 * 536),
+    `no cumulative ACK covered two segments: ${advances.join(',')}`);
+  cases++;
+}
+
+const DLL_BODY = Buffer.from(Array.from({length: 6000}, (_, i) => (i * 37 + 11) & 0xff));
+result = runExe(dllSpeedExe, 'http://192.168.7.44/BIG.BIN', dllSpeedScenario(unetDllImage, {
+  response: {status: '200 OK', body: DLL_BODY, headers: {}, closeDelimited: false},
+}));
+assertDllTransfer(result, DLL_BODY.length);
+assert.ok(result.maxInFlight >= 5 * 536,
+  `safe DLL reached only ${result.maxInFlight} bytes in flight`);
+assert.ok(result.dllEntryCalls[7] < Math.ceil((DLL_BODY.length + 64) / 536),
+  `one public RECV was still paid per segment (${result.dllEntryCalls[7]} calls)`);
+
+// COLD.RUN promises to support an application stack in WIN0 even though it
+// maps the overlay over that window. Patch only DLSPEED's declared stack and
+// its initial LD SP so the complete loader/network scenario exercises that
+// contract. No PUSH/POP may straddle the PAGE0 write.
+const win0StackImage = Buffer.from(dllSpeedImage);
+win0StackImage.writeUInt16LE(0x3ff0, 20);
+const stackInit = Buffer.from([0x31, 0xf0, 0x9f]);
+const stackInitAt = win0StackImage.indexOf(stackInit, 128);
+assert.ok(stackInitAt >= 0, 'DLSPEED initial LD SP was not found');
+assert.strictEqual(win0StackImage.indexOf(stackInit, stackInitAt + 1), -1,
+  'DLSPEED has more than one matching LD SP; patch target is ambiguous');
+win0StackImage.writeUInt16LE(0x3ff0, stackInitAt + 1);
+const WIN0_STACK_BODY = Buffer.alloc(3000, 0x6d);
+result = runExe(win0StackImage, 'http://192.168.7.44/WIN0.BIN',
+  dllSpeedScenario(unetDllImage, {
+    response: {status: '200 OK', body: WIN0_STACK_BODY, headers: {}, closeDelimited: false},
+  }, {initialIff: 1}));
+assertDllTransfer(result, WIN0_STACK_BODY.length);
+assert.ok(result.minimumSp < 0x4000, 'WIN0 caller-stack scenario never used WIN0');
+assert.deepStrictEqual(result.exitIff, {iff1: 1, iff2: 1},
+  'WIN0 caller-stack scenario did not restore interrupt state');
+
+// The safe image discards the damaged ordinary segment and consumes the good
+// retransmission at the same sequence number.  Offset 9 corrupts the first
+// status-code digit, so accepting it would make the HTTP parser fail.
+const DLL_FAULT_BODY = Buffer.alloc(3000, 0x5a);
+result = runExe(dllSpeedExe, 'http://192.168.7.44/FAULT.BIN', dllSpeedScenario(unetDllImage, {
+  response: {status: '200 OK', body: DLL_FAULT_BODY, headers: {}, closeDelimited: false},
+  corruptDataOnce: 9,
+}));
+assertDllTransfer(result, DLL_FAULT_BODY.length);
+
+// strictPc must not grant executable permission to the zero-filled DLL BSS.
+// Redirect export 0 (INIT) there; the loader relocates #0068 to #4068, and
+// the harness must stop before interpreting the data byte as an instruction.
+const bssJumpDll = Buffer.from(unetDllImage);
+bssJumpDll[33] = 0x68;
+bssJumpDll[34] = 0x00;
+assert.throws(() => runExe(dllSpeedExe, 'http://192.168.7.44/BIG.BIN',
+  dllSpeedScenario(bssJumpDll)), /PC escaped executable ranges: PC=4068/);
+cases++;
+
+// Nor may the unfilled upper cold-stack reservation become executable.  The
+// PARSE_HW jump-table slot is redirected to its #3F80 boundary; unlike the
+// real cold blob [0,length), that address was never read from the DLL file.
+const coldDataJumpDll = Buffer.from(unetDllImage);
+const l1Size = coldDataJumpDll.readUInt16LE(2);
+const parseHwVector = l1Size + 2 + 0x16 + 15 * 2;
+coldDataJumpDll[parseHwVector] = 0x80;
+coldDataJumpDll[parseHwVector + 1] = 0x3f;
+assert.throws(() => runExe(dllSpeedExe, 'http://192.168.7.44/BIG.BIN',
+  dllSpeedScenario(coldDataJumpDll)), /PC escaped executable ranges: PC=3f80/);
+cases++;
+
+// TX_SESSION fault matrix.  All scenarios start with IFF enabled so the
+// cleanup assertion covers both the ISA mapping and interrupt restoration.
+const TX_BODY = Buffer.alloc(100, 0x74);
+function txScenario(extra = {}) {
+  return dllSpeedScenario(unetDllImage, {
+    response: {status: '200 OK', body: TX_BODY, headers: {}, closeDelimited: false},
+  }, {initialIff: 1, ...extra});
+}
+function assertTxCleanup(value) {
+  assert.deepStrictEqual(value.cleanup, {isaClosed: true, pagesFreed: true, done: true});
+  assert.deepStrictEqual(value.exitIff, {iff1: 1, iff2: 1});
+}
+
+// Exactly 256 fast zero polls must close ISA before the one final 1-ms wait;
+// the 257th read sees completion and every frame still succeeds.
+result = runExe(dllSpeedExe, 'http://192.168.7.44/TX.BIN',
+  txScenario({txCompletionDelayReads: 256}));
+assert.strictEqual(result.exitCode, 0, result.output);
+assert.match(result.output, /RESULT OK/);
+assert.ok(result.card.txStatusReads >= result.txRecords.length * 257,
+  `completion was not polled through the bounded fast phase: ${result.card.txStatusReads}`);
+assertTxCleanup(result);
+clientTcpSegments(result);
+cases++;
+
+// Complete stale entries are popped in the first session before TX_FREE and
+// the new FIFO write.  Two injected entries add exactly two status pops.
+result = runExe(dllSpeedExe, 'http://192.168.7.44/TX.BIN',
+  txScenario({txStaleStatuses: [0xc0, 0xc0]}));
+assert.strictEqual(result.exitCode, 0, result.output);
+assert.strictEqual(result.card.txStatusPops, result.txRecords.length + 2);
+assertTxCleanup(result);
+cases++;
+
+// A permanently short TX_FREE times out before a byte enters FIFO.
+result = runExe(dllSpeedExe, 'http://192.168.7.44/TX.BIN',
+  txScenario({txFreeBlocked: true}));
+assert.strictEqual(result.exitCode, 3, result.output);
+assert.strictEqual(result.card.txFreeReads, 1000);
+assert.strictEqual(result.txRecords.length, 0, 'TX_FREE timeout wrote an uncertain frame');
+assert.match(result.output, /CONNECT failed/);
+assertTxCleanup(result);
+cases++;
+
+// FIFO consumption with no completion has an unknown outcome.  Recovery may
+// reset TX, but SEND_FRAME must return timeout without writing the frame twice.
+result = runExe(dllSpeedExe, 'http://192.168.7.44/TX.BIN',
+  txScenario({txNeverComplete: true}));
+assert.strictEqual(result.exitCode, 3, result.output);
+assert.strictEqual(result.txRecords.length, 1, 'uncertain TX completion was retried');
+assert.strictEqual(result.card.txStatusPops, 0);
+assert.ok(result.card.txStatusReads >= 258, 'final post-wait completion poll was skipped');
+assertTxCleanup(result);
+cases++;
+
+// A completed overflow is a known hardware error, not a timeout and not an
+// excuse to repeat the packet.  The public layer maps it to a stable failure.
+result = runExe(dllSpeedExe, 'http://192.168.7.44/TX.BIN',
+  txScenario({txCompletionStatus: 0xc4}));
+assert.strictEqual(result.exitCode, 3, result.output);
+assert.strictEqual(result.txRecords.length, 1);
+assert.strictEqual(result.card.txStatusPops, 1);
+assert.match(result.output, /CONNECT failed/);
+assertTxCleanup(result);
+cases++;
+
+const fastDllPath = path.join(root, 'build', 'perf-fast', 'UNET509B.DLL');
+assert.ok(fs.existsSync(fastDllPath), 'make perf-fast did not create its separate DLL');
+const fastDllImage = fs.readFileSync(fastDllPath);
+result = runExe(dllSpeedExe, 'http://192.168.7.44/BIG.BIN', dllSpeedScenario(fastDllImage, {
+  response: {status: '200 OK', body: DLL_BODY, headers: {}, closeDelimited: false},
+}));
+assertDllTransfer(result, DLL_BODY.length);
+
+// This is the sole intended semantic difference of perf-fast: the damaged
+// established in-order data copy is accepted, so the HTTP header is visibly
+// corrupt and the good duplicate cannot repair an already advanced RCV.NXT.
+result = runExe(dllSpeedExe, 'http://192.168.7.44/FAULT.BIN', dllSpeedScenario(fastDllImage, {
+  response: {status: '200 OK', body: DLL_FAULT_BODY, headers: {}, closeDelimited: false},
+  corruptDataOnce: 9,
+}));
+assert.strictEqual(result.exitCode, 6, result.output);
+assert.match(result.output, /invalid status, framing, chunked or compressed response/);
+assert.match(result.output, /RESULT FAIL/);
+assert.deepStrictEqual(result.cleanup, {isaClosed: true, pagesFreed: true, done: true});
+clientTcpSegments(result);
+cases++;
+
 result = runExe(speedExe, '/?', speedScenario());
 assert.strictEqual(result.exitCode, 0, result.output);
 assert.match(result.output, /Usage:/);
@@ -709,6 +943,42 @@ assert.strictEqual(result.exitCode, 0, result.output);
 assert.match(result.output, new RegExp(`Received: ${LARGE_BODY.length} bytes`));
 assert.ok(result.memoryAccesses > 0, 'harness did not report memoryAccesses');
 assert.ok(result.isaSessions > 0, 'harness did not report isaSessions');
+// The live pcap showed that almost the entire elapsed time was a sequence of
+// host-network scheduling gaps after a five-MSS burst drained. The harness
+// models MAME's 16 KiB RX partition, so DLDIRECT selects eleven MSS from the
+// idle Window 3 Free Receive Bytes value and keeps it across short RECV
+// boundaries. It acknowledges each pair before the window empties.
+const directAcks = clientTcpSegments(result)
+  .filter((segment) => segment.flags === 0x10 && !segment.payloadLength);
+const directWindows = directAcks.map((segment) => segment.window);
+assert.ok(result.maxInFlight >= 11 * 536,
+  `DLDIRECT reached only ${result.maxInFlight} bytes in flight`);
+assert.ok(directWindows.every((window) => window === 11 * 536),
+  `DLDIRECT did not select its eleven-MSS window: ${directWindows.join(',')}`);
+const directAdvances = directAcks.slice(1).map((segment, index) =>
+  (segment.acknowledgement - directAcks[index].acknowledgement) >>> 0);
+assert.ok(directAdvances.some((advance) => advance === 2 * 536),
+  `DLDIRECT never advanced its sliding window by two MSS: ${directAdvances.join(',')}`);
+assert.ok(directAdvances.every((advance) => advance <= 2 * 536),
+  `DLDIRECT let its sliding-window ACK debt grow too far: ${directAdvances.join(',')}`);
+speedChecked(result);
+
+// A physical 8 KiB card may expose only a 5 KiB RX partition. Eleven frames
+// would not fit there, so the same executable must fall back to eight MSS
+// without relying on a separate hardware build.
+const SMALL_FIFO_BODY = Buffer.alloc(32768, 0x6b);
+result = runExe(speedExe, 'http://192.168.7.44/BIG.BIN', speedScenario({
+  response: {status: '200 OK', body: SMALL_FIFO_BODY, headers: {}, closeDelimited: false},
+}, {rxFifoBytes: 5 * 1024}));
+assert.strictEqual(result.exitCode, 0, result.output);
+assert.match(result.output, new RegExp(`Received: ${SMALL_FIFO_BODY.length} bytes`));
+const smallFifoAcks = clientTcpSegments(result)
+  .filter((segment) => segment.flags === 0x10 && !segment.payloadLength);
+assert.ok(smallFifoAcks.length > 1, 'small-FIFO DLDIRECT emitted no data ACKs');
+assert.ok(smallFifoAcks.every((segment) => segment.window === 8 * 536),
+  `small-FIFO DLDIRECT exceeded eight MSS: ${smallFifoAcks.map((segment) => segment.window).join(',')}`);
+assert.ok(result.maxInFlight >= 8 * 536 && result.maxInFlight < 11 * 536,
+  `small-FIFO DLDIRECT reached unsafe in-flight size ${result.maxInFlight}`);
 speedChecked(result);
 
 // Round-2's two-phase receive (see the throughput plan) only fast-paths a

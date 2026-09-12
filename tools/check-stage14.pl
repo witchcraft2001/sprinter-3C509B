@@ -16,8 +16,23 @@ sub slurp {
 
 my $shim = slurp('src/dll/unet509b.asm', 0);
 my $cold = slurp('src/dll/unet509b_cold.asm', 0);
+my $coldctx = slurp('src/include/coldctx.inc', 0);
+my $tcpinc = slurp('src/include/tcp.inc', 0);
+my $transport = slurp('src/lib/tcp_transport.asm', 0);
+my $el3io = slurp('src/lib/el3_io.asm', 0);
+my $fifo = slurp('src/lib/el3_fifo.asm', 0);
+my $win0cold = slurp('src/lib/win0cold.asm', 0);
+my $build = slurp('tools/build.sh', 0);
+my $makefile = slurp('Makefile', 0);
+my $perf_fast = slurp('tools/perf-fast.sh', 0);
+my $artifacts = slurp('tools/artifacts.sh', 0);
 my $shim_code = $shim; $shim_code =~ s/;[^\n]*//g;
 my $cold_code = $cold; $cold_code =~ s/;[^\n]*//g;
+my $coldctx_code = $coldctx; $coldctx_code =~ s/;[^\n]*//g;
+my $transport_code = $transport; $transport_code =~ s/;[^\n]*//g;
+my $el3io_code = $el3io; $el3io_code =~ s/;[^\n]*//g;
+my $fifo_code = $fifo; $fifo_code =~ s/;[^\n]*//g;
+my $win0cold_code = $win0cold; $win0cold_code =~ s/;[^\n]*//g;
 
 die "Stage 14 added forbidden IRQ routing\n"
     if $shim_code =~ /irq\d*_callback|IRQ_(?:ACK|ENABLE)/i
@@ -55,6 +70,8 @@ die "UNET509B_CAPS does not assert the full-parity 0x023F mask\n"
 # Image ceiling: 14535 bytes (0x38C7) for hot code + in-image BSS.
 die "UNET509B.DLL image ceiling assertion is missing or changed\n"
     unless $shim_code =~ /ASSERT\s+\$\s*<=\s*DLL_IMAGE_ORIGIN\s*\+\s*0x38C7/;
+die "UNET509B.DLL no longer reserves the mandatory 16 hot-image bytes\n"
+    unless $shim_code =~ /ASSERT\s+\$\s*<=\s*DLL_IMAGE_ORIGIN\s*\+\s*0x38B7/;
 
 # INIT refuses to load into window 3 (the ISA aperture): CALL .here/POP HL to
 # find its own window, AND 0xC0 to isolate the window bits, CP 0xC0 to detect
@@ -95,6 +112,82 @@ die "unet509b_cold.asm references a forbidden hot-only primitive (RST/\@ISA./DSS
 die "unet509b_cold.asm contains port I/O or EI (IN/OUT/INI/OUTI/INIR/OTIR/IND/OUTD/INDR/OTDR/EI)\n"
     if $cold_code =~ /^\s*(?:IN|OUT|INI|OUTI|INIR|OTIR|IND|OUTD|INDR|OTDR|EI)\b/m;
 
+# Stage 13/14 RX supplement: only the DLL enables the two-phase session path,
+# and the transient receive promise is capped at five whole 536-byte MSSes.
+die "UNET509B.DLL does not enable the session/direct RX implementation\n"
+    unless $shim_code =~ /^\s*DEFINE\s+TCPX_DIRECT_RX\s*$/m
+    && $shim_code =~ /^\s*DEFINE\s+EL3_SESSION_RX\s*$/m;
+die "DLL receive window is not capped at five 536-byte segments\n"
+    unless $tcpinc =~ /^TCP_MSS\s+EQU\s+536\s*$/m
+    && $tcpinc =~ /^TCP_RECV_MAX_SEGMENTS\s+EQU\s+5\s*$/m
+    && $tcpinc =~ /^TCP_RECV_MAX_WINDOW\s+EQU\s+TCP_RECV_MAX_SEGMENTS\s*\*\s*TCP_MSS\s*$/m;
+die "cold fast RX does not retain the mandatory IPv4 checksum/filter path\n"
+    unless $cold_code =~ /^TCP_FAST_RECEIVE\b.*?CALL\s+\@ETHERNET\.VERIFY_CHECKSUM.*?TCP_FLAG_ACK/ms;
+die "safe/fast cold RX policy is not confined to the payload callback\n"
+    unless $cold_code =~ /IFNDEF\s+TCPX_UNCHECKED_DATA_RX.*?CCTX_CB_RX_PAYLOAD_SUM.*?ELSE.*?CCTX_CB_RX_PAYLOAD.*?ENDIF/ms;
+die "cold fast RX bypasses the two hot callback boundary\n"
+    unless $coldctx_code =~ /^CCTX_CB_RX_PAYLOAD\s+EQU\s+/m
+    && $coldctx_code =~ /^CCTX_CB_RX_PAYLOAD_SUM\s+EQU\s+/m
+    && $shim_code =~ /\@EL3IO\.RX_PAYLOAD\s*,\s*\@EL3IO\.RX_PAYLOAD_SUM/;
+
+# One RECV owns a direct-delivery scope, drains repeatedly, ACKs the first
+# segment and then pairs, and closes the transient window before its final
+# durable-only ACK. These anchors deliberately cover both ends of the
+# hot/cold contract instead of merely checking that FAST_RECEIVE exists.
+die "RECV does not keep a caller direct-delivery scope\n"
+    unless $transport_code =~ /^RECV\b.*?S11_RX_DEST.*?S11_RX_FREE.*?S11_RX_DELIVERED.*?CALL\s+WAIT_FOR_EVENT/ms;
+die "direct RX no longer sends the first ACK and cumulative pair ACKs\n"
+    unless $transport_code =~ /^\.SESSION_FAST\b.*?CP\s+1.*?CALL\s+SEND_OWED_ACK.*?CP\s+TCP_ACK_EVERY.*?CALL\s+SEND_OWED_ACK/ms;
+die "RECV does not close direct scope before its final durable-window ACK\n"
+    unless $transport_code =~ /^\.RECV_RETURN\b.*?LD\s+\(S11_RX_FREE\),HL.*?CALL\s+SEND_OWED_ACK/ms;
+die "DLL ACK construction is not a single combined cold call\n"
+    unless $transport_code =~ /^SEND_SEGMENT_COMMON\b.*?CFN_TCP_IP_BUILD.*?CALL\s+\@COLD\.RUN.*?JP\s+\@NETDRV\.SEND_FRAME/ms
+    && $cold_code =~ /^TCP_IP_BUILD\b.*?CALL\s+\@TCP\.BUILD.*?CALL\s+\@IPV4\.BUILD/ms;
+
+# TX normal path: one session through stale statuses, free-space check, FIFO
+# write and exactly 256 fast completion reads. The only later wait happens
+# after CLOSE, and timeout recovery must not branch back to SEND_ATTEMPT.
+{
+    my ($session) = $el3io_code =~ /^TX_SESSION\b(.*?)^TXB_WRITE_BARE\b/ms;
+    die "EL3IO.TX_SESSION is missing\n" unless defined $session;
+    my @need = ('EL3_W1_TX_STATUS', '.TXB_STALE', 'EL3_W1_TX_FREE',
+                'TXB_WRITE_BARE', 'LD\s+B\s*,\s*0',
+                'DJNZ\s+\.TXB_COMPLETE_FAST', '\@ISA\.CLOSE',
+                '\@EL3\.WAIT_QUANTUM');
+    my $at = 0;
+    for my $needle (@need) {
+        pos($session) = $at;
+        die "EL3IO.TX_SESSION ordering lost at $needle\n"
+            unless $session =~ /$needle/g;
+        $at = pos($session);
+    }
+    die "SEND_FRAME no longer uses the shared TX session\n"
+        unless $fifo_code =~ /^SEND_FRAME\b.*?CALL\s+\@EL3IO\.TX_SESSION/ms;
+    my ($timeout) = $fifo_code =~ /^\.SEND_TIMEOUT_OR_IO\b(.*?)^\.SEND_RETURN\b/ms;
+    die "SEND_FRAME TX timeout handler is missing\n" unless defined $timeout;
+    die "unknown TX completion is retransmitted\n" if $timeout =~ /SEND_ATTEMPT/;
+    die "TX timeout no longer recovers the transmitter with a stable timeout result\n"
+        unless $timeout =~ /CALL\s+TX_RECOVER_RESET.*?LD\s+A\s*,\s*EL3_ERR_TX_TIMEOUT.*?SCF/ms;
+}
+
+# The cold blob may consume the lower page only. Its private stack is the
+# exact upper 128 bytes and therefore does not inflate the hot L1 image.
+die "cold overlay no longer reserves 0x3F80..0x3FFF for its private stack\n"
+    unless $cold_code =~ /ASSERT\s+\$\s*<=\s*0x3F80/
+    && $win0cold_code =~ /LD\s+SP\s*,\s*0x4000/;
+
+# The checksum-skipping variant is a separate, non-release image. The define
+# is passed only to the cold assembly; the public L1 hot image remains common.
+die "Makefile has no perf-fast target\n"
+    unless $makefile =~ /^perf-fast:\s*\n\s*tools\/perf-fast\.sh\s*$/m;
+die "perf-fast does not isolate its build and enable the cold policy define\n"
+    unless $perf_fast =~ /build\/perf-fast/
+    && $perf_fast =~ /BUILD_DIR="\$fast_dir"\s+TCPX_UNCHECKED_DATA_RX=1\s+"\$script_dir\/build\.sh"/;
+die "build.sh does not confine TCPX_UNCHECKED_DATA_RX to cold_defines\n"
+    unless $build =~ /TCPX_UNCHECKED_DATA_RX.*?cold_defines\+=\(-DTCPX_UNCHECKED_DATA_RX\).*?unet509b_cold\.asm/ms;
+die "non-release perf-fast path leaked into the artifact manifest\n"
+    if $artifacts =~ /build\/perf-fast|sprinter-3c509b-fast/i;
+
 # Every COLD_CTX field the blob dereferences must be filled in by
 # FILL_COLD_CTX. An unfilled pointer is not a null that faults: inside a cold
 # call window 0 holds the blob itself, so a routine that WRITES through it
@@ -106,13 +199,29 @@ die "unet509b_cold.asm contains port I/O or EI (IN/OUT/INI/OUTI/INIR/OTIR/IND/OU
 {
     my ($fill) = $shim_code =~ /^FILL_COLD_CTX\b(.*?)^\s*RET\b/ms;
     die "FILL_COLD_CTX not found in unet509b.asm\n" unless defined $fill;
-    my %filled = map { $_ => 1 }
-        ($fill =~ /LD\s+\(UNET_COLD_CTX\s*\+\s*(CCTX_[A-Z0-9_]+)\)\s*,\s*HL/g);
+    die "FILL_COLD_CTX no longer copies one complete CCTX_SIZE table\n"
+        unless $fill =~ /LD\s+HL\s*,\s*COLD_CTX_INIT_TABLE.*?
+                         LD\s+DE\s*,\s*UNET_COLD_CTX.*?
+                         LD\s+BC\s*,\s*CCTX_SIZE.*?\bLDIR\b/msx;
+    my ($table) = $shim_code =~ /^COLD_CTX_INIT_TABLE\b(.*?)
+        ^\s*ASSERT\s+\$\s*-\s*COLD_CTX_INIT_TABLE\s*==\s*CCTX_SIZE/msx;
+    die "COLD_CTX_INIT_TABLE or its exact-size assertion is missing\n"
+        unless defined $table;
+    my @table_words;
+    while ($table =~ /^\s*DW\s+([^\n]+)$/gmi) {
+        push @table_words, grep { length } map { s/^\s+|\s+$//gr } split /,/, $1;
+    }
+    my ($ctx_size) = $coldctx_code =~ /^CCTX_SIZE\s+EQU\s+(\d+)\s*$/m;
+    die "CCTX_SIZE must be an even literal\n"
+        unless defined $ctx_size && !($ctx_size & 1);
+    die "COLD_CTX_INIT_TABLE has " . scalar(@table_words) .
+        " words, expected " . ($ctx_size / 2) . "\n"
+        unless @table_words == $ctx_size / 2;
     my %used;
     $used{$1} = 1 while $cold_code =~ /\(\s*IX\s*\+\s*(CCTX_[A-Z0-9_]+?)(?:\+1)?\s*\)/g;
     die "no COLD_CTX dereferences found in unet509b_cold.asm\n" unless %used;
-    my @missing = sort grep { !$filled{$_} } keys %used;
-    die "unet509b_cold.asm reads @missing but FILL_COLD_CTX never fills it\n"
+    my @missing = sort grep { $coldctx_code !~ /^\Q$_\E\s+EQU\s+/m } keys %used;
+    die "unet509b_cold.asm reads undeclared CCTX fields: @missing\n"
         if @missing;
 }
 
@@ -167,5 +276,5 @@ die "UNET509B.DLL is not an L1 image\n" unless $inspect =~ /"format":\s*"L1"/;
 die "UNET509B.DLL name field is missing the UNET509B prefix\n"
     unless $inspect =~ /"name":\s*"UNET509B[^"]*"/;
 
-print "Stage 14 static: 24-entry JP table, 0x023F caps, image ceiling, window-3 refusal, ",
-      "clean RET_A/cold isolation and mkdll verify/inspect passed\n";
+print "Stage 14 static: 24-entry JP table, 0x023F caps, 16-byte hot reserve, window-3 refusal, ",
+      "complete cold context, clean RET_A/cold isolation and mkdll verify/inspect passed\n";

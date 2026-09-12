@@ -22,6 +22,7 @@
 
 	DEVICE NOSLOT64K
 	INCLUDE "unet.inc"
+	INCLUDE "tcpctx.inc"
 
 TEST_RESULT	EQU 0x3F00		; first failing case number, 0 = all passed
 TEST_COMPLETE	EQU 0x3F01		; 0xA5 once TEST_DONE was reached
@@ -405,6 +406,66 @@ TEST_START
 	XOR	A
 	LD	(DLL_BASE + 0x20 + INITED_OFF),A
 
+	CASE	41			; partial caller buffer drains only what fits
+	; Seed channel 1's durable pending slot without touching the card. RECV
+	; must return exactly the five-byte caller capacity, advance pending_off,
+	; retain the other five bytes and leave the guard byte untouched.
+	LD	A,1
+	LD	(DLL_BASE + 0x20 + CH_STATE_OFF + 1),A
+	LD	HL,0
+	LD	(DLL_BASE + 0x20 + CTX1_OFF + CTX_PENDING_OFF),HL
+	LD	HL,10
+	LD	(DLL_BASE + 0x20 + CTX1_OFF + CTX_PENDING_LEN),HL
+	LD	HL,DLL_BASE + 0x20 + PENDING1_DATA_OFF
+	LD	DE,SMALL_PENDING
+	LD	BC,5
+.seed_small
+	LD	A,(DE)
+	LD	(HL),A
+	INC	DE
+	INC	HL
+	DEC	BC
+	LD	A,B
+	OR	C
+	JR	NZ,.seed_small
+	LD	A,0xA6
+	LD	(BUF+5),A
+	LD	A,1
+	LD	DE,BUF
+	LD	IX,5
+	LD	IY,0
+	ENTRY	UNET_FN_RECV
+	EXPECT_A 0
+	EXPECT_DE 5
+	LD	HL,BUF
+	LD	DE,SMALL_PENDING
+	LD	B,5
+.check_small
+	LD	A,(DE)
+	CP	(HL)
+	JP	NZ,FAIL
+	INC	DE
+	INC	HL
+	DJNZ	.check_small
+	LD	A,(BUF+5)
+	CP	0xA6
+	JP	NZ,FAIL
+	LD	HL,(DLL_BASE + 0x20 + CTX1_OFF + CTX_PENDING_OFF)
+	LD	DE,5
+	OR	A
+	SBC	HL,DE
+	JP	NZ,FAIL
+	LD	HL,(DLL_BASE + 0x20 + CTX1_OFF + CTX_PENDING_LEN)
+	LD	DE,5
+	OR	A
+	SBC	HL,DE
+	JP	NZ,FAIL
+	XOR	A
+	LD	(DLL_BASE + 0x20 + CH_STATE_OFF + 1),A
+	LD	HL,0
+	LD	(DLL_BASE + 0x20 + CTX1_OFF + CTX_PENDING_OFF),HL
+	LD	(DLL_BASE + 0x20 + CTX1_OFF + CTX_PENDING_LEN),HL
+
 	CASE	37			; in-image BSS canary
 	LD	A,(DLL_BASE + 0x20 + CANARY_OFF)
 	CP	0xA5
@@ -453,5 +514,6 @@ TAG_50		DB "50",0
 EMPTY		DB 0
 HOST_STR	DB "192.168.7.44",0
 PORT_STR	DB "80",0
+SMALL_PENDING	DB "small"
 
 	SAVEBIN "vectors.bin",0,0x10000

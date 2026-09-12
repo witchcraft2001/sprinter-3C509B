@@ -1,9 +1,12 @@
-.PHONY: all build test-host test-exe-stress package image clean
+.PHONY: all build perf-fast test-host test-exe-stress package image clean
 
 all: build
 
 build:
 	tools/build.sh
+
+perf-fast:
+	tools/perf-fast.sh
 
 test-host:
 	tools/test-host.sh

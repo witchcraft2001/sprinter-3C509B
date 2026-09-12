@@ -30,23 +30,22 @@ SEND_FRAME
 	LD	A,2
 	LD	(TX_ATTEMPTS_LEFT),A
 .SEND_ATTEMPT
+	IFDEF EL3_SESSION_RX
+	; One normal-path ISA session now owns stale status, TX_FREE, FIFO write and
+	; the first completion polls. A completion miss closes ISA before the sole
+	; final 1-ms wait; timeout recovery below never retries an uncertain frame.
+	CALL	@EL3IO.TX_SESSION
+	JR	C,.SEND_TIMEOUT_OR_IO
+	ELSE
 	CALL	TX_CLEAR_STALE
 	JP	C,.SEND_RETURN
 	CALL	TX_WAIT_FREE
 	JR	C,.SEND_TIMEOUT_OR_IO
-	IFDEF	EL3_SESSION_RX
-	; TX_BURST (el3_io.asm) writes preamble+frame+both pad regions in one ISA
-	; session instead of TX_WRITE_PACKET's four separate FIFO_WRITE/FIFO_ZERO
-	; opens; TX_WRITE_PACKET itself stays compiled (FTP does not define
-	; EL3_SESSION_RX and still calls it here). Same completion wait as
-	; before -- this only shrinks the write, not the TX_WAIT_COMPLETE below.
-	CALL	@EL3IO.TX_BURST
-	ELSE
 	CALL	TX_WRITE_PACKET
-	ENDIF
 	JP	C,.SEND_RETURN
 	CALL	TX_WAIT_COMPLETE
 	JR	C,.SEND_TIMEOUT_OR_IO
+	ENDIF
 	LD	A,(EL3_LAST_TX_STATUS)
 	LD	D,A
 	AND	EL3_TX_ERROR_MASK
@@ -371,6 +370,7 @@ TX_CALCULATE_LENGTHS
 	SCF
 	RET
 
+	IFNDEF EL3_SESSION_RX
 TX_CLEAR_STALE
 	LD	B,31
 .TX_STALE_LOOP
@@ -481,6 +481,7 @@ FIFO_WAIT_NEXT
 	LD	A,EL3_ERR_TX_TIMEOUT
 	SCF
 	RET
+	ENDIF
 
 TX_RECOVER_RESET
 	CALL	RESET_TX

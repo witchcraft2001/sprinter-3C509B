@@ -17,7 +17,8 @@ done
 sjasmplus --version 2>&1 | head -n 1
 
 bash -n "$script_dir/artifacts.sh" "$script_dir/build.sh" \
-  "$script_dir/image.sh" "$script_dir/package.sh" "$script_dir/test-host.sh" \
+  "$script_dir/image.sh" "$script_dir/package.sh" "$script_dir/perf-fast.sh" \
+  "$script_dir/test-host.sh" \
   "$script_dir/test-stage3-asm.sh" "$script_dir/test-stage4-asm.sh" \
   "$script_dir/test-stage5-asm.sh" "$script_dir/test-stage6-asm.sh" \
   "$script_dir/test-stage7-asm.sh" "$script_dir/test-stage8-asm.sh" \
@@ -94,6 +95,27 @@ perl -c "$script_dir/set-mame-network.pl" >/dev/null
 "$script_dir/test-mame-network.sh"
 
 "$script_dir/build.sh"
+"$script_dir/perf-fast.sh"
+python3 - "$repo_root/build/UNET509B.DLL" \
+  "$repo_root/build/perf-fast/UNET509B.DLL" <<'PYEOF'
+import struct, sys
+safe_path, fast_path = sys.argv[1:]
+safe = open(safe_path, 'rb').read()
+fast = open(fast_path, 'rb').read()
+safe_l1, = struct.unpack_from('<H', safe, 2)
+fast_l1, = struct.unpack_from('<H', fast, 2)
+if safe_l1 != fast_l1 or safe[:safe_l1] != fast[:fast_l1]:
+    raise SystemExit('perf-fast changed the public L1 hot image')
+if safe[safe_l1:] == fast[fast_l1:]:
+    raise SystemExit('perf-fast did not change the cold RX policy')
+PYEOF
+[ -f "$repo_root/build/perf-fast/sprinter-3c509b-fast.img" ]
+mdir -i "$repo_root/build/perf-fast/sprinter-3c509b-fast.img" ::NET.CFG \
+  | grep -Eq 'NET[[:space:]]+CFG'
+if grep -Fq 'build/perf-fast' "$script_dir/artifacts.sh"; then
+  echo "Error: non-release perf-fast artifacts leaked into tools/artifacts.sh" >&2
+  exit 1
+fi
 perl "$script_dir/check-hello.pl" \
   "$repo_root/build/HELLO.EXE" "$repo_root/src/apps/hello.asm"
 perl "$script_dir/check-stage1-audit.pl" "$repo_root/docs/STAGE1_AUDIT.md"

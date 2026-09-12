@@ -24,8 +24,9 @@
 	DEFINE	_MEMORY_DLL_INC
 
 ; ------------------------------------------------------
-; BSS_UNET: shim-private dispatcher scalars (see unet509b.asm's BSS_UNET
-; region, 112 bytes). Field layout here, offsets from BSS_UNET's own base.
+; BSS_UNET: shim-private dispatcher scalars. Field layout here, offsets from
+; BSS_UNET's own base. Keep the cold parameter block disjoint from both UDP
+; slots: either overlap silently changes its callback/function pointers.
 ; ------------------------------------------------------
 UNET_WIN_BASE		EQU DLL_BSS + BSS_UNET + 0x00	; word, this image's own page (WIN1/WIN2), from INIT
 UNET_INITED		EQU DLL_BSS + BSS_UNET + 0x02	; NETINIT has completed successfully
@@ -49,7 +50,8 @@ UNET_LISTEN_ACCEPTED	EQU DLL_BSS + BSS_UNET + 0x1D
 UNET_CANCEL_MODE	EQU DLL_BSS + BSS_UNET + 0x1E	; SETOPT CANCELKEYS
 UNET_CANCELLED		EQU DLL_BSS + BSS_UNET + 0x1F
 UNET_TICKS16		EQU DLL_BSS + BSS_UNET + 0x20	; word, NETTIME.TICK counter (cancel-poll cadence)
-UNET_UDP_CTX		EQU DLL_BSS + BSS_UNET + 0x22	; 2 * 14 bytes, connected-UDP per-channel context
+UNET_COLD_CTX		EQU DLL_BSS + BSS_UNET + 0x22	; CCTX_SIZE (52)
+UNET_UDP_CTX		EQU DLL_BSS + BSS_UNET + 0x56	; 2 * 14 bytes, connected-UDP per-channel context
 UNET_UDP_CTX_SIZE	EQU 14
 ; Field layout within one UNET_UDP_CTX[channel] slot (offsets, not addresses
 ; -- add to UNET_UDP_CTX + channel*UNET_UDP_CTX_SIZE).
@@ -58,14 +60,13 @@ UDPCTX_REMOTE_MAC	EQU 4	; six bytes
 UDPCTX_REMOTE_PORT	EQU 10	; word, host order
 UDPCTX_LOCAL_PORT	EQU 12	; word, host order
 	ASSERT UDPCTX_LOCAL_PORT + 2 == UNET_UDP_CTX_SIZE
-UNET_COLD_CTX		EQU DLL_BSS + BSS_UNET + 0x36	; CCTX_SIZE (46)
-UNET_SAVE_SP		EQU DLL_BSS + BSS_UNET + 0x64	; word, COLD.RUN's private-stack switch
-UNET_CONNECT_IP		EQU DLL_BSS + BSS_UNET + 0x66	; four bytes, F_CONNECT/F_UDPOPEN/F_RESOLVE/F_PING's parsed target IP scratch
-UNET_UDP_RPORT		EQU DLL_BSS + BSS_UNET + 0x6A	; word, F_UDPOPEN's parsed remote port scratch
-UNET_UDP_LPORT		EQU DLL_BSS + BSS_UNET + 0x6C	; word, F_UDPOPEN's parsed local port scratch
-UNET_BSS_USED		EQU 0x6E
-	ASSERT UNET_COLD_CTX + CCTX_SIZE <= DLL_BSS + BSS_UNET + 0x70	; BSS_UNET size, see unet509b.asm
-	ASSERT UNET_BSS_USED <= 0x70
+UNET_CONNECT_IP		EQU DLL_BSS + BSS_UNET + 0x72	; four bytes, parsed target IP scratch
+UNET_UDP_RPORT		EQU DLL_BSS + BSS_UNET + 0x76	; word, parsed remote port/port scratch
+UNET_UDP_LPORT		EQU DLL_BSS + BSS_UNET + 0x78	; word, parsed local port scratch
+UNET_BSS_USED		EQU 0x7A
+	ASSERT UNET_COLD_CTX + CCTX_SIZE <= UNET_UDP_CTX
+	ASSERT UNET_UDP_CTX + 2 * UNET_UDP_CTX_SIZE <= UNET_CONNECT_IP
+	ASSERT UNET_BSS_USED <= 0x7A
 
 ; ------------------------------------------------------
 ; BSS_RT: the driver stack's own resident scalars (el3*/netdrv/arp/nettime/
@@ -192,10 +193,10 @@ BSS_RT_USED		EQU 0xF4
 ; ------------------------------------------------------
 ; tcp_transport.asm (MODULE TCPX): STAGE9_TX/RX_BUFFER point at the DLL's
 ; own packet buffers (BSS_TX/BSS_RX, unet509b_bss.inc) instead of a mapped
-; DSS page; S11_* is the verbatim 0x00..0x9F relative layout memory.inc uses
-; for the two-context (non-STAGE13-string, non-STAGE12-single-context)
-; case, since the DLL keeps two real TCP contexts (BSS_CTX0/BSS_CTX1) and
-; two real one-MSS pending queues (BSS_PEND0/BSS_PEND1, plan decision #2).
+; DSS page. S11_* is a packed DLL-only layout: cold builders alias descriptors
+; whose lifetimes do not overlap, while the DLL still keeps two real TCP
+; contexts (BSS_CTX0/BSS_CTX1) and two real one-MSS pending queues
+; (BSS_PEND0/BSS_PEND1).
 ; ------------------------------------------------------
 STAGE9_TX_BUFFER	EQU DLL_BSS + BSS_TX	; ARP request/reply only now, see unet509b_bss.inc
 STAGE9_TX_CAPACITY	EQU 60
@@ -211,52 +212,56 @@ S11_CONTEXT1		EQU DLL_BSS + BSS_CTX1
 S11_CONTEXT_SCRATCH	EQU DLL_BSS + BSS_CTX_SCRATCH	; plan decision #7 (DNS/PING/UDPOPEN route)
 S11_STATE_BASE		EQU DLL_BSS + BSS_S11
 
-S11_TCP_BUILD_DESC	EQU S11_STATE_BASE + 0x00
-S11_BURST_SEQ		EQU S11_STATE_BASE + 0x17	; four bytes, network order (TCPX_SEND_BURST only)
-S11_BURST_FIRST		EQU S11_STATE_BASE + 0x1B	; word
+; The DLL's outbound TCP/IPv4 builder lives in the cold page, so its two
+; descriptor blocks and the disabled two-segment TX scratch may alias live
+; parse storage here. The standalone applications retain memory.inc's roomy
+; layout; only this in-image DLL BSS is packed against the L1 ceiling.
+S11_TCP_BUILD_DESC	EQU S11_STATE_BASE + 0x00	; private in cold builder
+S11_BURST_SEQ		EQU S11_STATE_BASE + 0x17	; TCPX_SEND_BURST is disabled
+S11_BURST_FIRST		EQU S11_STATE_BASE + 0x1B
 S11_BURST_PAIR		EQU S11_STATE_BASE + 0x1D
-S11_TCP_PARSE_DESC	EQU S11_STATE_BASE + 0x20
-S11_PARSE_SEQUENCE	EQU S11_STATE_BASE + 0x40
-S11_PARSE_ACK		EQU S11_STATE_BASE + 0x44
-S11_SELECTED_CONTEXT	EQU S11_STATE_BASE + 0x48	; word
-S11_MATCH_CONTEXT	EQU S11_STATE_BASE + 0x4A	; word
-S11_SEND_POINTER	EQU S11_STATE_BASE + 0x4C	; word
-S11_SEND_REMAINING	EQU S11_STATE_BASE + 0x4E	; word
-S11_SEND_CONFIRMED	EQU S11_STATE_BASE + 0x50	; word
-S11_SEGMENT_LENGTH	EQU S11_STATE_BASE + 0x52	; word
-S11_TARGET_ACK		EQU S11_STATE_BASE + 0x54	; four bytes, network order
-S11_FRAME_LENGTH	EQU S11_STATE_BASE + 0x58	; word
-S11_TCP_LENGTH		EQU S11_STATE_BASE + 0x5A	; word
-S11_IP_ID		EQU S11_STATE_BASE + 0x5C	; word
-S11_SEGMENT_ACCEPTED	EQU S11_STATE_BASE + 0x5F
-S11_CHANNEL		EQU S11_STATE_BASE + 0x60
-S11_COPY_LENGTH		EQU S11_STATE_BASE + 0x61	; word
-S11_BUILD_FLAGS		EQU S11_STATE_BASE + 0x63
-S11_WAIT_MASK		EQU S11_STATE_BASE + 0x64
-S11_ACTIVE_LENGTH	EQU S11_STATE_BASE + 0x65	; word
-S11_TIMEOUT_MS		EQU S11_STATE_BASE + 0x67	; word
-S11_DIAG_STAGE		EQU S11_STATE_BASE + 0x69
-S11_SEQUENCE_OVERRIDE	EQU S11_STATE_BASE + 0x6A
-S11_NEXT_LOCAL_PORT	EQU S11_STATE_BASE + 0x6B	; word, 49152..65535
-S11_WAIT_ALL		EQU S11_STATE_BASE + 0x6D
-S11_ACK_NOW		EQU S11_STATE_BASE + 0x6E
-S11_ACK_OWED		EQU S11_STATE_BASE + 0x6F
-S11_IPV4_BUILD_DESC	EQU S11_STATE_BASE + 0x70
-S11_IPV4_PARSE_DESC	EQU S11_STATE_BASE + 0x80	; IP4P_DESC_LENGTH = 18 bytes
-S11_FAST_LENGTH		EQU S11_STATE_BASE + 0x92	; word
-S11_FAST_BADSUM		EQU S11_STATE_BASE + 0x94	; word
-S11_RX_DEST		EQU S11_STATE_BASE + 0x96	; word
-S11_RX_FREE		EQU S11_STATE_BASE + 0x98	; word
-S11_RX_DELIVERED	EQU S11_STATE_BASE + 0x9A	; word
-S11_FAST_DEST		EQU S11_STATE_BASE + 0x9C	; word
-S11_FAST_DIRECT		EQU S11_STATE_BASE + 0x9E
-S11_WAIT_PROGRESS	EQU S11_STATE_BASE + 0x9F
+S11_TCP_PARSE_DESC	EQU S11_STATE_BASE + 0x00	; TCPP_DESC_LENGTH = 30
+S11_PARSE_SEQUENCE	EQU S11_STATE_BASE + 0x1E
+S11_PARSE_ACK		EQU S11_STATE_BASE + 0x22
+S11_SELECTED_CONTEXT	EQU S11_STATE_BASE + 0x26	; word
+S11_MATCH_CONTEXT	EQU S11_STATE_BASE + 0x28	; word
+S11_SEND_POINTER	EQU S11_STATE_BASE + 0x2A	; word
+S11_SEND_REMAINING	EQU S11_STATE_BASE + 0x2C	; word
+S11_SEND_CONFIRMED	EQU S11_STATE_BASE + 0x2E	; word
+S11_SEGMENT_LENGTH	EQU S11_STATE_BASE + 0x30	; word
+S11_TARGET_ACK		EQU S11_STATE_BASE + 0x32	; four bytes, network order
+S11_FRAME_LENGTH	EQU S11_STATE_BASE + 0x36	; word
+S11_TCP_LENGTH		EQU S11_STATE_BASE + 0x38	; outbound builder only
+S11_IP_ID		EQU S11_STATE_BASE + 0x38	; word
+S11_SEGMENT_ACCEPTED	EQU S11_STATE_BASE + 0x3A
+S11_CHANNEL		EQU S11_STATE_BASE + 0x3B
+S11_COPY_LENGTH		EQU S11_STATE_BASE + 0x3C	; word
+S11_BUILD_FLAGS		EQU S11_SEGMENT_ACCEPTED	; outbound builder is cold
+S11_WAIT_MASK		EQU S11_STATE_BASE + 0x3E
+S11_ACTIVE_LENGTH	EQU S11_STATE_BASE + 0x3F	; word
+S11_TIMEOUT_MS		EQU S11_STATE_BASE + 0x41	; word
+S11_DIAG_STAGE		EQU S11_STATE_BASE + 0x43
+S11_SEQUENCE_OVERRIDE	EQU S11_STATE_BASE + 0x44
+S11_NEXT_LOCAL_PORT	EQU S11_STATE_BASE + 0x45	; word, 49152..65535
+S11_WAIT_ALL		EQU S11_STATE_BASE + 0x47
+S11_ACK_NOW		EQU S11_STATE_BASE + 0x48
+S11_ACK_OWED		EQU S11_STATE_BASE + 0x49
+S11_IPV4_BUILD_DESC	EQU S11_STATE_BASE + 0x00	; private in cold builder
+S11_IPV4_PARSE_DESC	EQU S11_STATE_BASE + 0x4A	; IP4P_DESC_LENGTH = 18 bytes
+S11_FAST_LENGTH		EQU S11_STATE_BASE + 0x5C	; byte: direct segments in RECV
+S11_FAST_BADSUM		EQU S11_STATE_BASE + 0x5D	; word
+S11_RX_DEST		EQU S11_STATE_BASE + 0x5F	; word
+S11_RX_FREE		EQU S11_STATE_BASE + 0x61	; word
+S11_RX_DELIVERED	EQU S11_STATE_BASE + 0x63	; word
+S11_FAST_DEST		EQU S11_RX_DEST			; only non-DLL fast body uses it
+S11_FAST_DIRECT		EQU S11_STATE_BASE + 0x65
+S11_WAIT_PROGRESS	EQU S11_STATE_BASE + 0x66
 ; TCPX_ASYNCSEND (P5): the remaining ms budget within the CURRENT retry
 ; attempt of SEND's own .DATA_WAIT, sliced across suspend/resume (the
 ; window-probe wait is never sliced -- see tcp_transport.asm's own
 ; comment on WAIT_REMOTE_WINDOW -- so no phase flag is needed: a resume
 ; always re-enters .DATA_WAIT).
-S11_ASYNC_MS_LEFT	EQU S11_STATE_BASE + 0xA0	; word
-	ASSERT S11_ASYNC_MS_LEFT + 2 <= S11_STATE_BASE + 0xA2	; == BSS_S11 size, see unet509b_bss.inc
+S11_ASYNC_MS_LEFT	EQU S11_STATE_BASE + 0x67	; word
+	ASSERT S11_ASYNC_MS_LEFT + 2 <= S11_STATE_BASE + 0x69	; == BSS_S11 size, see unet509b_bss.inc
 
 	ENDIF

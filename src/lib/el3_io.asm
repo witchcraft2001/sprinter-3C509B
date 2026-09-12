@@ -386,12 +386,14 @@ RX_COPY_SUM
 	SRL	B
 	RR	C			; BC = whole 16-bit words
 	LD	A,C
-	AND	3
-	LD	(RXC_TAIL),A		; 0..3 words left over after the groups
+	AND	7
+	LD	(RXC_TAIL),A		; 0..7 words left over after the groups
 	SRL	B
 	RR	C
 	SRL	B
-	RR	C			; BC = whole four-word groups
+	RR	C
+	SRL	B
+	RR	C			; BC = whole eight-word groups
 	LD	A,C
 	EXX
 	LD	B,A			; group counter, shadow side
@@ -404,10 +406,10 @@ RX_COPY_SUM
 	EXX
 	INC	B
 	DEC	B			; Z iff no groups; leaves CF alone
-	EXX
-	JR	Z,.SUM_TAIL
+	JR	Z,.SUM_NO_GROUPS
 .SUM_GROUP
-	DUP 4
+	EXX
+	DUP 8
 	LD	A,(HL)
 	LD	(DE),A
 	INC	DE
@@ -420,12 +422,11 @@ RX_COPY_SUM
 	LD	B,A
 	EDUP
 	EXX
-	DJNZ	.SUM_GROUP_MORE
+	DJNZ	.SUM_GROUP
 	EXX
 	JR	.SUM_TAIL
-.SUM_GROUP_MORE
+.SUM_NO_GROUPS
 	EXX
-	JR	.SUM_GROUP
 .SUM_TAIL
 	LD	A,(RXC_TAIL)
 	EXX
@@ -699,21 +700,13 @@ RX_DROP
 	LD	BC,0
 	JP	RX_PAYLOAD
 
-; TX_BURST
-; Writes the preamble, frame and both pad regions @EL3.TX_WRITE_PACKET
-; writes in one ISA session instead of four (FIFO_WRITE/FIFO_WRITE/
-; FIFO_ZERO/FIFO_ZERO, each opening and closing its own). Reads
-; @EL3.TX_PREAMBLE/TX_SOURCE/TX_INPUT_LENGTH/TX_EFFECTIVE_LENGTH, already
-; populated by @EL3.TX_CALCULATE_LENGTHS -- same contract and same caller
-; (@EL3.SEND_FRAME's .SEND_ATTEMPT) as TX_WRITE_PACKET, which this replaces
-; only under EL3_SESSION_RX; TX_WRITE_PACKET itself stays compiled for FTP.
-; The FIFO data port is window-independent (unlike RX_STATUS/COMMAND, it
-; needs no Window 1 check here -- OPEN_FIFO above never does one either),
-; and SEND_FRAME has already selected Window 1 for TX_STATUS/TX_FREE by the
-; time this runs regardless.
-; Out: A=EL3_OK/CF=0, or explicit EL3_ERR_ISA_STATE/CF=1.
-; Clobbers AF, BC, DE, HL; preserves IX and IY.
-TX_BURST
+; TX_SESSION
+; Normal TX owns stale-status clearing, the TX_FREE check, the complete FIFO
+; burst and up to 256 immediate completion polls in one ISA session. If the
+; card has not completed by then, ISA is closed for one final 1-ms wait and a
+; single last poll. Every exit closes ISA; an unknown completion outcome is a
+; timeout and is never retransmitted by SEND_FRAME.
+TX_SESSION
 	LD	HL,(@EL3.TX_EFFECTIVE_LENGTH)
 	LD	BC,(@EL3.TX_INPUT_LENGTH)
 	OR	A
@@ -736,9 +729,50 @@ TX_BURST
 	XOR	A
 	LD	(@EL3.TX_PREAMBLE+2),A
 	LD	(@EL3.TX_PREAMBLE+3),A
+	LD	HL,0
+	LD	(EL3_LAST_TICKS),HL
 	LD	A,(@EL3.SLOT)
 	CALL	@ISA.OPEN
 	JP	C,.TXB_ISA_ERROR
+	LD	BC,EL3_W1_TX_STATUS
+	CALL	RXS_POINTER
+	LD	E,31
+.TXB_STALE
+	LD	A,(HL)
+	LD	(EL3_LAST_TX_STATUS),A
+	AND	EL3_TX_COMPLETE
+	JR	Z,.TXB_FREE
+	XOR	A
+	LD	(HL),A
+	DEC	E
+	JR	NZ,.TXB_STALE
+.TXB_FREE
+	LD	BC,EL3_W1_TX_FREE
+	CALL	RXS_POINTER
+	LD	E,(HL)
+	INC	HL
+	LD	D,(HL)
+	EX	DE,HL
+	LD	(EL3_LAST_STATUS),HL
+	LD	DE,(@EL3.TX_REQUIRED_BYTES)
+	OR	A
+	SBC	HL,DE
+	JR	NC,.TXB_WRITE
+	CALL	@ISA.CLOSE
+	JP	C,.TXB_ISA_ERROR
+	CALL	@EL3.WAIT_QUANTUM
+	LD	HL,(EL3_LAST_TICKS)
+	INC	HL
+	LD	(EL3_LAST_TICKS),HL
+	LD	DE,EL3_FIFO_WAIT_QUANTA
+	OR	A
+	SBC	HL,DE
+	JR	NC,.TXB_TIMEOUT
+	LD	A,(@EL3.SLOT)
+	CALL	@ISA.OPEN
+	JP	C,.TXB_ISA_ERROR
+	JR	.TXB_FREE
+.TXB_WRITE
 	LD	HL,(EL3_BASE)
 	SET	6,H
 	SET	7,H			; HL = fixed FIFO port
@@ -754,9 +788,45 @@ TX_BURST
 	LD	C,A
 	LD	B,0
 	CALL	TXB_ZERO_BARE
+	LD	BC,EL3_W1_TX_STATUS
+	CALL	RXS_POINTER
+	LD	B,0			; DJNZ gives exactly 256 bounded polls
+.TXB_COMPLETE_FAST
+	LD	A,(HL)
+	LD	(EL3_LAST_TX_STATUS),A
+	AND	EL3_TX_COMPLETE
+	JR	NZ,.TXB_COMPLETE
+	DJNZ	.TXB_COMPLETE_FAST
 	CALL	@ISA.CLOSE
-	JP	C,.TXB_ISA_ERROR
+	JR	C,.TXB_ISA_ERROR
+	CALL	@EL3.WAIT_QUANTUM
+	LD	HL,(EL3_LAST_TICKS)
+	INC	HL
+	LD	(EL3_LAST_TICKS),HL
+	LD	A,(@EL3.SLOT)
+	CALL	@ISA.OPEN
+	JR	C,.TXB_ISA_ERROR
+	LD	BC,EL3_W1_TX_STATUS
+	CALL	RXS_POINTER
+	LD	A,(HL)
+	LD	(EL3_LAST_TX_STATUS),A
+	AND	EL3_TX_COMPLETE
+	JR	Z,.TXB_CLOSE_TIMEOUT
+.TXB_COMPLETE
 	XOR	A
+	LD	(HL),A			; pop exactly one completed status
+	CALL	@ISA.CLOSE
+	JR	C,.TXB_ISA_ERROR
+	XOR	A
+	RET
+.TXB_CLOSE_TIMEOUT
+	CALL	@ISA.CLOSE
+	JR	C,.TXB_ISA_ERROR
+.TXB_TIMEOUT
+	LD	HL,EL3_COUNT_TIMEOUT
+	CALL	@EL3.INC_WORD
+	LD	A,EL3_ERR_TX_TIMEOUT
+	SCF
 	RET
 .TXB_ISA_ERROR
 	LD	A,EL3_ERR_ISA_STATE
@@ -781,20 +851,14 @@ TXB_WRITE_BARE
 	RET
 
 TXB_ZERO_BARE
-	LD	A,B
-	OR	C
+	LD	A,C			; all callers pass a count below 256
+	OR	A
 	RET	Z
-	XOR	A
+	LD	B,A
+	LD	E,0
 .TXB_ZERO_LOOP
-	LD	D,A
-	LD	A,B
-	OR	C
-	LD	A,D
-	JR	Z,.TXB_ZERO_DONE
-	LD	(HL),A
-	DEC	BC
-	JR	.TXB_ZERO_LOOP
-.TXB_ZERO_DONE
+	LD	(HL),E
+	DJNZ	.TXB_ZERO_LOOP
 	RET
 
 	ENDIF
@@ -806,7 +870,7 @@ WRITE_WORD	DW 0
 FIFO_TAIL	DB 0		; FIFO_READ's 0..7-byte remainder after the groups
 	ENDIF
 	IFDEF EL3_SESSION_RX
-RXC_TAIL	DB 0		; RX_COPY_PLAIN's 0..7-byte / RX_COPY_SUM's 0..3-word
+RXC_TAIL	DB 0		; RX_COPY_PLAIN's 0..7-byte / RX_COPY_SUM's 0..7-word
 				; remainder after the groups; never both at once
 RXC_ODD		DB 0		; RX_COPY_SUM: odd trailing byte to pad
 RXS_MODE	DB 0		; 0 = RX_PAYLOAD plain copy, 1 = RX_PAYLOAD_SUM

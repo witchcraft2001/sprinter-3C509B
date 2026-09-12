@@ -57,6 +57,8 @@
 					; TCPX_SINGLE_CONTEXT guard's IFNDEF STAGE13_LAYOUT)
 	DEFINE	TCPX_LISTEN		; tcp_transport.asm: inbound TCP (P4)
 	DEFINE	TCPX_ASYNCSEND		; tcp_transport.asm: SEND suspend/resume (P5)
+	DEFINE	TCPX_DIRECT_RX		; defer/coalesce ACKs outside frame dispatch
+	DEFINE	EL3_SESSION_RX		; two-phase FIFO receive and direct delivery
 
 	INCLUDE "dss.inc"
 	INCLUDE "sprinter.inc"
@@ -136,8 +138,6 @@ S9_ENV_BUFFER	EQU DLL_BSS + BSS_RX	; 256 bytes, RX is idle whenever env is read
 
 	INCLUDE "memory.inc"		; IFDEF UNET_DLL -> memory_dll.inc
 
-BSS_STACK_TOP	EQU DLL_BSS + BSS_STACK + 96
-
 ; ======================================================
 ; Driver stack. Same modules any Stage 11 EXE links, in the same order
 ; (see e.g. tcptest.asm); UNET_DLL/STAGE12_LAYOUT/STAGE13_LAYOUT (defined
@@ -207,9 +207,11 @@ PARSE
 
 	MODULE TCP
 
+	IFNDEF UNET_DLL
 BUILD
 	LD	A,CFN_TCP_BUILD
 	JP	@COLD.RUN
+	ENDIF
 
 PARSE
 	LD	A,CFN_TCP_PARSE
@@ -1368,9 +1370,9 @@ PARSE_PORT
 
 ; ------------------------------------------------------
 ; FILL_COLD_CTX: point every COLD_CTX pointer field at this image's own
-; resident scalars, once NETDRV/EL3 have published them. Every store is a
-; plain "LD HL,label" -- relocatable like any other reference (the plan's
-; relocation rule); nothing here is a computed address difference.
+; resident scalars, once NETDRV/EL3 have published them. A compact relocatable
+; pointer table is copied as one block; literal zero entries are the reserved
+; CCTX slots and are never dereferenced by cold code.
 ; Every field the cold blob dereferences must be filled here, including the
 ; ones only one cold routine touches: an unset pointer reads as 0x0000,
 ; which inside a cold call is the blob's OWN dispatch entry point, not a
@@ -1380,47 +1382,21 @@ PARSE_PORT
 ; check-stage14.pl cross-checks the two lists.
 ; ------------------------------------------------------
 FILL_COLD_CTX
-	LD	HL,STAGE9_RX_BUFFER
-	LD	(UNET_COLD_CTX+CCTX_RX_BUF),HL
-	LD	HL,NET_LOCAL_IP
-	LD	(UNET_COLD_CTX+CCTX_LOCAL_IP),HL
-	LD	HL,NETDRV_STATION_MAC
-	LD	(UNET_COLD_CTX+CCTX_STATION_MAC),HL
-	LD	HL,NET_TARGET_IP
-	LD	(UNET_COLD_CTX+CCTX_TARGET_IP),HL
-	LD	HL,NET_NEXT_HOP_IP
-	LD	(UNET_COLD_CTX+CCTX_NEXT_HOP_IP),HL
-	LD	HL,NET_RESULT_MAC
-	LD	(UNET_COLD_CTX+CCTX_RESULT_MAC),HL
-	LD	HL,S9_IP_ID
-	LD	(UNET_COLD_CTX+CCTX_IP_ID),HL
-	LD	HL,DNS_TRANSACTION_ID
-	LD	(UNET_COLD_CTX+CCTX_DNS_XID),HL
-	LD	HL,DNS_RESULT_IP
-	LD	(UNET_COLD_CTX+CCTX_DNS_RESULT),HL
-	LD	HL,S9_RX_PAYLOAD
-	LD	(UNET_COLD_CTX+CCTX_DNS_PAYLOAD_END),HL
-	LD	HL,S9_DRAIN_LEFT
-	LD	(UNET_COLD_CTX+CCTX_DNS_DRAIN),HL
-	LD	HL,S9_IPV4_BUILD_DESC
-	LD	(UNET_COLD_CTX+CCTX_DNS_IP_BUILD_DESC),HL
-	LD	HL,S9_IPV4_PARSE_DESC
-	LD	(UNET_COLD_CTX+CCTX_DNS_IP_PARSE_DESC),HL
-	LD	HL,DNS_NAME_POINTER
-	LD	(UNET_COLD_CTX+CCTX_DNS_NAME_PTR),HL
-	LD	HL,S9_RX_LENGTH
-	LD	(UNET_COLD_CTX+CCTX_DNS_FRAME_LEN),HL
-	LD	HL,S11_FRAME_LENGTH
-	LD	(UNET_COLD_CTX+CCTX_DNS_RX_LEN),HL
-	LD	HL,PING_ICMP_BUILD_DESC
-	LD	(UNET_COLD_CTX+CCTX_PING_BUILD_DESC),HL
-	LD	HL,PING_ICMP_REPLY_DESC
-	LD	(UNET_COLD_CTX+CCTX_PING_REPLY_DESC),HL
-	LD	HL,UNET_UDP_CTX
-	LD	(UNET_COLD_CTX+CCTX_UDP_CTX_BASE),HL
-	LD	HL,S9_LOCAL_PORT
-	LD	(UNET_COLD_CTX+CCTX_S9_LOCAL_PORT),HL
+	LD	HL,COLD_CTX_INIT_TABLE
+	LD	DE,UNET_COLD_CTX
+	LD	BC,CCTX_SIZE
+	LDIR
 	RET
+
+COLD_CTX_INIT_TABLE
+	DW STAGE9_RX_BUFFER,NET_LOCAL_IP,NETDRV_STATION_MAC
+	DW NET_TARGET_IP,NET_NEXT_HOP_IP,NET_RESULT_MAC,S9_IP_ID
+	DW DNS_TRANSACTION_ID,DNS_RESULT_IP,S9_RX_PAYLOAD,S9_DRAIN_LEFT
+	DW S9_IPV4_BUILD_DESC,S9_IPV4_PARSE_DESC,DNS_NAME_POINTER,S9_RX_LENGTH
+	DW S11_FRAME_LENGTH,PING_ICMP_BUILD_DESC,PING_ICMP_REPLY_DESC
+	DW UNET_UDP_CTX,S9_LOCAL_PORT,S11_STATE_BASE,S11_PENDING0,S11_CONTEXT0
+	DW @EL3IO.RXS_SUM,@EL3IO.RX_PAYLOAD,@EL3IO.RX_PAYLOAD_SUM
+	ASSERT $ - COLD_CTX_INIT_TABLE == CCTX_SIZE
 
 ; ------------------------------------------------------
 ; TEARDOWN_LINK: forced, idempotent teardown before (re-)bringing the link
@@ -1501,13 +1477,6 @@ RESOLVE_TARGET
 	SCF
 	RET
 
-; Shared single-instruction tail for MAP_SEND_FAIL below (MAP_CONNECT_FAIL
-; and MAP_RECV_FAIL moved cold with their own copy of this -- cold code
-; cannot call back into hot code).
-MAP_TAIL_CANCEL
-	LD	A,NERR_CANCEL
-	RET
-
 ; ------------------------------------------------------
 ; RESOLVE_HOST: In HL=the caller's own host text (already validated by
 ; CHECK_HOST_ARG), literal dotted quad or hostname, resolved into
@@ -1551,15 +1520,9 @@ PING_PARSE_REPLY
 	LD	A,CFN_PING_PARSE_REPLY
 	JP	@COLD.RUN
 MAP_DNS_FAIL
-	CP	NETDRV_ERR_CANCELLED
-	JR	Z,MAP_TAIL_CANCEL
-	CP	EL3_ERR_RX_TIMEOUT
-	JR	Z,.timeout
-	LD	A,NERR_DNS
-	RET
-.timeout
-	LD	A,NERR_TIMEOUT
-	RET
+	LD	E,A
+	LD	A,CFN_MAP_DNS_FAIL
+	JP	@COLD.RUN
 
 ; ------------------------------------------------------
 ; MAP_CONNECT_FAIL: In A=raw TCPX.OPEN failure code. Out: A=NERR_*.
@@ -1577,28 +1540,9 @@ MAP_CONNECT_FAIL
 ; ------------------------------------------------------
 MAP_SEND_FAIL
 	CALL	CAPTURE_DIAG
-	CP	NETDRV_ERR_CANCELLED
-	JR	Z,MAP_TAIL_CANCEL
-	CP	TCP_ERR_RESET
-	JR	Z,.closed
-	CP	TCP_ERR_CLOSED
-	JR	Z,.closed
-	CP	TCP_ERR_TIMEOUT
-	JR	Z,.send
-	CP	TCP_ERR_SEQUENCE
-	JR	Z,.send
-	CP	TCP_ERR_WINDOW
-	JR	Z,.send
-	CP	NETDRV_ERR_PROTOCOL
-	JR	Z,.send
-	LD	A,NERR_HW
-	RET
-.closed
-	LD	A,NERR_CLOSED
-	RET
-.send
-	LD	A,NERR_SEND
-	RET
+	LD	E,A
+	LD	A,CFN_MAP_SEND_FAIL
+	JP	@COLD.RUN
 
 ; ------------------------------------------------------
 ; MAP_RECV_FAIL: In A=raw TCPX.RECV failure code (TCP_ERR_TIMEOUT is
@@ -1618,11 +1562,11 @@ MAP_RECV_FAIL
 ; "up" test STATUS(0xFF)/NETINIT use). Trashes A, BC, DE, HL.
 ; ------------------------------------------------------
 ENV_IS_UP
-	LD	HL,N_NET_IP
+	LD	HL,@S9APP.E_IP
 	LD	DE,S9_ENV_BUFFER
 	CALL	ENV_GET_RAW
 	RET	C
-	LD	HL,N_NET_MAC
+	LD	HL,@S9APP.E_MAC
 	LD	DE,S9_ENV_BUFFER
 	JP	ENV_GET_RAW
 
@@ -1714,52 +1658,29 @@ COPY_LIMITED
 ;   "509B hw=0 st=00 nerr=00 tcp=00 el3=00/0000"
 ; ------------------------------------------------------
 BUILD_LASTERR
+	LD	HL,LASTERR_TEMPLATE
 	LD	DE,DLL_BSS + BSS_TX
-	LD	HL,LIT_509B
-	CALL	APPEND
-	LD	HL,S_HW
-	CALL	APPEND
+	LD	BC,43			; fixed text including its NUL
+	LDIR
 	LD	A,(UNET_INITED)
 	ADD	A,'0'
-	LD	(DE),A
-	INC	DE
-	LD	HL,S_ST
-	CALL	APPEND
-	LD	A,(UNET_STAGE)
-	CALL	FORMAT_HEX_A
-	LD	HL,S_NERR
-	CALL	APPEND
-	LD	A,(UNET_LAST_NERR)
-	CALL	FORMAT_HEX_A
-	LD	HL,S_TCP
-	CALL	APPEND
-	LD	A,(UNET_TCP_LAST)
-	CALL	FORMAT_HEX_A
-	LD	HL,S_EL3
-	CALL	APPEND
-	LD	A,(UNET_DIAG_EL3)
-	CALL	FORMAT_HEX_A
-	LD	A,'/'
-	LD	(DE),A
-	INC	DE
-	LD	A,(UNET_DIAG_EL3+1)
-	CALL	FORMAT_HEX_A
-	LD	A,(UNET_DIAG_EL3+2)
-	CALL	FORMAT_HEX_A
-	XOR	A
-	LD	(DE),A
-	RET
-
-; APPEND: copy the ASCIIZ at HL to (DE), DE past the last char.
-; Trashes A, HL. The NUL is not written.
-APPEND
+	LD	(DLL_BSS+BSS_TX+8),A
+	; The remaining six source bytes are contiguous. FORMAT_HEX_A advances DE;
+	; this compact gap table skips the fixed labels already copied above.
+	LD	HL,UNET_STAGE
+	LD	DE,DLL_BSS+BSS_TX+13
+	LD	IX,LASTERR_GAPS
+	LD	B,6
+.field
+	LD	A,(IX+0)
+	ADD	A,E			; BSS_TX+13..41 cannot cross a page
+	LD	E,A
 	LD	A,(HL)
-	AND	A
-	RET	Z
-	LD	(DE),A
-	INC	DE
 	INC	HL
-	JR	APPEND
+	CALL	FORMAT_HEX_A
+	INC	IX
+	DJNZ	.field
+	RET
 
 ; FORMAT_HEX_A: append A as two hex digits to (DE), DE advances.
 ; Trashes A. Preserves BC, HL.
@@ -1788,37 +1709,28 @@ FORMAT_HEX_A
 ; ------------------------------------------------------
 INFO_FIELD_COUNT	EQU 13
 INFO_NAME_TABLE
-	DW N_NET_IP		; 1  UNET_IF_IP
-	DW N_NET_MASK		; 2  UNET_IF_MASK
-	DW N_NET_GW		; 3  UNET_IF_GW
-	DW N_NET_MAC		; 4  UNET_IF_MAC
-	DW N_NET_DNS1		; 5  UNET_IF_DNS1
-	DW N_NET_DNS2		; 6  UNET_IF_DNS2
+	DW @S9APP.E_IP		; 1  UNET_IF_IP
+	DW @S9APP.E_MASK	; 2  UNET_IF_MASK
+	DW @S9APP.E_GW		; 3  UNET_IF_GW
+	DW @S9APP.E_MAC		; 4  UNET_IF_MAC
+	DW @S9APP.E_DNS1	; 5  UNET_IF_DNS1
+	DW @S9APP.E_DNS2	; 6  UNET_IF_DNS2
 	DW N_NET_IPSRC		; 7  UNET_IF_IPSRC
 	DW 0			; 8  UNET_IF_SSID  (no Wi-Fi)
 	DW 0			; 9  UNET_IF_BAUD  (no UART)
 	DW N_NET_NTP		; 10 UNET_IF_NTP
 	DW N_NET_TZ		; 11 UNET_IF_TZ
-	DW N_NET_HW		; 12 UNET_IF_HW
+	DW @S9APP.E_HW		; 12 UNET_IF_HW
 
-LIT_509B	DB "509B",0
+LIT_509B	EQU @S9APP.V_509B
 LIT_EMPTY	DB 0
-S_HW		DB " hw=",0
-S_ST		DB " st=",0
-S_NERR		DB " nerr=",0
-S_TCP		DB " tcp=",0
-S_EL3		DB " el3=",0
+LASTERR_TEMPLATE DB "509B hw=0 st=00 nerr=00 tcp=00 el3=00/0000",0
+	ASSERT $ - LASTERR_TEMPLATE == 43
+LASTERR_GAPS	DB 0,6,5,5,1,0
 
-N_NET_IP	DB "NET_IP",0
-N_NET_MASK	DB "NET_MASK",0
-N_NET_GW	DB "NET_GW",0
-N_NET_MAC	DB "NET_MAC",0
-N_NET_DNS1	DB "NET_DNS1",0
-N_NET_DNS2	DB "NET_DNS2",0
 N_NET_IPSRC	DB "NET_IP_SRC",0
 N_NET_NTP	DB "NET_NTP",0
 N_NET_TZ	DB "NET_TZ",0
-N_NET_HW	DB "NET_HW",0
 
 ; ------------------------------------------------------
 ; Shim-private scalars not shared with the driver stack.
@@ -1827,3 +1739,4 @@ N_NET_HW	DB "NET_HW",0
 	ENDMODULE
 
 	ASSERT $ <= DLL_IMAGE_ORIGIN + 0x38C7
+	ASSERT $ <= DLL_IMAGE_ORIGIN + 0x38B7	; retain at least 16 bytes spare

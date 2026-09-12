@@ -28,6 +28,9 @@ EXE_VERSION	EQU 1
 	; in-line. FTP does not define this and keeps the byte-identical old
 	; behavior -- its image has no room to spare for this yet.
 	DEFINE TCPX_DIRECT_RX
+	; Select an eight- or eleven-MSS streaming window from the card's idle RX
+	; capacity. Genuine pending-space backpressure still closes the window.
+	DEFINE TCPX_WIDE_DIRECT_WINDOW
 	; One ISA-window session per receive step (el3_io.asm's RX_BEGIN/
 	; RX_PAYLOAD/RX_DROP) instead of the several RX_PENDING/READ_FRAME used
 	; apart. Additive only: RX_PENDING/READ_FRAME themselves are untouched,
@@ -58,6 +61,9 @@ HTTP_WORK32_VAR		EQU W12_WORK32
 HTTP_ERROR_VAR		EQU W12_HOP_DONE
 HTTP_STATUS_SEEN_VAR	EQU W12_STATUS_SEEN
 HTTP_HEADER_LINE_VAR	EQU W12_HEADER_LINE
+; DLDIRECT does not implement redirects, so these two cleared WGET fields can
+; hold the receive window selected once after NETDRV.INIT.
+TCP_DIRECT_WINDOW_VAR	EQU W12_FLAGS
 
 	MODULE MAIN
 
@@ -96,6 +102,8 @@ START
 	CALL	@S9APP.LOAD_ACTIVE_CONFIG
 	JP	C,CONFIG_FAIL
 	CALL	@S9APP.INIT_DRIVER
+	JP	C,HARDWARE_FAIL
+	CALL	CONFIGURE_DIRECT_WINDOW
 	JP	C,HARDWARE_FAIL
 
 	LD	HL,W12_HOST
@@ -228,6 +236,42 @@ CLEAR_STATE
 
 RESET_HTTP_STATE
 	JP	@HTTPSTREAM.RESET
+
+; CONFIGURE_DIRECT_WINDOW
+; Reads the empty card FIFO once before DNS/TCP traffic. Eight MSS is the safe
+; fallback; eleven is selected only if Window 3 reports room for eleven full
+; DWORD-padded Ethernet frames. Window 1 and the closed ISA mapping are
+; restored on every successful return.
+; Out: A=EL3_OK/CF=0 or explicit EL3 status/CF=1.
+; Clobbers AF, DE and HL; preserves BC, IX and IY.
+CONFIGURE_DIRECT_WINDOW
+	LD	HL,TCP_DIRECT_RECV_SAFE_WINDOW
+	LD	(TCP_DIRECT_WINDOW_VAR),HL
+	LD	A,3
+	CALL	@EL3.SELECT_WINDOW
+	RET	C
+	LD	E,EL3_W3_RX_FREE
+	CALL	@EL3IO.READ16
+	JR	C,.READ_FAILED
+	LD	DE,TCP_DIRECT_RECV_WIDE_FIFO_MIN
+	OR	A
+	SBC	HL,DE
+	JR	C,.RESTORE_WINDOW
+	LD	HL,TCP_DIRECT_RECV_WIDE_WINDOW
+	LD	(TCP_DIRECT_WINDOW_VAR),HL
+.RESTORE_WINDOW
+	LD	A,1
+	JP	@EL3.SELECT_WINDOW
+.READ_FAILED
+	PUSH	AF
+	LD	A,1
+	CALL	@EL3.SELECT_WINDOW
+	JR	C,.RESTORE_FAILED
+	POP	AF
+	RET
+.RESTORE_FAILED
+	POP	HL			; discard saved AF without changing new A/CF
+	RET
 
 ; PARSE_DLDIRECT_CLI: exactly one positional (the URL), or -h/-?/--help.
 PARSE_DLDIRECT_CLI
@@ -927,10 +971,8 @@ MSG_USAGE_ERROR DB "[E] usage: missing or invalid URL",0
 MSG_HELP
 	DB "Usage:",13,10
 	DB "  DLDIRECT http://host[:port]/path",13,10
-	DB "  DLDIRECT /?",13,10,13,10
-	DB "  Discards the body while counting it; prints bytes, elapsed",13,10
-	DB "  seconds and KB/s once the transfer completes. Use a file of",13,10
-	DB "  at least a few hundred KB for a stable measurement.",13,10,0
+	DB "  DLDIRECT /?",13,10
+	DB "  Discards data; use a multi-megabyte file for a stable rate.",13,10,0
 MSG_OK		DB "RESULT OK",13,10,0
 MSG_FAIL	DB "RESULT FAIL",13,10,0
 

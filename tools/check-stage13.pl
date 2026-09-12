@@ -28,6 +28,9 @@ my $ftp = slurp('src/apps/ftp.asm', 0);
 my $dlspeed = slurp('src/apps/dlspeed.asm', 0);
 my $dldirect = slurp('src/apps/dldirect.asm', 0);
 my $libman = slurp('src/lib/libman13.asm', 0);
+my $transport = slurp('src/lib/tcp_transport.asm', 0);
+my $tcpinc = slurp('src/include/tcp.inc', 0);
+my $el3inc = slurp('src/include/el3.inc', 0);
 die "Stage 13 FTP contains an unbounded interrupt wait\n" if $ftp =~ /\b(?:HALT|EI)\b/;
 die "Stage 13 DLSPEED contains an unbounded interrupt wait\n" if $dlspeed =~ /\b(?:HALT|EI)\b/;
 
@@ -62,12 +65,27 @@ die "libman close-failure path does not unload an allocated DLL slot\n"
 die "direct benchmark lost its throughput feature set\n"
     unless $dldirect =~ /DEFINE\s+FAST_DATAPATH/ &&
            $dldirect =~ /DEFINE\s+TCPX_DIRECT_RX/ &&
-           $dldirect =~ /DEFINE\s+EL3_SESSION_RX/;
+           $dldirect =~ /DEFINE\s+EL3_SESSION_RX/ &&
+           $dldirect =~ /DEFINE\s+TCPX_WIDE_DIRECT_WINDOW/;
+die "DLDIRECT no longer keeps its FIFO-qualified window across RECV boundaries\n"
+    unless $transport =~ /TCPX_WIDE_DIRECT_WINDOW[\s\S]*?LD\s+HL,\(TCP_DIRECT_WINDOW_VAR\)/;
+die "DLDIRECT no longer advances its wide sliding window every two segments\n"
+    unless $transport =~ /TCPX_WIDE_DIRECT_WINDOW[\s\S]*?CP\s+TCP_ACK_EVERY[\s\S]*?CALL\s+SEND_OWED_ACK/;
+die "DLDIRECT no longer batches eleven segments in its 6 KiB caller buffer\n"
+    unless $dldirect =~ /LD\s+BC,STAGE9_FILE_CAPACITY[\s\S]*?CALL\s+\@TCPX\.RECV/;
+die "DLDIRECT no longer selects safe/wide windows from RX FIFO capacity\n"
+    unless $dldirect =~ /CONFIGURE_DIRECT_WINDOW[\s\S]*?EL3_W3_RX_FREE[\s\S]*?TCP_DIRECT_RECV_WIDE_FIFO_MIN[\s\S]*?TCP_DIRECT_RECV_WIDE_WINDOW/ &&
+           $el3inc =~ /^EL3_W3_RX_FREE\s+EQU\s+0x0A\s*$/m &&
+           $tcpinc =~ /^TCP_DIRECT_RECV_SAFE_SEGMENTS\s+EQU\s+8\s*$/m &&
+           $tcpinc =~ /^TCP_DIRECT_RECV_WIDE_SEGMENTS\s+EQU\s+11\s*$/m &&
+           $tcpinc =~ /^TCP_DIRECT_RECV_WIDE_FIFO_MIN\s+EQU\s+TCP_DIRECT_RECV_WIDE_SEGMENTS\s*\*\s*TCP_DIRECT_RECV_FIFO_FRAME\s*$/m;
 
 die "FTP client is not PASV-only (found an active-mode PORT command or a LISTEN call)\n"
     if $ftp =~ /DB\s+"PORT[\s"]|CMD_PORT|\bLISTEN\b/;
 die "FTP does not implement REST + RETR\n"
     unless $ftp =~ /CMD_REST\s+DB/ && $ftp =~ /CMD_RETR\s+DB/;
+die "FTP no longer treats REST-at-SIZE as an already complete file\n"
+    unless $ftp =~ /RESUME_SIZE_COMPARE[\s\S]*?TRANSFER_SUMMARY/;
 die "FTP does not use two independent TCP channels\n"
     unless $ftp =~ /FTP_CTRL_CHANNEL\s+EQU\s+0/ && $ftp =~ /FTP_DATA_CHANNEL\s+EQU\s+1/ &&
            $ftp =~ /STAGE13_LAYOUT/;
@@ -78,7 +96,6 @@ die "Stage 13 two-channel layout no longer defines both pending regions/contexts
 # TCPX_SINGLE_CONTEXT must stay decoupled from STAGE13_LAYOUT so the FTP data
 # channel is reachable at all; the two-channel/deep-window flag refactor is
 # the whole reason WGET's own layout stayed byte-for-byte compatible.
-my $transport = slurp('src/lib/tcp_transport.asm', 0);
 die "TCPX_SINGLE_CONTEXT no longer excludes STAGE13_LAYOUT\n"
     unless $transport =~ /IFDEF STAGE12_LAYOUT\n\tIFNDEF STAGE13_LAYOUT\n\tDEFINE TCPX_SINGLE_CONTEXT/;
 

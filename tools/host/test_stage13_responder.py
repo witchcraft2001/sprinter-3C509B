@@ -253,6 +253,32 @@ class Stage13ResponderTest(unittest.TestCase):
         received = b"".join(stage11.parse_tcp(frame)["payload"] for frame in data_frames)
         self.assertEqual(received, stage13.LARGE[2000:])
 
+    def test_rest_at_eof_sends_fin_and_226(self):
+        # An empty tail still has protocol completion: without the FIN-only
+        # data segment the client waits its whole data timeout after a valid
+        # REST == SIZE request (the failure seen in the live MAME run).
+        responder = stage13.Responder()
+        session = Session(responder)
+        session.send("USER anonymous\r\n")
+        session.send("PASS anonymous@\r\n")
+        session.send("TYPE I\r\n")
+        session.send("PASV\r\n")
+        self.open_data_channel(responder, responder.data_port, client_seq=7200)
+
+        session.send(f"REST {len(stage13.LARGE)}\r\n")
+        replies = session.send("RETR LARGE.BIN\r\n")
+        empty_fin = [stage11.parse_tcp(frame) for label, frame in replies
+                     if label == "DATA"]
+        self.assertEqual(len(empty_fin), 1)
+        self.assertEqual(empty_fin[0]["payload"], b"")
+        self.assertTrue(empty_fin[0]["flags"] & 0x01)
+        queued_control = bytes(
+            responder.connections[responder.control_key].send_queue)
+        self.assertTrue(any(b"226 Transfer complete.\r\n" in
+                            stage11.parse_tcp(frame)["payload"]
+                            for _, frame in replies) or
+                        b"226 Transfer complete.\r\n" in queued_control)
+
     def test_rest_does_not_carry_over_to_the_next_transfer(self):
         # A RETR with no REST of its own must start at 0, even right after a
         # resumed one -- REST applies to exactly the transfer command that

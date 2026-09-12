@@ -8,6 +8,20 @@ TCP_PROTOCOL		EQU 6
 TCP_HEADER_LENGTH	EQU 20
 TCP_SYN_HEADER_LENGTH	EQU 24
 TCP_MSS			EQU 536
+TCP_RECV_MAX_SEGMENTS	EQU 5
+TCP_RECV_MAX_WINDOW	EQU TCP_RECV_MAX_SEGMENTS * TCP_MSS
+	IFDEF TCPX_WIDE_DIRECT_WINDOW
+; DLDIRECT reads Window 3 Free Receive Bytes once while the initialized FIFO
+; is empty. Eight maximum frames need 4,736 FIFO bytes and fit a 5 KiB RX
+; partition; eleven need 6,512 and are enabled only when the card reports at
+; least that much room (MAME reports its full 16 KiB RX partition).
+TCP_DIRECT_RECV_SAFE_SEGMENTS EQU 8
+TCP_DIRECT_RECV_WIDE_SEGMENTS EQU 11
+TCP_DIRECT_RECV_SAFE_WINDOW EQU TCP_DIRECT_RECV_SAFE_SEGMENTS * TCP_MSS
+TCP_DIRECT_RECV_WIDE_WINDOW EQU TCP_DIRECT_RECV_WIDE_SEGMENTS * TCP_MSS
+TCP_DIRECT_RECV_FIFO_FRAME EQU (14 + 20 + TCP_HEADER_LENGTH + TCP_MSS + 3) & 0xFFFC
+TCP_DIRECT_RECV_WIDE_FIFO_MIN EQU TCP_DIRECT_RECV_WIDE_SEGMENTS * TCP_DIRECT_RECV_FIFO_FRAME
+	ENDIF
 
 ; Receive window advertised while a channel is not backpressured: a whole
 ; multiple of TCP_MSS, since a non-multiple stalls the pipe on every window

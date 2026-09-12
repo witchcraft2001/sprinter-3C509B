@@ -3,6 +3,7 @@ set -euo pipefail
 
 script_dir="$(cd "$(dirname "$0")" && pwd)"
 repo_root="$(cd "$script_dir/.." && pwd)"
+build_dir="${BUILD_DIR:-$repo_root/build}"
 
 if ! command -v sjasmplus >/dev/null 2>&1; then
   echo "Error: sjasmplus is required but was not found in PATH" >&2
@@ -14,7 +15,7 @@ if ! command -v sprinter-mkdll >/dev/null 2>&1; then
   exit 1
 fi
 
-mkdir -p "$repo_root/build"
+mkdir -p "$build_dir"
 
 build_app()
 {
@@ -25,8 +26,8 @@ build_app()
   sjasmplus --nologo --fullpath --cleanonerror \
     -I "$repo_root/src/include" \
     -I "$repo_root/src/lib" \
-    --lst="$repo_root/build/$artifact_name.lst" \
-    --raw="$repo_root/build/$artifact_name.EXE" \
+    --lst="$build_dir/$artifact_name.lst" \
+    --raw="$build_dir/$artifact_name.EXE" \
     "$repo_root/src/apps/$source_name.asm" >"$assembly_log"
   cat "$assembly_log"
   if grep -Eq 'Errors: [1-9]|error:' "$assembly_log"; then
@@ -34,7 +35,7 @@ build_app()
     return 1
   fi
   rm -f "$assembly_log"
-  echo "Built build/$artifact_name.EXE"
+  echo "Built ${build_dir#$repo_root/}/$artifact_name.EXE"
 }
 
 # build_dll: assemble UNET509B.DLL as a libman 1.3 / L1 relocatable image
@@ -53,6 +54,7 @@ build_app()
 build_dll()
 {
   local full_version major_minor cold_bin cold_size
+  local cold_defines=()
   full_version="$(sed -n 's/.*PACKAGE_VERSION[^"]*"\([^"]*\)".*/\1/p' \
     "$repo_root/src/include/version.inc")"
   major_minor="$(printf '%s' "$full_version" | cut -d. -f1,2)"
@@ -60,14 +62,17 @@ build_dll()
     --format l1 --target 1.3 --assembler sjasmplus \
     -I "$repo_root/src/include" -I "$repo_root/src/lib" \
     --name "UNET509B v$full_version" --version "$major_minor" --no-compress \
-    -o "$repo_root/build/UNET509B.DLL"
-  sprinter-mkdll verify "$repo_root/build/UNET509B.DLL" --target 1.3
+    -o "$build_dir/UNET509B.DLL"
+  sprinter-mkdll verify "$build_dir/UNET509B.DLL" --target 1.3
 
-  cold_bin="$repo_root/build/unet509b_cold.bin"
+  if [ "${TCPX_UNCHECKED_DATA_RX:-0}" = 1 ]; then
+    cold_defines+=(-DTCPX_UNCHECKED_DATA_RX)
+  fi
+  cold_bin="$build_dir/unet509b_cold.bin"
   sjasmplus --nologo --fullpath -I "$repo_root/src/include" \
-    -I "$repo_root/src/lib" "--raw=$cold_bin" \
+    -I "$repo_root/src/lib" "${cold_defines[@]}" "--raw=$cold_bin" \
     "$repo_root/src/dll/unet509b_cold.asm"
-  python3 - "$repo_root/build/UNET509B.DLL" "$cold_bin" <<'PYEOF'
+  python3 - "$build_dir/UNET509B.DLL" "$cold_bin" <<'PYEOF'
 import struct, sys
 out_path, cold_path = sys.argv[1], sys.argv[2]
 with open(cold_path, "rb") as f:
@@ -76,10 +81,10 @@ with open(out_path, "ab") as f:
     f.write(struct.pack("<H", len(cold)))
     f.write(cold)
 PYEOF
-  sprinter-mkdll verify "$repo_root/build/UNET509B.DLL" --target 1.3
+  sprinter-mkdll verify "$build_dir/UNET509B.DLL" --target 1.3
   cold_size="$(wc -c < "$cold_bin" | tr -d ' ')"
   rm -f "$cold_bin"
-  echo "Built build/UNET509B.DLL (cold blob: $cold_size bytes)"
+  echo "Built ${build_dir#$repo_root/}/UNET509B.DLL (cold blob: $cold_size bytes)"
 }
 
 build_dll

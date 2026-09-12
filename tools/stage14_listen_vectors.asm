@@ -68,6 +68,7 @@ A_PROCESS_FRAME	EQU DLL_BASE + SYM_PROCESS_FRAME
 A_SEND_FRAME	EQU DLL_BASE + SYM_SEND_FRAME
 A_SECONDS	EQU DLL_BASE + SYM_SECONDS
 A_COLD_READY	EQU DLL_BASE + SYM_COLD_READY
+A_FILL_COLD_CTX EQU DLL_BASE + SYM_FILL_COLD_CTX
 A_LOCAL_IP	EQU DLL_BASE + SYM_LOCAL_IP
 A_STATION_MAC	EQU DLL_BASE + SYM_STATION_MAC
 A_RX_BUF	EQU DLL_BASE + SYM_RX_BUF
@@ -76,6 +77,8 @@ A_CTX0		EQU DLL_BASE + SYM_CTX0
 A_INITED	EQU DLL_BASE + SYM_INITED
 A_RX_PENDING	EQU DLL_BASE + SYM_RX_PENDING
 A_READ_FRAME	EQU DLL_BASE + SYM_READ_FRAME
+A_RX_BEGIN	EQU DLL_BASE + SYM_RX_BEGIN
+A_RX_PAYLOAD	EQU DLL_BASE + SYM_RX_PAYLOAD
 A_CH_STATE	EQU DLL_BASE + SYM_CH_STATE
 A_LISTEN_ACC	EQU DLL_BASE + SYM_LISTEN_ACCEPTED
 A_READ_WALL	EQU DLL_BASE + SYM_READ_WALL
@@ -148,6 +151,7 @@ TEST_START
 	LD	DE,A_STATION_MAC
 	LD	BC,6
 	LDIR
+	CALL	A_FILL_COLD_CTX
 
 	; GENERATE_TUPLE asks DSS for the seconds counter; there is no DSS
 	; here, and the value only seeds an ISN. NETDRV.SEND_FRAME would talk
@@ -171,6 +175,14 @@ TEST_START
 	LD	(A_READ_FRAME),A
 	LD	HL,READ_FRAME_STUB
 	LD	(A_READ_FRAME+1),HL
+	LD	A,0xC3
+	LD	(A_RX_BEGIN),A
+	LD	HL,RX_BEGIN_STUB
+	LD	(A_RX_BEGIN+1),HL
+	LD	A,0xC3
+	LD	(A_RX_PAYLOAD),A
+	LD	HL,RX_PAYLOAD_STUB
+	LD	(A_RX_PAYLOAD+1),HL
 	; NETTIME.READ_WALL is the third and last routine on this path that
 	; needs a machine: it asks DSS for the time of day with its own RST,
 	; not through the S9APP.SECONDS patched above, and NETTIME.START calls
@@ -547,6 +559,37 @@ READ_FRAME_STUB
 	LD	(RX_QLEN2),HL
 	POP	BC
 	XOR	A			; CF=0
+	RET
+
+; Session-RX equivalents used by the optimized DLL wait loop. Every queued
+; passive-open vector is an optionless 54-byte control segment, exactly the
+; header capacity passed by WAIT_LOOP; RX_PAYLOAD therefore only has to close
+; the two-phase scope and promote the next queued frame.
+RX_BEGIN_STUB
+	LD	A,(RX_QLEN)
+	LD	BC,(RX_QLEN)
+	OR	C
+	JR	Z,.none
+	EX	DE,HL
+	LD	HL,(RX_QSRC)
+	PUSH	BC
+	LDIR
+	POP	BC
+	XOR	A
+	RET
+.none
+	LD	BC,0
+	XOR	A
+	RET
+
+RX_PAYLOAD_STUB
+	LD	HL,(RX_QSRC2)
+	LD	(RX_QSRC),HL
+	LD	HL,(RX_QLEN2)
+	LD	(RX_QLEN),HL
+	LD	HL,0
+	LD	(RX_QLEN2),HL
+	XOR	A
 	RET
 
 ; ------------------------------------------------------

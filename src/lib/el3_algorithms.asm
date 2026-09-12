@@ -98,6 +98,14 @@ BASE_DECODE
 ; In: HL = 0200..03E0 aligned to 10h. Out: A = index 00..1E, CF=0.
 ; Preserves BC, DE, HL, IX and IY.
 BASE_ENCODE
+	IFDEF	UNET_DLL
+	PUSH	IX
+	LD	IX,UNET_COLD_CTX
+	LD	A,CFN_EL3_BASE_ENCODE
+	CALL	@COLD.RUN
+	POP	IX
+	RET
+	ELSE
 	PUSH	HL
 	LD	A,L
 	AND	0x0F
@@ -135,6 +143,7 @@ BASE_ENCODE
 	LD	A,EL3_ERR_BASE
 	SCF
 	RET
+	ENDIF
 
 ; COPY_MAC
 ; Copies the factory station address to EL3_MAC in network order.
@@ -146,6 +155,7 @@ BASE_ENCODE
 ; themselves, so nothing local could show it.
 ; VALIDATE is the only caller. It has already saved BC, DE, HL, IX and IY and
 ; sets A itself, so this preserves nothing.
+	IFNDEF UNET_DLL
 COPY_MAC
 	LD	HL,EEPROM_BUFFER + 1
 	LD	DE,EL3_MAC
@@ -163,12 +173,23 @@ COPY_MAC
 	INC	DE
 	DJNZ	.LOOP
 	RET
+	ENDIF
 
 ; VALIDATE
 ; Validates exact IDs, unicast MAC, and both documented checksum lanes.
 ; Out: A=EL3_OK/CF=0 or stable error/CF=1.
 ; Preserves BC, DE, HL, IX and IY.
 VALIDATE
+	IFDEF	UNET_DLL
+	PUSH	BC,DE,HL,IX,IY
+	LD	HL,EEPROM_BUFFER
+	LD	DE,EL3_MAC
+	LD	IX,UNET_COLD_CTX
+	LD	A,CFN_EL3_VALIDATE
+	CALL	@COLD.RUN
+	POP	IY,IX,HL,DE,BC
+	RET
+	ELSE
 	PUSH	BC,DE,HL,IX,IY
 	VDIAG	EL3_VFAIL_PRODUCT
 	LD	HL,(EEPROM_BUFFER + 0x03*2)
@@ -366,6 +387,7 @@ XOR_WORD_BYTES_E
 	INC	HL
 	DJNZ	.LOOP
 	RET
+	ENDIF
 
 	ENDMODULE
 	ENDIF

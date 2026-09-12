@@ -25,6 +25,11 @@ make package
 make image
 ```
 
+`make perf-fast` creates a separate Stage 13/14 comparison build under
+`build/perf-fast/`. Its DLL skips the TCP payload checksum only for an already
+validated established in-order data segment; it is not part of either release
+manifest and must not be distributed as the normal DLL.
+
 Generated files are placed under `build/` and `distr/`:
 
 - The current DSS programs under `build/` include NETCFG, IFUP, PING, TFTP,

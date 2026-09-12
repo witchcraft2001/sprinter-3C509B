@@ -10,7 +10,7 @@
 ; decision: the sibling's RUN leaves the caller's stack live under WIN0
 ; while the cold code runs; ours does not assume WIN0 is ever safe for a
 ; stack (the DLL may load into WIN1 while the CALLER's own stack lives in
-; WIN0), so RUN switches to a private in-image stack (BSS_STACK_TOP) for
+; WIN0), so RUN switches to the upper 128 bytes of the mapped cold page for
 ; the duration of the call. The sibling also never frees its allocated
 ; page (FINI does not exist for a load-once DLL there); this one adds FREE
 ; so a libman l_free does not leak a DSS_GETMEM block.
@@ -43,7 +43,7 @@
 ;   4. Close the file, restore WIN3 to whatever it held before.
 ;
 ; RUN (every cold invocation):
-;   Sample IFF2, DI, save the caller's SP and switch to BSS_STACK_TOP,
+;   Sample IFF2, DI, save the caller's SP and switch to 0x4000,
 ;   save PAGE0 and write the cached physical byte, CALL the cold image's
 ;   entry point at offset 0, restore PAGE0, restore the caller's SP,
 ;   restore IFF2 (EI only if it was set).
@@ -59,7 +59,7 @@
 ; FREE (from FINI): DSS_FREEMEM the allocated block if INIT ever
 ; succeeded; idempotent, safe to call even if INIT was never run.
 ;
-; Public API (INCLUDE "win0cold.asm" after DLL_BSS/BSS_STACK_TOP exist):
+; Public API (INCLUDE "win0cold.asm" after the DLL BSS exists):
 ;
 ;   COLD.INIT
 ;       Out: CF=0 ready; CF=1 unavailable: A = the DSS error code if the
@@ -300,7 +300,7 @@ RUN
 	RET
 .go
 	POP	AF
-	LD	(.SAVE_A),A
+	EX	AF,AF'			; park the function code during IFF sampling
 	; Sample the caller's real IFF2 BEFORE the DI below, mirroring
 	; isa.asm's ISA.OPEN (NMOS erratum: a maskable interrupt can land
 	; mid "LD A,I" and misreport P/V once; if it did, its handler has
@@ -316,33 +316,37 @@ RUN
 .IFF_SAMPLED
 	LD	(.SAVE_IFF),A
 	DI
-	; Switch to the private in-image stack for the duration of the cold
-	; call: the caller's own stack may live in WIN0 (the DLL may be
-	; loaded in WIN1 while the consumer's stack sits in WIN2, or vice
-	; versa), and WIN0 is about to be repointed at the cold page.
+	; Save the caller stack while it is still mapped. The register bank, not a
+	; PUSH/POP pair, carries BC across the PAGE0 write: the caller's stack may
+	; itself be in WIN0 and becomes inaccessible as soon as that write lands.
+	; The real cold stack is in the upper 128 bytes of the cold page, above the
+	; enforced 0x3F80 blob boundary.
+	; The DLL itself lives in WIN1 or WIN2, but the caller's own stack may live
+	; in WIN0, which is about to be repointed at the cold page.
 	LD	(.SAVE_SP),SP
-	LD	SP,BSS_STACK_TOP
 	; BC is a live pass-through register in both directions, so the
 	; PAGE0 port loads below must not leak into or out of the cold call.
-	PUSH	BC
+	EXX
 	LD	BC,PAGE0
 	IN	A,(C)
 	LD	(.SAVE_PAGE0),A
 	LD	A,(PHYS_BYTE)
 	OUT	(C),A
-	POP	BC
-	LD	A,(.SAVE_A)
+	EXX
+	LD	SP,0x4000
+	EX	AF,AF'
 	CALL	0x0000
-	PUSH	AF
-	PUSH	BC
+	; Preserve every returned register in the alternate bank while PAGE0 is
+	; restored. Cold code may use the alternate bank internally, but only its
+	; main-bank outputs are part of the public contract at this boundary.
+	EX	AF,AF'
+	EXX
 	LD	A,(.SAVE_PAGE0)
 	LD	BC,PAGE0
 	OUT	(C),A
-	POP	BC
-	POP	AF
-	; SP is back at BSS_STACK_TOP here (every push above is matched by a
-	; pop); safe to restore the caller's real stack before touching it.
 	LD	SP,(.SAVE_SP)
+	EXX
+	EX	AF,AF'
 	PUSH	AF
 	LD	A,(.SAVE_IFF)
 	OR	A
@@ -351,7 +355,6 @@ RUN
 .no_ei
 	POP	AF
 	RET
-.SAVE_A		DB 0
 .SAVE_PAGE0	DB 0
 .SAVE_IFF	DB 0
 .SAVE_SP	DW 0

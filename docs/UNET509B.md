@@ -80,6 +80,35 @@ ASYNCSEND | LISTEN`, ABI `0x0100` -- full parity with `UNETRTL.DLL`.
 | `RAWETH`     | no    | no raw-frame entry point in the current ABI |
 | `RXFLOW`     | no    | the card buffers receive in its own on-card FIFO |
 
+## Receive path
+
+The shipped DLL keeps full IPv4/TCP validation while avoiding a mandatory
+one-call-per-MSS receive loop. It first reads the fixed 54-byte
+Ethernet/IPv4/TCP prefix. A plain established, in-order data segment can then
+be copied directly from the FIFO into the active caller buffer while its TCP
+checksum is accumulated; one `RECV` continues draining complete MSSes until
+the buffer no longer has room. The advertised transient window is limited to
+five MSSes (2680 bytes). The first directly delivered segment is acknowledged
+immediately, later segments use cumulative ACKs in pairs, and the final ACK
+sent as `RECV` returns advertises only the durable 536-byte per-channel pending
+capacity.
+
+Packets for another channel, insufficient caller space, a caller buffer in
+WIN0 (hidden while the cold overlay is mapped), and all non-ordinary packets
+use the original pending/slow path. SYN, FIN, RST, TCP options, pure ACKs,
+duplicates, out-of-order data and invalid IPv4 headers therefore retain the
+complete protocol parser. The two channels keep separate pending storage and
+state. A caller stack in WIN0 remains supported: `COLD.RUN` saves its address
+before remapping PAGE0 and switches to the overlay's private stack without a
+PUSH/POP that would cross the mapping change. Only direct delivery to a WIN0
+data buffer is disabled.
+
+A developer-only `perf-fast` image changes only the ordinary direct data copy
+to omit the TCP checksum calculation. It continues checking IPv4, tuple,
+sequence, flags and header shape and continues generating every outgoing
+checksum. That image lives under `build/perf-fast`, is not present in either
+release artifact manifest, and is not safe for distribution.
+
 ## Differences from the RTL/ESP backends
 
 These are the only places where a portable consumer can observe which
@@ -222,6 +251,12 @@ card, and re-enables them only if that sample said they were on. A
 consumer that keeps interrupts enabled across the call gets them back
 enabled; a consumer that calls in with interrupts already disabled
 does not have them force-enabled by the DLL.
+
+Transmit setup also stays within one bounded ISA session for stale-status
+drain, TX-free inspection, FIFO write and the first 256 completion polls. If
+completion is still unknown, the driver closes ISA before its final 1 ms wait
+and single poll. A timeout recovers TX but never retransmits the frame whose
+outcome is unknown.
 
 `UNET509B.DLL` is published in both the release archive and the
 floppy image, so a consumer can take the ready-built file without

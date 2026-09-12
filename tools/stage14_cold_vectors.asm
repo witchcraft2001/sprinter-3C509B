@@ -32,6 +32,7 @@ EL3_ERR_LINK_TIMEOUT	EQU 20
 	INCLUDE "unet.inc"		; NERR_* (frozen ABI constants)
 	INCLUDE "netdrv.inc"		; NETDRV_ERR_*
 	INCLUDE "tcp.inc"		; TCP_ERR_*
+	INCLUDE "tcpctx.inc"		; cold fast-RX context fields
 
 UNMAPPED_STATUS	EQU 0xFF		; no NERR_* mapping: must fall through to NERR_HW
 
@@ -69,12 +70,32 @@ V_DNS_PAYLOAD_END EQU 0x5868		; 2  S9_RX_PAYLOAD (parse scratch)
 V_DNS_DRAIN	EQU 0x586A		; 1  S9_DRAIN_LEFT (parse scratch)
 V_DNS_RX_LEN	EQU 0x586C		; 2  S11_FRAME_LENGTH (parse input)
 V_LOCAL_IP	EQU 0x586E		; 4  a writable stand-in for NET_LOCAL_IP
+V_TCP_STATE	EQU 0x5900		; compact DLL S11 state block (105 bytes)
+V_TCP_CTX0	EQU 0x5980		; selected 40-byte TCP context
+V_TCP_CTX1	EQU 0x59B0		; non-selected context
+V_TCP_PENDING0	EQU 0x5A00		; two one-MSS durable pending slots
+V_TCP_PENDING1	EQU V_TCP_PENDING0+TCP_MSS
+V_TCP_DEST	EQU 0x6000		; visible caller buffer
+V_TCP_SEED_EXPECT EQU 0x586F		; checksum seed expected by callback
+V_TCP_FORCE_BAD	EQU 0x5871		; callback forces a checksum reject
+V_TCP_RXS_SUM	EQU 0x5872		; hot EL3IO.RXS_SUM stand-in
+V_TCP_SEED_ACTUAL EQU 0x5874		; seed observed by the checksum callback
+V_TCP_CB_USED	EQU 0x5876		; 1=plain callback, 2=checksum callback
 
-; Stack-depth probe: SP is moved to PROBE_SP with the bytes below it
-; poisoned, so the deepest write of a cold call can be found afterwards.
-PROBE_SP	EQU 0x4F00
-PROBE_FLOOR	EQU 0x4E00
-PROBE_FILL	EQU 0x5A
+V_S11_SELECTED	EQU V_TCP_STATE+0x26
+V_S11_MATCH	EQU V_TCP_STATE+0x28
+V_S11_ACK_NOW	EQU V_TCP_STATE+0x48
+V_S11_RX_DEST	EQU V_TCP_STATE+0x5F
+V_S11_RX_FREE	EQU V_TCP_STATE+0x61
+V_S11_RX_DELIVERED EQU V_TCP_STATE+0x63
+V_S11_FAST_DIRECT EQU V_TCP_STATE+0x65
+V_S11_FAST_BADSUM EQU V_TCP_STATE+0x5D
+
+; Stack-depth probe: use the exact 0x3F80..0x3FFF reservation COLD.RUN maps.
+; Its poisoned bottom byte doubles as the boundary canary.
+PROBE_SP	EQU 0x4000
+PROBE_FLOOR	EQU 0x3F80
+PROBE_FILL	EQU 0xA5
 
 	MACRO CASE n
 	LD	A,n
@@ -679,7 +700,7 @@ TEST_START
 	EXPECT_HL 0x1F90
 
 ; ------------------------------------------------------
-; Cold-stack depth. COLD.RUN runs the whole blob on a 96-byte private stack
+; Cold-stack depth. COLD.RUN runs the whole blob on a 128-byte private stack
 ; inside the DLL image (the consumer's own stack may live in the window
 ; WIN0 is about to be repointed at), and the bytes below it are the
 ; dispatcher's scalars and COLD_CTX itself -- an overflow would corrupt the
@@ -710,12 +731,258 @@ TEST_START
 	LD	A,CFN_ARP_PARSE
 	CALL	PROBE_DEPTH
 
-	CASE	153			; the private stack is 96 bytes; keep real margin
+	CASE	153			; leave at least half of the private stack unused
 	LD	HL,(COLD_DEPTH)
 	LD	DE,64
 	OR	A
 	SBC	HL,DE
 	JP	NC,FAIL
+
+; ------------------------------------------------------
+; DLL fast-RX predicate: a normal established in-order data segment must go
+; straight to the active caller buffer. The checksum callback also checks the
+; pseudo/header seed the cold predicate computed before accepting payload.
+; ------------------------------------------------------
+	CASE	180
+	LD	HL,X_TCP_ODD
+	CALL	SETUP_TCP_RX
+	LD	HL,0x7BBD		; accumulator value before odd payload 0x4142,0x4300
+	LD	(V_TCP_SEED_EXPECT),HL
+	LD	IX,CCTX
+	LD	IY,V_TCP_CTX0
+	COLD	CFN_TCP_FAST_RECEIVE
+	JR	C,.TCP_180_HANDLED
+	CASE	181
+	JP	FAIL
+.TCP_180_HANDLED
+	OR	A
+	JR	Z,.TCP_180_STATUS_OK
+	CASE	182
+	JP	FAIL
+.TCP_180_STATUS_OK
+	CASE	183
+	LD	A,(V_S11_FAST_DIRECT)
+	CP	1
+	JP	NZ,FAIL
+	CASE	184
+	LD	HL,(V_S11_RX_DELIVERED)
+	EXPECT_HL 3
+	CASE	185
+	LD	HL,V_TCP_DEST
+	LD	DE,X_TCP_PAYLOAD_ODD
+	LD	B,3
+	CALL	EXPECT_RANGE
+	CASE	186
+	LD	HL,V_TCP_CTX0+CTX_RCV_NXT
+	LD	DE,X_TCP_NEXT_ODD
+	LD	B,4
+	CALL	EXPECT_RANGE
+	LD	A,(V_TCP_CB_USED)
+	IFDEF UNCHECKED_BUILD
+	CP	1
+	ELSE
+	CP	2
+	ENDIF
+	JP	NZ,FAIL
+
+	CASE	187			; even payload follows the same direct path
+	LD	HL,X_TCP_EVEN
+	CALL	SETUP_TCP_RX
+	LD	HL,0x7B79
+	LD	(V_TCP_SEED_EXPECT),HL
+	LD	IX,CCTX
+	LD	IY,V_TCP_CTX0
+	COLD	CFN_TCP_FAST_RECEIVE
+	JP	NC,FAIL
+	OR	A
+	JP	NZ,FAIL
+	LD	A,(V_S11_FAST_DIRECT)
+	CP	1
+	JP	NZ,FAIL
+	LD	HL,(V_S11_RX_DELIVERED)
+	EXPECT_HL 4
+	LD	HL,V_TCP_DEST
+	LD	DE,X_TCP_PAYLOAD_EVEN
+	LD	B,4
+	CALL	EXPECT_RANGE
+	LD	HL,V_TCP_CTX0+CTX_RCV_NXT
+	LD	DE,X_TCP_NEXT_EVEN
+	LD	B,4
+	CALL	EXPECT_RANGE
+
+	CASE	188			; safe rejects a bad sum; fast build accepts it
+	LD	HL,X_TCP_ODD
+	CALL	SETUP_TCP_RX
+	LD	HL,0x7BBD
+	LD	(V_TCP_SEED_EXPECT),HL
+	LD	A,1
+	LD	(V_TCP_FORCE_BAD),A
+	LD	IX,CCTX
+	LD	IY,V_TCP_CTX0
+	COLD	CFN_TCP_FAST_RECEIVE
+	JP	NC,FAIL
+	OR	A
+	JP	NZ,FAIL
+	IFDEF UNCHECKED_BUILD
+	LD	A,(V_S11_FAST_DIRECT)
+	CP	1
+	JP	NZ,FAIL
+	LD	HL,(V_S11_RX_DELIVERED)
+	EXPECT_HL 3
+	LD	A,(V_TCP_CB_USED)
+	CP	1
+	JP	NZ,FAIL			; unchecked build never called RX_PAYLOAD_SUM
+	ELSE
+	LD	A,(V_S11_FAST_DIRECT)
+	OR	A
+	JP	NZ,FAIL
+	LD	HL,(V_S11_RX_DELIVERED)
+	EXPECT_HL 0
+	LD	HL,(V_S11_FAST_BADSUM)
+	EXPECT_HL 1
+	LD	HL,V_TCP_CTX0+CTX_RCV_NXT
+	LD	DE,X_TCP_SEQUENCE
+	LD	B,4
+	CALL	EXPECT_RANGE
+	LD	A,(V_TCP_CB_USED)
+	CP	2
+	JP	NZ,FAIL
+	ENDIF
+
+	CASE	189			; duplicate sequence remains on the slow path
+	LD	HL,X_TCP_ODD
+	CALL	SETUP_TCP_RX
+	LD	A,0x40
+	LD	(RXB+41),A
+	CALL	EXPECT_TCP_SLOW
+
+	CASE	190			; out-of-order sequence remains on the slow path
+	LD	HL,X_TCP_ODD
+	CALL	SETUP_TCP_RX
+	LD	A,0x42
+	LD	(RXB+41),A
+	CALL	EXPECT_TCP_SLOW
+
+	CASE	191			; FIN/SYN/RST and TCP options are never unchecked
+	LD	HL,X_TCP_ODD
+	CALL	SETUP_TCP_RX
+	LD	A,0x19
+	LD	(RXB+47),A
+	CALL	EXPECT_TCP_SLOW
+	CASE	192
+	LD	HL,X_TCP_ODD
+	CALL	SETUP_TCP_RX
+	LD	A,0x1C
+	LD	(RXB+47),A
+	CALL	EXPECT_TCP_SLOW
+	CASE	193
+	LD	HL,X_TCP_ODD
+	CALL	SETUP_TCP_RX
+	LD	A,0x1A
+	LD	(RXB+47),A
+	CALL	EXPECT_TCP_SLOW
+	CASE	194
+	LD	HL,X_TCP_ODD
+	CALL	SETUP_TCP_RX
+	LD	A,0x60
+	LD	(RXB+46),A
+	CALL	EXPECT_TCP_SLOW
+
+	CASE	195			; a pure ACK/zero-window probe has no fast payload
+	LD	HL,X_TCP_ACK_ONLY
+	CALL	SETUP_TCP_RX
+	CALL	EXPECT_TCP_SLOW
+
+	CASE	196			; WIN0 caller is hidden while the cold page is live
+	LD	HL,X_TCP_ODD
+	CALL	SETUP_TCP_RX
+	LD	HL,0x2000
+	LD	(V_S11_RX_DEST),HL
+	CALL	EXPECT_TCP_SLOW
+
+	CASE	197			; small caller falls back to durable pending
+	LD	HL,X_TCP_ODD
+	CALL	SETUP_TCP_RX
+	LD	HL,2
+	LD	(V_S11_RX_FREE),HL
+	LD	HL,0x7BBD
+	LD	(V_TCP_SEED_EXPECT),HL
+	LD	IX,CCTX
+	LD	IY,V_TCP_CTX0
+	COLD	CFN_TCP_FAST_RECEIVE
+	JP	NC,FAIL
+	OR	A
+	JP	NZ,FAIL
+	LD	A,(V_S11_FAST_DIRECT)
+	OR	A
+	JP	NZ,FAIL
+	LD	HL,(V_TCP_CTX0+CTX_PENDING_LEN)
+	EXPECT_HL 3
+	LD	A,(V_TCP_CTX0+CTX_EVENT)
+	AND	EVENT_DATA
+	JP	Z,FAIL
+	LD	A,(V_S11_ACK_NOW)
+	CP	1
+	JP	NZ,FAIL
+	LD	HL,V_TCP_PENDING0
+	LD	DE,X_TCP_PAYLOAD_ODD
+	LD	B,3
+	CALL	EXPECT_RANGE
+
+	CASE	198			; neither caller nor pending has enough space
+	LD	HL,X_TCP_ODD
+	CALL	SETUP_TCP_RX
+	LD	HL,2
+	LD	(V_S11_RX_FREE),HL
+	LD	HL,TCP_MSS-2
+	LD	(V_TCP_CTX0+CTX_PENDING_LEN),HL
+	CALL	EXPECT_TCP_SLOW
+
+	CASE	199			; tuple for the other channel cannot bypass dispatch
+	LD	HL,X_TCP_ODD
+	CALL	SETUP_TCP_RX
+	LD	A,81
+	LD	(RXB+35),A		; peer source port 81 instead of context port 80
+	CALL	EXPECT_TCP_SLOW
+
+	CASE	200			; no selected context
+	LD	HL,X_TCP_ODD
+	CALL	SETUP_TCP_RX
+	LD	IX,CCTX
+	LD	IY,0
+	COLD	CFN_TCP_FAST_RECEIVE
+	JP	C,FAIL
+	LD	A,(V_TCP_CB_USED)
+	OR	A
+	JP	NZ,FAIL
+
+	CASE	201			; channel 1 uses only its own pending MSS
+	LD	HL,X_TCP_ODD
+	CALL	SETUP_TCP_RX
+	LD	HL,V_TCP_CTX0
+	LD	DE,V_TCP_CTX1
+	LD	BC,40
+	LDIR
+	LD	HL,V_TCP_CTX1
+	LD	(V_S11_SELECTED),HL
+	LD	HL,0
+	LD	(V_S11_RX_FREE),HL
+	LD	HL,0x7BBD
+	LD	(V_TCP_SEED_EXPECT),HL
+	LD	IX,CCTX
+	LD	IY,V_TCP_CTX1
+	COLD	CFN_TCP_FAST_RECEIVE
+	JP	NC,FAIL
+	OR	A
+	JP	NZ,FAIL
+	LD	HL,(V_TCP_CTX1+CTX_PENDING_LEN)
+	EXPECT_HL 3
+	LD	HL,(V_TCP_CTX0+CTX_PENDING_LEN)
+	EXPECT_HL 0
+	LD	HL,V_TCP_PENDING1
+	LD	DE,X_TCP_PAYLOAD_ODD
+	LD	B,3
+	CALL	EXPECT_RANGE
 
 ; ------------------------------------------------------
 ; The DNS codec (CFN_DNS_BUILD_FRAME / CFN_DNS_PARSE_FRAME /
@@ -929,6 +1196,18 @@ FILL_CCTX
 	LD	(CCTX+CCTX_DNS_DRAIN),HL
 	LD	HL,V_DNS_RX_LEN
 	LD	(CCTX+CCTX_DNS_RX_LEN),HL
+	LD	HL,V_TCP_STATE
+	LD	(CCTX+CCTX_TCP_STATE_BASE),HL
+	LD	HL,V_TCP_PENDING0
+	LD	(CCTX+CCTX_TCP_PENDING0),HL
+	LD	HL,V_TCP_CTX0
+	LD	(CCTX+CCTX_TCP_CONTEXT0),HL
+	LD	HL,V_TCP_RXS_SUM
+	LD	(CCTX+CCTX_EL3_RXS_SUM),HL
+	LD	HL,TCP_RX_PLAIN_STUB
+	LD	(CCTX+CCTX_CB_RX_PAYLOAD),HL
+	LD	HL,TCP_RX_SUM_STUB
+	LD	(CCTX+CCTX_CB_RX_PAYLOAD_SUM),HL
 	; The peer the route already resolved to, and a fresh IP identifier.
 	LD	HL,X_IP_PEER
 	LD	DE,V_TARGET_IP
@@ -944,6 +1223,125 @@ FILL_CCTX
 	LDIR
 	LD	HL,0x1234
 	LD	(V_IP_ID),HL
+	RET
+
+; HL=60-byte TCP fixture. Build one established selected context and an active
+; visible caller-buffer scope around it.
+SETUP_TCP_RX
+	PUSH	HL
+	CALL	FILL_CCTX
+	LD	HL,V_TCP_STATE
+	LD	BC,0x69
+	CALL	CLEAR_BLOCK
+	LD	HL,V_TCP_CTX0
+	LD	BC,80
+	CALL	CLEAR_BLOCK
+	LD	HL,V_TCP_PENDING0
+	LD	BC,1072
+	CALL	CLEAR_BLOCK
+	LD	HL,V_TCP_DEST
+	LD	BC,64
+	CALL	CLEAR_BLOCK
+	POP	HL
+	LD	DE,RXB
+	LD	BC,60
+	LDIR
+	LD	HL,60
+	LD	(V_DNS_RX_LEN),HL
+	LD	HL,V_TCP_CTX0
+	LD	(V_S11_SELECTED),HL
+	LD	HL,V_TCP_DEST
+	LD	(V_S11_RX_DEST),HL
+	LD	HL,64
+	LD	(V_S11_RX_FREE),HL
+	LD	A,TCP_STATE_ESTABLISHED
+	LD	(V_TCP_CTX0+CTX_STATE),A
+	LD	HL,X_IP_PEER
+	LD	DE,V_TCP_CTX0+CTX_REMOTE_IP
+	LD	BC,4
+	LDIR
+	LD	HL,80
+	LD	(V_TCP_CTX0+CTX_REMOTE_PORT),HL
+	LD	HL,0xD058
+	LD	(V_TCP_CTX0+CTX_LOCAL_PORT),HL
+	LD	HL,X_TCP_ACK
+	LD	DE,V_TCP_CTX0+CTX_SND_NXT
+	LD	BC,4
+	LDIR
+	LD	HL,X_TCP_SEQUENCE
+	LD	DE,V_TCP_CTX0+CTX_RCV_NXT
+	LD	BC,4
+	LDIR
+	XOR	A
+	LD	(V_TCP_FORCE_BAD),A
+	LD	(V_TCP_CB_USED),A
+	RET
+
+; HL=start, BC=count (>0). Clear a fixture block without assuming DSS-zeroed
+; memory, matching the real loader's arbitrary-page-content tests.
+CLEAR_BLOCK
+	LD	D,H
+	LD	E,L
+	INC	DE
+	DEC	BC
+	LD	(HL),0
+	LDIR
+	RET
+
+; The caller has prepared a header that must stay on WAIT_LOOP's established
+; slow path.  Prove the predicate neither consumed FIFO bytes nor committed
+; transport state; PROCESS_FRAME is deliberately outside this cold-only test.
+EXPECT_TCP_SLOW
+	LD	IX,CCTX
+	LD	IY,V_TCP_CTX0
+	COLD	CFN_TCP_FAST_RECEIVE
+	JP	C,FAIL
+	LD	A,(V_TCP_CB_USED)
+	OR	A
+	JP	NZ,FAIL
+	LD	A,(V_S11_FAST_DIRECT)
+	OR	A
+	JP	NZ,FAIL
+	LD	HL,(V_S11_RX_DELIVERED)
+	EXPECT_HL 0
+	LD	HL,V_TCP_CTX0+CTX_RCV_NXT
+	LD	DE,X_TCP_SEQUENCE
+	LD	B,4
+	JP	EXPECT_RANGE
+
+; Hot callback stand-ins used by the separately assembled cold predicate.
+; They copy from the simulated FIFO tail at RXB+54, then the SUM version
+; validates the seed and publishes either the clean FFFF accumulator or a
+; deliberately bad result.
+TCP_RX_PLAIN_STUB
+	LD	A,1
+	LD	(V_TCP_CB_USED),A
+	LD	HL,RXB+54
+	LDIR
+	XOR	A
+	RET
+
+TCP_RX_SUM_STUB
+	LD	A,2
+	LD	(V_TCP_CB_USED),A
+	LD	HL,RXB+54
+	LDIR
+	LD	HL,(V_TCP_SEED_EXPECT)
+	LD	DE,(V_TCP_RXS_SUM)
+	LD	(V_TCP_SEED_ACTUAL),DE
+	OR	A
+	SBC	HL,DE
+	JR	NZ,.bad
+	LD	A,(V_TCP_FORCE_BAD)
+	OR	A
+	JR	NZ,.bad
+	LD	HL,0xFFFF
+	JR	.store
+.bad
+	LD	HL,0
+.store
+	LD	(V_TCP_RXS_SUM),HL
+	XOR	A
 	RET
 
 ; 0xCC over NET_RESULT_MAC, so a copy that never happens cannot pass by
@@ -1013,9 +1411,9 @@ CHECK_SUM16
 	JP	NZ,FAIL
 	RET
 
-; A=cold function code, arguments already in registers. Runs the call on a
-; poisoned stack at PROBE_SP and keeps the deepest use seen so far in
-; COLD_DEPTH. IX must survive, so it is not used as scratch here.
+; A=cold function code, arguments already in registers. Runs the call on the
+; poisoned actual cold-stack reservation and keeps the deepest use seen so
+; far in COLD_DEPTH. Touching its bottom canary measures as 128 and fails.
 PROBE_DEPTH
 	PUSH	AF
 	LD	HL,PROBE_FLOOR
@@ -1275,5 +1673,34 @@ X_UDP_SLOT1	DB 10,0,0,7
 		DB 0xAA,0xBB,0xCC,0xDD,0xEE,0xFF
 		DW 0x1F90
 		DW 0xC401
+
+X_TCP_ODD
+	DB 0x00,0x20,0xAF,0x12,0x34,0x56,0x00,0x11,0x22,0x33,0x44,0x55,0x08,0x00
+	DB 0x45,0x00,0x00,0x2B,0x51,0x11,0x40,0x00,0x3E,0x06,0x5C,0x2A
+	DB 192,168,7,44,192,168,7,21
+	DB 0x00,0x50,0xD0,0x58,0x10,0x21,0x30,0x41,0x02,0x03,0x04,0x05
+	DB 0x50,0x18,0x10,0x00,0x74,0xE2,0x00,0x00
+X_TCP_PAYLOAD_ODD
+	DB 'A','B','C',0,0,0
+X_TCP_SEQUENCE	DB 0x10,0x21,0x30,0x41
+X_TCP_ACK	DB 0x02,0x03,0x04,0x05
+X_TCP_NEXT_ODD	DB 0x10,0x21,0x30,0x44
+
+X_TCP_EVEN
+	DB 0x00,0x20,0xAF,0x12,0x34,0x56,0x00,0x11,0x22,0x33,0x44,0x55,0x08,0x00
+	DB 0x45,0x00,0x00,0x2C,0x51,0x11,0x40,0x00,0x3E,0x06,0x5C,0x29
+	DB 192,168,7,44,192,168,7,21
+	DB 0x00,0x50,0xD0,0x58,0x10,0x21,0x30,0x41,0x02,0x03,0x04,0x05
+	DB 0x50,0x18,0x10,0x00,0x74,0x9D,0x00,0x00
+X_TCP_PAYLOAD_EVEN
+	DB 'A','B','C','D',0,0
+X_TCP_NEXT_EVEN DB 0x10,0x21,0x30,0x45
+
+X_TCP_ACK_ONLY
+	DB 0x00,0x20,0xAF,0x12,0x34,0x56,0x00,0x11,0x22,0x33,0x44,0x55,0x08,0x00
+	DB 0x45,0x00,0x00,0x28,0x51,0x11,0x40,0x00,0x3E,0x06,0x5C,0x2D
+	DB 192,168,7,44,192,168,7,21
+	DB 0x00,0x50,0xD0,0x58,0x10,0x21,0x30,0x41,0x02,0x03,0x04,0x05
+	DB 0x50,0x10,0x10,0x00,0xF9,0x2F,0x00,0x00,0,0,0,0,0,0
 
 	SAVEBIN "cold_vectors.bin",0,0x10000

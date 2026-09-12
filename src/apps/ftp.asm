@@ -206,6 +206,33 @@ START
 	JP	Z,PROMPT_CANCEL
 	JP	FILE_FAIL
 .FILE_READY
+	; A repeated -r against an already complete local file is a successful
+	; no-op. Opening a PASV data connection and issuing REST exactly at EOF is
+	; legal, but a number of small/test servers never close that empty stream;
+	; SIZE already gives us an unambiguous answer without entering that trap.
+	LD	A,(F13_MODE)
+	OR	A
+	JR	NZ,.TRANSFER_NEEDED
+	LD	A,(F13_RESUME_SELECTED)
+	OR	A
+	JR	Z,.TRANSFER_NEEDED
+	LD	A,(F13_TOTAL_KNOWN)
+	OR	A
+	JR	Z,.TRANSFER_NEEDED
+	LD	HL,F13_RESUME_OFFSET
+	LD	DE,F13_TOTAL_SIZE
+	LD	B,4
+.RESUME_SIZE_COMPARE
+	LD	A,(DE)
+	CP	(HL)
+	JR	NZ,.TRANSFER_NEEDED
+	INC	DE
+	INC	HL
+	DJNZ	.RESUME_SIZE_COMPARE
+	CALL	CLOSE_LOCAL_FILE
+	JP	C,FILE_FAIL
+	JP	TRANSFER_SUMMARY
+.TRANSFER_NEEDED
 
 	LD	HL,MSG_OPENING_DATA
 	CALL	@CONSOLE.LINE
@@ -313,6 +340,7 @@ TRANSFER_DONE
 	JR	C,.NO226
 	CALL	PRINT_REPLY
 .NO226
+TRANSFER_SUMMARY
 	LD	A,(F13_MODE)
 	CP	2
 	JR	Z,.SKIP_SUMMARY

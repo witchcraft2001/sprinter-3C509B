@@ -425,8 +425,14 @@ class EtherLinkIII {
     this.netDiag = 0;
     this.rxFilter = 0;
     this.intrMask = 0; this.readZero = 0;
-    this.rxEarly = 0x7fc; this.txAvailable = 0x7fc; this.txStart = 0x600;
+    this.rxEarly = 0x7fc;
+    this.txAvailable = scenario.txAvailable === undefined ? 0x7fc : scenario.txAvailable;
+    this.txStart = 0x600;
     this.txStatus = [];
+    this.txStaleInjected = false;
+    this.txStatusReads = 0;
+    this.txStatusPops = 0;
+    this.txFreeReads = 0;
     this.txFifo = [];
     this.txExpected = 0;
     this.rxQueue = [];
@@ -625,7 +631,10 @@ class EtherLinkIII {
       if (dwordPad.some(Boolean)) throw new Error('non-zero TX DWORD padding');
       this.transmitted.push(frame);
       this.txRecords.push({preamble, dwordPad, frame});
-      this.txStatus.push(0xc0);
+      if (!this.scenario.txNeverComplete) this.txStatus.push({
+        value: this.scenario.txCompletionStatus ?? 0xc0,
+        remaining: this.scenario.txCompletionDelayReads || 0,
+      });
       if (this.netDiag & 0xf000) this.rxQueue.push({frame: frame.slice(), cursor: 0});
       this.respond(frame);
       this.txFifo = []; this.txExpected = 0;
@@ -1395,10 +1404,20 @@ class EtherLinkIII {
           return this.rxQueue.length ? this.rxQueue[0].frame.length |
             (this.rxQueue[0].statusError ? 0x4000 : 0) : 0;
         }
-        if (offset === 0x0c) return 0x2000;
+        if (offset === 0x0c) {
+          this.txFreeReads++;
+          if (this.scenario.txFreeBlocked) return 0;
+          if (this.scenario.txFreeDelayReads && this.txFreeReads <= this.scenario.txFreeDelayReads)
+            return 0;
+          return 0x2000;
+        }
         break;
       case 2:
         if (offset >= 0 && offset < 6 && !(offset & 1)) return this.station[offset] | (this.station[offset + 1] << 8);
+        break;
+      case 3:
+        if (offset === 0x0a)
+          return this.scenario.rxFifoBytes === undefined ? 0x4000 : this.scenario.rxFifoBytes;
         break;
       case 4:
         if (offset === 0x04) return 0;
@@ -1436,7 +1455,18 @@ class EtherLinkIII {
     if (!this.active) return 0xff;
     if (this.window === 1 && offset === 0) return this.rxByte();
     if (this.window === 1 && offset > 0 && offset < 4) throw new Error(`wrong RX FIFO offset ${offset}`);
-    if (this.window === 1 && offset === 0x0b) return this.txStatus[0] || 0;
+    if (this.window === 1 && offset === 0x0b) {
+      this.txStatusReads++;
+      if (!this.txStaleInjected) {
+        this.txStaleInjected = true;
+        this.txStatus.push(...(this.scenario.txStaleStatuses || []).map((value) =>
+          ({value: value & 0xff, remaining: 0})));
+      }
+      const status = this.txStatus[0];
+      if (!status) return 0;
+      if (status.remaining > 0) { status.remaining--; return 0; }
+      return status.value;
+    }
     if (this.window === 2 && offset < 6) return this.station[offset];
     if (this.window === 6 && offset < 14) return 0;
     if (offset & 1) {
@@ -1454,7 +1484,10 @@ class EtherLinkIII {
     if (!this.active) return;
     if (this.window === 1 && offset === 0) return this.txByte(value);
     if (this.window === 1 && offset > 0 && offset < 4) throw new Error(`wrong TX FIFO offset ${offset}`);
-    if (this.window === 1 && offset === 0x0b) { if (this.txStatus.length) this.txStatus.shift(); return; }
+    if (this.window === 1 && offset === 0x0b) {
+      if (this.txStatus.length) { this.txStatus.shift(); this.txStatusPops++; }
+      return;
+    }
     if (this.window === 2 && offset < 6) { this.station[offset] = value & 0xff; return; }
     if (offset & 1) {
       const even = offset - 1;
@@ -1474,7 +1507,10 @@ function normalizeFrame(frame) {
 function runExe(exePath, args = '', inputScenario = {}) {
   const scenario = {...inputScenario};
   scenario.rxFrames = (scenario.rxFrames || []).map(normalizeFrame);
-  const exe = fs.readFileSync(exePath);
+  // Tests that exercise loader/stack placement sometimes need a minimally
+  // patched copy of a real built image. Accepting a Buffer keeps those
+  // mutations in memory while preserving the normal path-based API.
+  const exe = Buffer.isBuffer(exePath) ? Buffer.from(exePath) : fs.readFileSync(exePath);
   if (exe.length <= 128 || exe.toString('ascii', 0, 3) !== 'EXE' || exe[3] !== 1)
     throw new Error('invalid DSS EXE header');
   const headerSize = u16(exe, 4), entry = u16(exe, 16), entry2 = u16(exe, 18), stack = u16(exe, 20);
@@ -1534,24 +1570,131 @@ function runExe(exePath, args = '', inputScenario = {}) {
   const files = new Map(Object.entries(scenario.files || {}).map(([name, data]) => [
     canonicalName(name), Buffer.isBuffer(data) ? Buffer.from(data) : Buffer.from(data, 'utf8'),
   ]));
+  // A libman L1 file contains three very different regions: executable image
+  // bytes, a relocation bitmap and (for UNET509B) an appended WIN0 overlay.
+  // `strictPc` used to reject every call into a loaded DLL, so DLL scenarios
+  // had to disable the one guard that catches a bad return into BSS or an
+  // unmapped page.  Describe executable *source* ranges here and project them
+  // onto the physical DSS pages as READ_FILE fills those pages below.
+  const l1ExecutableRanges = (name, data) => {
+    if (data.length < 32 || data.toString('ascii', 0, 2) !== 'L1') return [];
+    const fileSize = u16(data, 2), relocStart = u16(data, 4);
+    if (fileSize > data.length || relocStart < 32 + 24 * 3 || relocStart > fileSize)
+      throw new Error('invalid L1 size/relocation fields');
+    const jumpEnd = 32 + 24 * 3;
+    // UNET509B deliberately writes its zero-filled BSS immediately after the
+    // fixed 24-entry jump table and terminates it with A5.  Excluding that run
+    // is what makes strictPc reject execution in runtime data instead of
+    // blessing the whole 16K allocation merely because it holds a DLL.
+    let codeStart = jumpEnd;
+    while (codeStart < relocStart && data[codeStart] === 0) codeStart++;
+    if (codeStart >= relocStart || data[codeStart] !== 0xa5) {
+      // The BSS marker is a UNET509B layout contract, not an L1-format field.
+      // A different library remains executable as one image unless its own
+      // layout metadata is taught here; never silently weaken this DLL's gate.
+      if (name.endsWith('UNET509B.DLL'))
+        throw new Error('UNET509B L1 DLL has no zero-BSS A5 boundary marker');
+      return [[32, relocStart]];
+    }
+    codeStart++;
+    const ranges = [[32, jumpEnd], [codeStart, relocStart]];
+    if (fileSize + 2 <= data.length) {
+      const coldLength = u16(data, fileSize);
+      const coldEnd = fileSize + 2 + coldLength;
+      if (coldEnd > data.length) throw new Error('truncated L1 cold overlay');
+      if (coldLength) ranges.push([fileSize + 2, coldEnd]);
+    }
+    return ranges;
+  };
+  const fileExecutableRanges = new Map([...files].map(([name, data]) =>
+    [name, l1ExecutableRanges(name, data)]));
+  const l1Files = [...files].filter(([, data]) => data.length >= 32 &&
+    data.toString('ascii', 0, 2) === 'L1');
   const openFiles = new Map();
   let nextHandle = 4, envSetCount = 0, clockSecond = scenario.clockSecond || 0;
   let fileReadCalls = 0, fileWriteCalls = 0, fileCloseCalls = 0, totalWritten = 0;
   let clockReads = 0, scanCount = 0, keyDelivered = false;
   const dssEvents = [];
-  let stdout = '', exitCode = null, steps = 0, minimumSp = stack, minimumPageSp = 0x10000;
+  let stdout = '', exitCode = null, exitIff = null;
+  let steps = 0, minimumSp = stack, minimumPageSp = 0x10000;
   // Times the bounded polling yield above was collapsed: one per NETTIME.TICK,
   // and a tick is 1.9 ms of busy-wait on a real Sprinter (NETPROF measured).
   // The step counter cannot show this, precisely because the loop is collapsed.
   let delayLoops = 0;
   const setTimeCalls = [];
   const pcTrace = [];
+  const executablePages = new Map();
+  const l1Pages = new Set();
+  const dllEntryCalls = Array(24).fill(0);
+  let mappedExecutableHits = 0;
 
   const cardPort = (address) => address & 0x3fff;
   const assertCardSlot = () => selectedSlot === card.slot && card.present;
   const assertWordCycleComplete = () => {
     if (card.wordReadHigh.size) throw new Error('ISA closed after low byte read without high byte');
     if (card.wordWriteLow.size) throw new Error('ISA closed after low byte write without high byte');
+  };
+  const mappedAddress = (address) => {
+    address &= 0xffff;
+    if (address < 0x4000 && win0 !== null) return [win0, address];
+    if (address < 0x8000 && win1 !== null) return [win1, address - 0x4000];
+    if (address < 0xc000 && win2 !== null) return [win2, address - 0x8000];
+    if (win3 !== null && !isaOpen) return [win3, address - 0xc000];
+    return null;
+  };
+  const markExecutableRead = (file, sourceStart, destination, length) => {
+    const sourceEnd = sourceStart + length;
+    for (const [rangeStart, rangeEnd] of fileExecutableRanges.get(file.name) || []) {
+      const first = Math.max(sourceStart, rangeStart);
+      const last = Math.min(sourceEnd, rangeEnd);
+      for (let source = first; source < last; source++) {
+        const mapped = mappedAddress(destination + source - sourceStart);
+        if (!mapped) continue;
+        const [page, offset] = mapped;
+        let executable = executablePages.get(page);
+        if (!executable) {
+          executable = new Uint8Array(0x4000);
+          executablePages.set(page, executable);
+        }
+        executable[offset] = 1;
+      }
+    }
+  };
+  const isMappedExecutable = (address) => {
+    const mapped = mappedAddress(address);
+    return !!mapped && !!executablePages.get(mapped[0])?.[mapped[1]];
+  };
+  // libman reads an L1 file into a temporary two-page block, relocates and
+  // packs the image into another page, then frees the temporary block.  The
+  // packed bytes were therefore not written by READ_FILE itself.  Recognize
+  // that exact relocated image when a page is mapped and transfer only the
+  // source ranges classified above, leaving BSS/bitmap/unmapped tail dark.
+  const recognizeL1Page = (page, virtualBase) => {
+    const content = pages.get(page);
+    if (!content) return;
+    for (const [name, data] of l1Files) {
+      const fileSize = u16(data, 2), relocStart = u16(data, 4);
+      const imageLength = relocStart - 32;
+      if (imageLength <= 0 || 32 + imageLength > content.length) continue;
+      let matches = true;
+      for (let i = 0; i < imageLength; i++) {
+        const relocated = data[relocStart + (i >> 3)] & (0x80 >> (i & 7));
+        const expected = (data[32 + i] + (relocated ? virtualBase >> 8 : 0)) & 0xff;
+        if (content[32 + i] !== expected) { matches = false; break; }
+      }
+      if (!matches) continue;
+      let executable = executablePages.get(page);
+      if (!executable) {
+        executable = new Uint8Array(0x4000);
+        executablePages.set(page, executable);
+      }
+      for (const [first, last] of fileExecutableRanges.get(name) || []) {
+        const hotFirst = Math.max(first, 32), hotLast = Math.min(last, relocStart);
+        for (let source = hotFirst; source < hotLast; source++) executable[source] = 1;
+      }
+      l1Pages.add(page);
+      return;
+    }
   };
   const rd = (address) => {
     address &= 0xffff;
@@ -1613,21 +1756,25 @@ function runExe(exePath, args = '', inputScenario = {}) {
       if ((port & 0xff) === 0x82) {
         page0 = value;
         win0 = allocated(value) ? value : null;
+        if (win0 !== null) recognizeL1Page(win0, 0x0000);
         return;
       }
       if ((port & 0xff) === 0xa2) {
         page1 = value;
         win1 = allocated(value) ? value : null;
+        if (win1 !== null) recognizeL1Page(win1, 0x4000);
         return;
       }
       if ((port & 0xff) === 0xc2) {
         page2 = value;
         win2 = allocated(value) ? value : null;
+        if (win2 !== null) recognizeL1Page(win2, 0x8000);
         return;
       }
       if ((port & 0xff) === 0xe2) {
         page3 = value;
         win3 = allocated(value) ? value : null;
+        if (win3 !== null) recognizeL1Page(win3, 0xc000);
         if (systemIsa && (value === 0xd4 || value === 0xd6)) selectedSlot = (value - 0xd4) >> 1;
         return;
       }
@@ -1649,7 +1796,13 @@ function runExe(exePath, args = '', inputScenario = {}) {
   if (Buffer.byteLength(args, 'ascii') > 255) throw new Error('command line exceeds DSS byte length');
   wr(cmdAddress, Buffer.byteLength(args, 'ascii'));
   for (let i = 0; i < args.length; i++) wr(cmdAddress + 1 + i, args.charCodeAt(i));
-  let state = cpu.getState(); state.pc = entry; state.sp = stack; state.ix = cmdAddress; cpu.setState(state);
+  let state = cpu.getState();
+  state.pc = entry; state.sp = stack; state.ix = cmdAddress;
+  if (scenario.initialIff !== undefined) {
+    state.iff1 = scenario.initialIff ? 1 : 0;
+    state.iff2 = scenario.initialIff ? 1 : 0;
+  }
+  cpu.setState(state);
   // DSS reaches the entry point with the loader's own frames, and at least one
   // interrupt frame, already spent below this stack. Model that so a program
   // that parks its entry stack on top of its own code fails here too.
@@ -1713,9 +1866,11 @@ function runExe(exePath, args = '', inputScenario = {}) {
         if (scenario.fileReadFailAt === fileReadCalls) { s.a = 1; setCarry(s, true); return ret(s); }
         let requested = (s.d << 8) | s.e;
         if (scenario.fileReadMax) requested = Math.min(requested, scenario.fileReadMax);
-        const chunk = file.data.subarray(file.offset, file.offset + requested);
+        const sourceStart = file.offset;
+        const chunk = file.data.subarray(sourceStart, sourceStart + requested);
         const destination = (s.h << 8) | s.l;
         for (let i = 0; i < chunk.length; i++) wr(destination + i, chunk[i]);
+        markExecutableRead(file, sourceStart, destination, chunk.length);
         file.offset += chunk.length;
         if (scenario.traceDss) dssEvents.push(`READ ${file.name} ${chunk.length}/${requested}`);
         s.d = chunk.length >> 8; s.e = chunk.length & 0xff;
@@ -1846,25 +2001,32 @@ function runExe(exePath, args = '', inputScenario = {}) {
         const page = s.a + s.b;
         if (!allocated(page)) throw new Error(`SETWIN1 of unallocated page ${page}`);
         if (loadAddress < 0x8000) throw new Error('SETWIN1 would remap the image window');
-        page1 = page; win1 = page; setCarry(s, false); return ret(s);
+        page1 = page; win1 = page; recognizeL1Page(page, 0x4000);
+        setCarry(s, false); return ret(s);
       }
       case 0x3a: {
         const page = s.a + s.b;
         if (!allocated(page)) throw new Error(`SETWIN2 of unallocated page ${page}`);
         if (loadAddress >= 0x8000) throw new Error('SETWIN2 would remap the image window');
-        page2 = page; win2 = page; setCarry(s, false); return ret(s);
+        page2 = page; win2 = page; recognizeL1Page(page, 0x8000);
+        setCarry(s, false); return ret(s);
       }
       case 0x3b: {
         const page = s.a + s.b;
         if (!allocated(page)) throw new Error(`SETWIN3 of unallocated page ${page}`);
         if (isaOpen) throw new Error('SETWIN3 while ISA window is open');
-        page3 = page; win3 = page; setCarry(s, false); return ret(s);
+        page3 = page; win3 = page; recognizeL1Page(page, 0xc000);
+        setCarry(s, false); return ret(s);
       }
       case 0x3e: {
         const countPages = allocations.get(s.a);
         if (!countPages) throw new Error(`FREEMEM of unknown block ${s.a}`);
         if (scenario.traceDss) dssEvents.push(`FREEMEM ${s.a}+${countPages}`);
         for (let i = 0; i < countPages; i++) pages.delete(s.a + i);
+        for (let i = 0; i < countPages; i++) {
+          executablePages.delete(s.a + i);
+          l1Pages.delete(s.a + i);
+        }
         allocations.delete(s.a);
         if (!allocated(win0)) win0 = null;
         if (!allocated(win1)) win1 = null;
@@ -1903,6 +2065,7 @@ function runExe(exePath, args = '', inputScenario = {}) {
       }
       case 0x41:
         exitCode = s.b;
+        exitIff = {iff1: s.iff1, iff2: s.iff2};
         if (isaOpen) throw new Error('EXIT with ISA window open');
         if (allocations.size) throw new Error(`EXIT with unreleased DSS pages: ${
           [...allocations.entries()].map(([id, count]) => `${id}+${count}`).join(', ')}; ` +
@@ -1950,9 +2113,23 @@ function runExe(exePath, args = '', inputScenario = {}) {
           `stack=${Array.from({length: 8}, (_, offset) => rd((stopped.sp + offset) & 0xffff).toString(16).padStart(2, '0')).join('')} ` +
           `trace=${pcTrace.map((v) => v.toString(16)).join(',')}`);
       }
-      if (scenario.strictPc && cpu.getState().pc !== 0x0008 && cpu.getState().pc !== 0x0010 &&
-          (cpu.getState().pc < loadAddress || cpu.getState().pc >= loadAddress + exe.length))
-        throw new Error(`PC escaped image: PC=${cpu.getState().pc.toString(16)} SP=${cpu.getState().sp.toString(16)} trace=${pcTrace.map((v) => v.toString(16)).join(',')}`);
+      if (scenario.strictPc) {
+        const pc = cpu.getState().pc;
+        const inExe = pc >= loadAddress && pc < loadAddress + exe.length;
+        const inMappedCode = isMappedExecutable(pc);
+        if (pc !== 0x0008 && pc !== 0x0010 && !inExe && !inMappedCode)
+          throw new Error(`PC escaped executable ranges: PC=${pc.toString(16)} ` +
+            `SP=${cpu.getState().sp.toString(16)} trace=${pcTrace.map((v) => v.toString(16)).join(',')}` +
+            (scenario.traceDss ? ` DSS=${dssEvents.slice(-8).join(';')}` : ''));
+        if (inMappedCode) {
+          mappedExecutableHits++;
+          const mapped = mappedAddress(pc);
+          const entryOffset = mapped ? mapped[1] - 32 : -1;
+          if (mapped && l1Pages.has(mapped[0]) && entryOffset >= 0 &&
+              entryOffset < 24 * 3 && entryOffset % 3 === 0)
+            dllEntryCalls[entryOffset / 3]++;
+        }
+      }
       if (scenario.traceCpu) { pcTrace.push(cpu.getState().pc); if (pcTrace.length > 32) pcTrace.shift(); }
       // Production polling yields use this exact bounded BC loop. Collapse all
       // but its final iteration so multi-second actual-EXE timeout tests retain
@@ -1987,7 +2164,9 @@ function runExe(exePath, args = '', inputScenario = {}) {
       pagesFreed: allocations.size === 0,
       done: !card.rxEnabled && !card.txEnabled && card.window === 0,
     },
-    card: {slot: card.slot, base: card.base, mac: hex(card.mac), station: hex(card.station), active: card.active},
+    card: {slot: card.slot, base: card.base, mac: hex(card.mac), station: hex(card.station), active: card.active,
+      txStatusReads: card.txStatusReads, txStatusPops: card.txStatusPops,
+      txFreeReads: card.txFreeReads},
     httpRequests: card.httpRequests.slice(),
     environment: {...environment},
     currentDir,
@@ -2010,6 +2189,8 @@ function runExe(exePath, args = '', inputScenario = {}) {
     probedSlots: [...probedSlots].sort(),
     memoryAccesses: memoryAccessCount,
     isaSessions: isaSessionCount,
+    mappedExecutableHits,
+    dllEntryCalls,
     // DSS_SYSTIME reads, and the polling yields that go with them. A yield is
     // 1.9 ms of busy-wait on a real Sprinter, so delayLoops is the count that
     // says how much wall time a wait loop spent standing still.
@@ -2023,6 +2204,7 @@ function runExe(exePath, args = '', inputScenario = {}) {
     steps,
     minimumSp,
     minimumPageSp: minimumPageSp === 0x10000 ? null : minimumPageSp,
+    exitIff,
   };
 }
 

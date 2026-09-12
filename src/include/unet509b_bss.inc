@@ -37,15 +37,14 @@ BSS_PEND1	EQU 0x083E	; 536  S11_PENDING1
 BSS_CTX0	EQU 0x0A56	; 40   S11_CONTEXT0
 BSS_CTX1	EQU 0x0A7E	; 40   S11_CONTEXT1
 BSS_CTX_SCRATCH	EQU 0x0AA6	; 40   S11_CONTEXT_SCRATCH (route resolve for DNS/UDP/PING)
-BSS_S11		EQU 0x0ACE	; 162  S11_STATE_BASE (+2: TCPX_ASYNCSEND's S11_ASYNC_MS_LEFT)
+BSS_S11		EQU 0x0ACE	; 105  S11_STATE_BASE (packed DLL-only layout)
 ; BSS_RT was 400 (a round-number guess from early phases); DNS's added
 ; scratch fields brought real usage (BSS_RT_USED, memory_dll.inc) to 244 --
 ; 264 keeps a 20-byte margin instead of carrying ~136 bytes of pure guess
 ; padding against the hard image ceiling.
-BSS_RT		EQU 0x0B70	; 264  RUNTIME_BASE (EL3_*/NETDRV_*/NET_*/ARP/NETTIME_*/S9_*/DNS_*)
-BSS_UNET	EQU 0x0C78	; 112  dispatcher scalars (unet509b.asm's own state; usage 0x6E/110)
-BSS_STACK	EQU 0x0CE8	; 96   private stack for COLD.RUN
-DLL_BSS_SIZE	EQU 0x0D48	; 3400 total
+BSS_RT		EQU 0x0B37	; 244  RUNTIME_BASE (EL3_*/NETDRV_*/NET_*/ARP/NETTIME_*/S9_*/DNS_*)
+BSS_UNET	EQU 0x0C2B	; 122  dispatcher scalars and compact COLD_CTX
+DLL_BSS_SIZE	EQU 0x0CA5	; 3237 total; cold stack lives at WIN0 3F80..3FFF
 	ASSERT BSS_TX + 60 <= BSS_RX
 	ASSERT BSS_RX + 1514 <= BSS_PEND0
 	ASSERT BSS_PEND0 + 536 <= BSS_PEND1
@@ -53,9 +52,8 @@ DLL_BSS_SIZE	EQU 0x0D48	; 3400 total
 	ASSERT BSS_CTX0 + 40 <= BSS_CTX1
 	ASSERT BSS_CTX1 + 40 <= BSS_CTX_SCRATCH
 	ASSERT BSS_CTX_SCRATCH + 40 <= BSS_S11
-	ASSERT BSS_S11 + 162 <= BSS_RT
-	ASSERT BSS_RT + 264 <= BSS_UNET
-	ASSERT BSS_UNET + 112 <= BSS_STACK
-	ASSERT BSS_STACK + 96 <= DLL_BSS_SIZE
+	ASSERT BSS_S11 + 105 <= BSS_RT
+	ASSERT BSS_RT + 244 <= BSS_UNET
+	ASSERT BSS_UNET + 122 <= DLL_BSS_SIZE
 
 	ENDIF

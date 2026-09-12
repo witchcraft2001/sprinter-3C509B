@@ -346,7 +346,21 @@ class Responder:
             body = LISTING if verb == "LIST" else fixtures().get(arg.upper(), b"")
             connection.send_queue.extend(body[offset:])
             if connection.last_request is not None:
-                self._extra.extend(self._drain(connection, connection.last_request, "data"))
+                if not connection.send_queue and not connection.fin_sent:
+                    # REST exactly at EOF is an empty but complete transfer.
+                    # There is no payload for _drain() to hang FIN on, so emit
+                    # the FIN-only data segment here and complete the control
+                    # transaction with 226 just like the non-empty path.
+                    reply = stage11.build_tcp(connection.last_request,
+                                               connection.server_next,
+                                               connection.client_next, 0x11)
+                    connection.server_next = (connection.server_next + 1) & 0xFFFFFFFF
+                    connection.fin_sent = True
+                    self._extra.append(("DATA", reply))
+                    if self.profile != "suppress226":
+                        self._send_226()
+                else:
+                    self._extra.extend(self._drain(connection, connection.last_request, "data"))
             return
 
 

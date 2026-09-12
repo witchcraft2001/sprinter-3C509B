@@ -7,3 +7,4 @@
 .mame-cfg/
 /cfg/
 /nvram/
+evidence/stage13*/*.pcap
