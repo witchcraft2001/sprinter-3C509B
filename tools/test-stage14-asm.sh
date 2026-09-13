@@ -107,6 +107,7 @@ pend1_off=$(( ctx1_addr + pend_field - 0x20 ))
 ctx1_off=$(( ctx1_addr - 0x20 ))
 pend1_data_off=$(( pend1_addr - 0x20 ))
 inited_off=$(( $(awk '/^UNET_INITED:/ {print $3}' "$tmp_dir/shim_0020.sym") - 0x20 ))
+stage_off=$(( $(awk '/^UNET_STAGE:/ {print $3}' "$tmp_dir/shim_0020.sym") - 0x20 ))
 [ "$(od -An -tu1 -j "$canary_off" -N 1 "$tmp_dir/image_0020.bin" | tr -d ' ')" = 165 ]
 
 # 3. Run the entry-point vectors under z88dk-ticks in each layout.
@@ -115,7 +116,7 @@ run_layout() {
   local defines=(-DDLL_BASE="0x$dll_base" -DVEC_BASE="0x$vec_base" -DCANARY_OFF="$canary_off"
                  -DCH_STATE_OFF="$ch_state_off" -DPEND1_OFF="$pend1_off"
                  -DCTX1_OFF="$ctx1_off" -DPENDING1_DATA_OFF="$pend1_data_off"
-                 -DINITED_OFF="$inited_off")
+                 -DINITED_OFF="$inited_off" -DSTAGE_OFF="$stage_off")
   [ -n "$extra" ] && defines+=("-D$extra")
   cp "$tmp_dir/dll_$dll_base.bin" "$tmp_dir/dll_image.bin"
   (
@@ -232,6 +233,7 @@ listen_defines=(
   -DCTX_REMOTE_MAC="$(sym TCPX.CTX_REMOTE_MAC)"
   -DCTX_REMOTE_PORT="$(sym TCPX.CTX_REMOTE_PORT)"
   -DCTX_RCV_NXT="$(sym TCPX.CTX_RCV_NXT)"
+  -DCTX_SND_UNA="$(sym TCPX.CTX_SND_UNA)"
   -DCTX_EVENT="$(sym TCPX.CTX_EVENT)"
   -DEVENT_SYN_ACK="$(sym TCPX.EVENT_SYN_ACK)"
 )
@@ -252,7 +254,8 @@ listen_end="$(awk '/^TEST_DONE:/ {sub(/^0x0*/, "", $3); print $3}' "$tmp_dir/vec
 # never reaches TEST_DONE would hang the gate for good instead of failing it.
 # The whole run is well under a second, so a wall-clock bound costs nothing.
 z88dk-ticks -l 0 -pc 0x8000 -end "$listen_end" -counter 100000000 \
-  -output "$tmp_dir/vec_listen.ram" "$tmp_dir/listen_vectors.bin" >/dev/null &
+  -output "$tmp_dir/vec_listen.ram" "$tmp_dir/listen_vectors.bin" \
+  >"$tmp_dir/vec_listen.run.log" 2>&1 &
 listen_pid=$!
 for _ in $(seq 1 60); do
   kill -0 "$listen_pid" 2>/dev/null || break
@@ -267,10 +270,11 @@ wait "$listen_pid" || true
 listen_result="$(od -An -tu1 -j 16128 -N 1 "$tmp_dir/vec_listen.ram" | tr -d ' ')"
 listen_complete="$(od -An -tu1 -j 16129 -N 1 "$tmp_dir/vec_listen.ram" | tr -d ' ')"
 if [ "$listen_complete" != 165 ] || [ "$listen_result" != 0 ]; then
+  cat "$tmp_dir/vec_listen.run.log" >&2
   echo "Error: Stage 14 passive-open vector failed at case $listen_result (complete=$listen_complete)" >&2
   exit 1
 fi
 
 image_size="$(wc -c < "$tmp_dir/image_0020.bin" | tr -d ' ')"
 cold_size="$(wc -c < "$tmp_dir/cold.bin" | tr -d ' ')"
-echo "Stage 14 ASM: shipped image == stand-alone build, libman relocation to WIN1/WIN2 == direct assembly, 41 entry-point vectors in WIN1 and WIN2, window-3 refusal, safe/fast cold-overlay suites, 18 passive-open vectors passed (image $image_size bytes, cold $cold_size bytes, deepest cold stack $cold_depth of 128; boundary canary intact)"
+echo "Stage 14 ASM: shipped image == stand-alone build, libman relocation to WIN1/WIN2 == direct assembly, 43 entry-point vectors in WIN1 and WIN2, window-3 refusal, safe/fast cold-overlay suites, 24 passive-open/SEND-FIN vectors passed (response+FIN together/separate preserved after partial ACK; 20x1200-byte stream exact; full ACK+FIN succeeds; image $image_size bytes, cold $cold_size bytes, deepest cold stack $cold_depth of 128; boundary canary intact)"

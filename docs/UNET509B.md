@@ -136,9 +136,11 @@ card it got. None of them changes the calling convention.
   failed (01 NETINIT, 02 CONNECT, 03 SEND, 04 RECV, 05 CLOSE), `nerr`
   the UNET status returned, `tcp` the TCP-layer failure code (`FF` or a
   DSS error code for a `st=01` overlay-load failure), and `el3` the 3C509B
-  driver's own last stage/status pair. The values are captured at the
-  moment of failure, so `LASTERR` never reports a card that has since
-  recovered.
+  driver's own last stage/status pair. Before the first failure, each
+  `LASTERR` call formats the live state. A non-zero API return freezes the
+  complete line at that point; successful calls do not change it, and only
+  the next failure replaces it. A caller may therefore drain a peer response
+  and close the channel before logging the original `SEND` failure.
 - **The ARP cache is disabled.** Every `CONNECT`/`UDPOPEN`/`RESOLVE`/
   `PING` resolves its next hop with a single fresh ARP exchange
   instead of trusting a stale cache entry -- one exchange per call,
@@ -156,6 +158,15 @@ then 2s, then 4s -- 7 seconds total). Exhaustion returns `NERR_SEND`;
 A payload-bearing frame that arrives for the channel while `SEND`
 waits is not discarded: it is queued in that channel's 536-byte
 receive buffer and returned by the next `RECV`.
+
+An orderly peer FIN before the current chunk is fully acknowledged returns
+`NERR_CLOSED`, not `NERR_SEND`. `DE` includes the exact cumulative ACK prefix
+of that chunk. The channel and its pending response remain connected until
+`RECV` has returned every byte; the following `RECV` returns
+`NERR_CLOSED`/`DE=0` and releases the channel (or re-arms an accepted LISTEN
+channel). `CLOSE` is idempotent afterward. RST keeps the destructive close
+path. If FIN carries the full ACK, the current `SEND` succeeds; the close is
+reported by `RECV` instead. This is the same public behavior as UNETRTL 0.3.8.
 
 To discover that queued data without blocking, call `STATUS` on the
 channel: bit 2 (`UNET_ST_RXPEND`) is set while the channel holds bytes

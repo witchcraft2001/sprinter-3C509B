@@ -147,6 +147,7 @@ JUMP_TABLE
 	DW	TCP_IP_BUILD		; 34 CFN_TCP_IP_BUILD
 	DW	MAP_SEND_FAIL		; 35 CFN_MAP_SEND_FAIL
 	DW	MAP_DNS_FAIL		; 36 CFN_MAP_DNS_FAIL
+	DW	TCP_SEND_EVENT		; 37 CFN_TCP_SEND_EVENT
 	ASSERT	($ - JUMP_TABLE) / 2 == CFN_COUNT
 
 	INCLUDE "ethernet.asm"
@@ -154,6 +155,81 @@ JUMP_TABLE
 	INCLUDE "tcp.asm"
 	INCLUDE "udp.asm"
 	INCLUDE "icmp.asm"
+
+; ======================================================
+; SEND completion classifier. This is cold because the hot L1 image has only
+; its mandatory 16-byte reserve left. IX is the selected TCP context and IY
+; is S11_STATE_BASE, both handed in explicitly by TCPX.SEND.
+;
+; A full cumulative ACK wins over a FIN in the same segment: A=0/CF=0.
+; A partial ACK followed by FIN returns TCP_ERR_CLOSED/CF=1 and DE equal to
+; the previously confirmed chunks plus the acknowledged prefix of this one.
+; A mismatched ACK without FIN remains TCP_ERR_SEQUENCE/CF=0, so the hot path
+; keeps its existing FAIL_CONTEXT handling.
+; ======================================================
+TCP_SEND_EVENT
+	LD	A,(IX+CTX_SND_UNA)
+	CP	(IY+S11_TARGET_ACK-S11_STATE_BASE)
+	JR	NZ,.NOT_FULL
+	LD	A,(IX+CTX_SND_UNA+1)
+	CP	(IY+S11_TARGET_ACK-S11_STATE_BASE+1)
+	JR	NZ,.NOT_FULL
+	LD	A,(IX+CTX_SND_UNA+2)
+	CP	(IY+S11_TARGET_ACK-S11_STATE_BASE+2)
+	JR	NZ,.NOT_FULL
+	LD	A,(IX+CTX_SND_UNA+3)
+	CP	(IY+S11_TARGET_ACK-S11_STATE_BASE+3)
+	JR	NZ,.NOT_FULL
+	XOR	A
+	RET
+.NOT_FULL
+	LD	A,(IX+CTX_REMOTE_FIN)
+	OR	A
+	JR	NZ,.PEER_FIN
+	LD	A,TCP_ERR_SEQUENCE
+	OR	A
+	RET
+.PEER_FIN
+	; A FIN without ACK confirms nothing. For an ACK-bearing FIN, subtract
+	; SND.UNA from the parsed big-endian value. A valid in-flight delta has
+	; zero in the high 16 bits and is no larger than ACTIVE_LENGTH (<= MSS).
+	LD	A,(IY+S11_TCP_PARSE_DESC-S11_STATE_BASE+TCPP_FLAGS)
+	AND	TCP_FLAG_ACK
+	JR	Z,.NO_PARTIAL
+	LD	A,(IY+S11_PARSE_ACK-S11_STATE_BASE+3)
+	SUB	(IX+CTX_SND_UNA+3)
+	LD	E,A
+	LD	A,(IY+S11_PARSE_ACK-S11_STATE_BASE+2)
+	SBC	A,(IX+CTX_SND_UNA+2)
+	LD	D,A
+	LD	A,(IY+S11_PARSE_ACK-S11_STATE_BASE+1)
+	SBC	A,(IX+CTX_SND_UNA+1)
+	LD	C,A
+	LD	A,(IY+S11_PARSE_ACK-S11_STATE_BASE)
+	SBC	A,(IX+CTX_SND_UNA)
+	OR	C
+	JR	NZ,.NO_PARTIAL
+	LD	H,D
+	LD	L,E
+	LD	E,(IY+S11_ACTIVE_LENGTH-S11_STATE_BASE)
+	LD	D,(IY+S11_ACTIVE_LENGTH-S11_STATE_BASE+1)
+	OR	A
+	SBC	HL,DE
+	JR	C,.PARTIAL_OK
+	JR	NZ,.NO_PARTIAL
+.PARTIAL_OK
+	ADD	HL,DE			; restore the acknowledged delta
+	JR	.ADD_CONFIRMED
+.NO_PARTIAL
+	LD	HL,0
+.ADD_CONFIRMED
+	LD	E,(IY+S11_SEND_CONFIRMED-S11_STATE_BASE)
+	LD	D,(IY+S11_SEND_CONFIRMED-S11_STATE_BASE+1)
+	ADD	HL,DE
+	EX	DE,HL
+	LD	A,TCP_ERR_CLOSED
+	SCF
+	RET
 
 ; ======================================================
 ; DLL fast receive predicate and commit path. IX always addresses COLD_CTX;

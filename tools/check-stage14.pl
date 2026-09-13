@@ -94,11 +94,24 @@ die "INIT does not detect and refuse its own window 3 placement\n"
         if $cold_at > $cfg_at;
 }
 
-# Shared error-return exit contract: RET_A stores LASTERR and always clears
-# carry via OR A immediately before RET (Pascal LibCall propagates carry, and
-# every UNET function except INIT/window-3-refusal must return CF=0).
-die "RET_A does not clear carry (OR A) immediately before RET\n"
-    unless $shim_code =~ /^RET_A\b[^\n]*\n\s*LD\s+\([^)]*\),A\s*\n\s*OR\s+A\s*\n\s*RET\b/ms;
+# Shared error-return exit contract: success returns immediately without
+# disturbing a frozen LASTERR. Every non-zero status is stored and formatted
+# before return, with DE preserved for SEND/RECV and CF restored clear from
+# the entry OR A / saved AF pair.
+die "RET_A does not freeze failures while preserving successful calls and DE\n"
+    unless $shim_code =~ /^RET_A\b.*?OR\s+A\s*\n\s*RET\s+Z\s*\n\s*LD\s+\(UNET_LAST_NERR\),A.*?PUSH\s+AF\s*\n\s*PUSH\s+DE\s*\n\s*CALL\s+BUILD_LASTERR\s*\n\s*POP\s+DE\s*\n\s*POP\s+AF\s*\n\s*RET\b/ms;
+die "F_LASTERR does not keep the frozen snapshot after a failure\n"
+    unless $shim_code =~ /^F_LASTERR\b.*?LD\s+A,\(UNET_LAST_NERR\).*?CALL\s+Z,BUILD_LASTERR.*?LD\s+HL,LASTERR_BUF/ms;
+
+# SEND must wake on FIN as well as ACK/RST. The DLL-only completion classifier
+# returns a partial confirmed prefix and its CF path bypasses FAIL_CONTEXT, so
+# a response queued with the FIN remains available to RECV.
+die "TCP SEND wait does not include EVENT_FIN\n"
+    unless $transport_code =~ /LD\s+A,EVENT_ACK\|EVENT_FIN\|EVENT_RST\s*\n\s*CALL\s+WAIT_FOR_EVENT/;
+die "TCP SEND FIN classifier or queue-preserving return is missing\n"
+    unless $transport_code =~ /CFN_TCP_SEND_EVENT.*?CALL\s+\@COLD\.RUN\s*\n\s*JP\s+C,\.SEND_PEER_FIN.*?\.SEND_PEER_FIN\b.*?JP\s+\.SEND_RETURN/ms;
+die "cold SEND completion classifier is missing from the dispatch table\n"
+    unless $cold_code =~ /DW\s+TCP_SEND_EVENT.*?^TCP_SEND_EVENT\b.*?LD\s+A,TCP_ERR_CLOSED\s*\n\s*SCF/ms;
 
 # The cold overlay (WIN0) never touches ISA, DSS, or a raw RST -- it can only
 # reach the outside world via the COLD_CTX pointers and registers it was

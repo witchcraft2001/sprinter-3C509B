@@ -59,7 +59,8 @@ python3 -c 'import ast,sys; [ast.parse(open(p, encoding="utf-8").read(), filenam
   "$script_dir/host/stage13_responder.py" "$script_dir/host/test_stage13_responder.py" \
   "$script_dir/host/stage13_http_server.py"
 python3 -c 'import ast,sys; [ast.parse(open(p, encoding="utf-8").read(), filename=p) for p in sys.argv[1:]]' \
-  "$script_dir/host/stage14_responder.py" "$script_dir/host/test_stage14_responder.py"
+  "$script_dir/host/stage14_responder.py" "$script_dir/host/test_stage14_responder.py" \
+  "$script_dir/host/unettest_fin_during_send.py"
 sh -n "$script_dir/3com.sh"
 input_profile="$repo_root/config/mame/sprinter.cfg"
 ui_profile="$repo_root/config/mame/default.cfg"

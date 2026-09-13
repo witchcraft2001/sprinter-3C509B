@@ -19,11 +19,11 @@
 ; this path that need a machine: S9APP.SECONDS (RST into DSS, called by
 ; GENERATE_TUPLE for ISN entropy) and NETDRV.SEND_FRAME (ISA), the latter
 ; replaced by a capture stub so the emitted frame can be inspected byte for
-; byte, checksums included. The cases that call RECV rather than
-; PROCESS_FRAME need three more: NETDRV.RX_PENDING and NETDRV.READ_FRAME
-; become a two-deep frame queue, NETTIME.READ_WALL (its own RST, not the
-; S9APP one) freezes at zero, and TCPX.CHECK_CANCEL answers "no key" instead
-; of asking DSS on every pass of the wait loop.
+; byte, checksums included. The cases that call RECV rather than PROCESS_FRAME
+; patch the session-RX entry points into a two-deep frame queue, freeze
+; NETTIME.READ_WALL (its own RST, not the S9APP one) at zero, and make
+; TCPX.CHECK_CANCEL answer "no key" instead of asking DSS on every pass of
+; the wait loop.
 ;
 ; The frame fed in is a real macOS-shaped SYN: 20 bytes of options (MSS,
 ; window scale, timestamps), ECN bits absent, both checksums valid.
@@ -54,9 +54,25 @@ ACK_FRAME	EQU 0x2900		; the handshake's closing ACK, built here
 FIN_FRAME	EQU 0x2940		; the peer's FIN|ACK
 FINACK_FRAME	EQU 0x2980		; its acknowledgement of our own FIN
 DATA_ACK_FRAME	EQU 0x29C0		; the peer's ACK of the bytes we SEND
-SEND_LEN	EQU 4			; payload the SEND case transmits
+RESP_FIN_FRAME	EQU 0x2A00		; partial ACK + HTTP response + FIN
+FIN_ONLY_FRAME	EQU 0x2A80		; separate FIN following a response segment
+CTX_SNAPSHOT	EQU 0x2B00		; reusable established context for vector 2
+SEND_LEN	EQU 7			; payload the SEND cases transmit
 RECV_BUF	EQU 0x2C00		; a consumer buffer outside the DLL's window
 RECV_BUF_SIZE	EQU 512
+LONG_RESP_FRAME	EQU 0x3000		; response after the 20x1200-byte stream
+RX_PREFIX_LEN	EQU 54
+
+AUTO_ACK_MODE	EQU 0x2830		; non-zero: CAPTURE_FRAME queues a full ACK
+AUTO_ACK_BAD	EQU 0x2831		; sticky payload/segment validation failure
+AUTO_ACK_SEGS	EQU 0x2832		; data segments seen
+AUTO_CALLS_LEFT EQU 0x2833		; remaining public SEND calls
+AUTO_ACK_LEN	EQU 0x2834		; word, current TCP payload length
+AUTO_ACK_TOTAL	EQU 0x2836		; word, unique bytes observed
+AUTO_EXPECT_PTR EQU 0x2838		; word, next expected byte in LONG_PAYLOAD
+LONG_SEND_LEN	EQU 1200
+LONG_SEND_CALLS EQU 20
+LONG_SEND_TOTAL EQU LONG_SEND_LEN * LONG_SEND_CALLS
 
 DLL_BASE	EQU 0x4000
 VEC_BASE	EQU 0x8000
@@ -354,7 +370,7 @@ TEST_START
 					; the damage surfaces one call away from its
 					; cause. BINK.EXE saw 33 for a 19-byte send
 					; on hardware before this case existed.
-	CALL	BUILD_DATA_ACK
+	CALL	BUILD_FULL_ACK_FIN
 	XOR	A
 	LD	DE,SEND_PAYLOAD
 	LD	IX,SEND_LEN
@@ -367,8 +383,11 @@ TEST_START
 	SBC	HL,DE
 	JP	NZ,FAIL
 
-	CASE	11			; the peer reads its reply and hangs up
-	CALL	BUILD_FIN
+	CASE	11			; FIN after the full ACK did not fail SEND;
+					; it surfaces only now, on RECV
+	LD	HL,0
+	LD	(RX_QLEN),HL
+	LD	(RX_QLEN2),HL
 	XOR	A
 	LD	DE,RECV_BUF
 	LD	IX,RECV_BUF_SIZE
@@ -420,6 +439,10 @@ TEST_START
 	OR	A
 	JP	NZ,FAIL
 	EXPECT_BYTE A_CTX0 + CTX_STATE, TCP_STATE_ESTABLISHED
+	LD	HL,A_CTX0
+	LD	DE,CTX_SNAPSHOT
+	LD	BC,40
+	LDIR
 
 	CASE	15			; unet.inc reads IY=0 as "poll, do not block":
 					; an idle link answers NERR_OK with DE=0. The
@@ -446,35 +469,65 @@ TEST_START
 	JP	NZ,FAIL
 	EXPECT_BYTE A_CTX0 + CTX_STATE, TCP_STATE_ESTABLISHED
 
-	CASE	16			; an ORDINARY channel must SURVIVE its peer's
-					; FIN. unet.inc has RECV merely report the
-					; close, TCPX.SEND deliberately accepts
-					; CLOSE_WAIT, and half-close is how a protocol
-					; finishes its own side. Releasing the channel
-					; here -- which the LISTEN re-arm above must do
-					; -- zeroed its state instead, and that is how a
-					; binkp mailer lost the M_EOB it still owed
-					; after the boss hung up first.
+	CASE	16			; response + FIN while this SEND has only a
+					; three-byte cumulative ACK. This channel is
+					; treated as an ordinary client so the final
+					; RECV must release it instead of re-arming the
+					; listener (cases 11-13 already cover re-arm).
 	XOR	A
-	LD	(A_LISTEN_ACC),A	; this one did not come from LISTEN
-	CALL	BUILD_FIN
-	LD	HL,0
-	LD	(RX_QLEN2),HL		; only the peer's FIN: we send none back
+	LD	(A_LISTEN_ACC),A
+	CALL	BUILD_RESPONSE_FIN
 	XOR	A
-	LD	DE,RECV_BUF
-	LD	IX,RECV_BUF_SIZE
-	LD	IY,50
-	ENTRY	UNET_FN_RECV
+	LD	DE,SEND_PAYLOAD
+	LD	IX,SEND_LEN
+	ENTRY	UNET_FN_SEND
 	JP	C,FAIL
 	CP	NERR_CLOSED
 	JP	NZ,FAIL
-	EXPECT_BYTE A_CH_STATE, 1		; still the caller's own channel
+	LD	HL,3
+	OR	A
+	SBC	HL,DE
+	JP	NZ,FAIL
+	EXPECT_BYTE A_CH_STATE, 1		; response remains readable
 	EXPECT_BYTE A_CTX0 + CTX_STATE, TCP_STATE_CLOSE_WAIT
+	XOR	A
+	ENTRY	UNET_FN_STATUS
+	JP	C,FAIL
+	OR	A
+	JP	NZ,FAIL
+	LD	HL,UNET_ST_CONN|UNET_ST_RXPEND
+	OR	A
+	SBC	HL,DE
+	JP	NZ,FAIL
 
-	CASE	17			; and the answer stays NERR_CLOSED however
-					; often it is polled -- a consumer that drains
-					; in a loop must not see it turn into
-					; NERR_STATE half way through
+	CASE	17			; peer payload is returned byte-for-byte, and
+					; a successful RECV/STATUS cannot overwrite the
+					; SEND failure snapshot. Only the next RECV
+					; reports CLOSED and frees the ordinary channel.
+	XOR	A
+	LD	DE,RECV_BUF
+	LD	IX,RECV_BUF_SIZE
+	LD	IY,0
+	ENTRY	UNET_FN_RECV
+	JP	C,FAIL
+	OR	A
+	JP	NZ,FAIL
+	LD	HL,PEER_REPLY_LEN
+	OR	A
+	SBC	HL,DE
+	JP	NZ,FAIL
+	EXPECT_MEM RECV_BUF, PEER_REPLY, PEER_REPLY_LEN
+	LD	DE,RECV_BUF
+	LD	IX,RECV_BUF_SIZE
+	ENTRY	UNET_FN_LASTERR
+	JP	C,FAIL
+	OR	A
+	JP	NZ,FAIL
+	LD	HL,RECV_BUF
+	LD	DE,LASTERR_SEND_CLOSED
+	LD	B,43
+	CALL	MEMCMP
+	JP	NZ,FAIL
 	XOR	A
 	LD	DE,RECV_BUF
 	LD	IX,RECV_BUF_SIZE
@@ -483,23 +536,15 @@ TEST_START
 	JP	C,FAIL
 	CP	NERR_CLOSED
 	JP	NZ,FAIL
+	LD	A,D
+	OR	E
+	JP	NZ,FAIL
+	EXPECT_BYTE A_CH_STATE, 0
+	EXPECT_BYTE A_CTX0 + CTX_STATE, TCP_STATE_CLOSED
 
-	CASE	18			; CLOSE must RELEASE the channel. Every case
-					; above closes through F_RECV's own re-arm
-					; path, so none of them executes the tail of
-					; CLOSE itself -- and that tail is reached by
-					; falling through, which any routine inserted
-					; under the call silently steals. CLOSE then
-					; still answers NERR_OK while the channel stays
-					; marked open, so the NEXT CONNECT on it gets
-					; NERR_STATE: a browser loads one page and then
-					; reports "connect failed" for the rest of the
-					; session.
-	LD	HL,FINACK_FRAME		; the peer's ACK of the FIN CLOSE sends
-	LD	(RX_QSRC),HL
-	LD	HL,ACK_LEN
-	LD	(RX_QLEN),HL
+	CASE	18			; CLOSE is idempotent after that final RECV
 	LD	HL,0
+	LD	(RX_QLEN),HL
 	LD	(RX_QLEN2),HL
 	XOR	A
 	ENTRY	UNET_FN_CLOSE
@@ -507,6 +552,154 @@ TEST_START
 	OR	A
 	JP	NZ,FAIL
 	EXPECT_BYTE A_CH_STATE, 0	; free again: what CONNECT demands
+	EXPECT_BYTE A_CTX0 + CTX_STATE, TCP_STATE_CLOSED
+
+	CASE	19			; same partial ACK and response, but payload
+					; and FIN arrive as two TCP segments
+	LD	HL,CTX_SNAPSHOT
+	LD	DE,A_CTX0
+	LD	BC,40
+	LDIR
+	LD	A,1
+	LD	(A_CH_STATE),A
+	CALL	BUILD_RESPONSE_THEN_FIN
+	XOR	A
+	LD	DE,SEND_PAYLOAD
+	LD	IX,SEND_LEN
+	ENTRY	UNET_FN_SEND
+	JP	C,FAIL
+	CP	NERR_CLOSED
+	JP	NZ,FAIL
+	LD	HL,3
+	OR	A
+	SBC	HL,DE
+	JP	NZ,FAIL
+	EXPECT_BYTE A_CH_STATE, 1
+	EXPECT_BYTE A_CTX0 + CTX_STATE, TCP_STATE_CLOSE_WAIT
+
+	CASE	20
+	XOR	A
+	LD	DE,RECV_BUF
+	LD	IX,RECV_BUF_SIZE
+	LD	IY,0
+	ENTRY	UNET_FN_RECV
+	JP	C,FAIL
+	OR	A
+	JP	NZ,FAIL
+	LD	HL,PEER_REPLY_LEN
+	OR	A
+	SBC	HL,DE
+	JP	NZ,FAIL
+	EXPECT_MEM RECV_BUF, PEER_REPLY, PEER_REPLY_LEN
+	LD	DE,RECV_BUF
+	LD	IX,RECV_BUF_SIZE
+	ENTRY	UNET_FN_LASTERR
+	JP	C,FAIL
+	OR	A
+	JP	NZ,FAIL
+	LD	HL,RECV_BUF
+	LD	DE,LASTERR_SEND_CLOSED
+	LD	B,43
+	CALL	MEMCMP
+	JP	NZ,FAIL
+
+	CASE	21
+	XOR	A
+	LD	DE,RECV_BUF
+	LD	IX,RECV_BUF_SIZE
+	LD	IY,0
+	ENTRY	UNET_FN_RECV
+	JP	C,FAIL
+	CP	NERR_CLOSED
+	JP	NZ,FAIL
+	LD	A,D
+	OR	E
+	JP	NZ,FAIL
+	EXPECT_BYTE A_CH_STATE, 0
+	EXPECT_BYTE A_CTX0 + CTX_STATE, TCP_STATE_CLOSED
+
+	CASE	22			; long PUT geometry: 20 public 1200-byte SENDs.
+					; CAPTURE_FRAME validates every payload byte,
+					; bounds every segment by MSS and immediately
+					; queues its exact cumulative ACK.
+	LD	HL,CTX_SNAPSHOT
+	LD	DE,A_CTX0
+	LD	BC,40
+	LDIR
+	LD	A,1
+	LD	(A_CH_STATE),A
+	XOR	A
+	LD	(A_LISTEN_ACC),A
+	LD	(AUTO_ACK_BAD),A
+	LD	(AUTO_ACK_SEGS),A
+	LD	HL,0
+	LD	(AUTO_ACK_TOTAL),HL
+	LD	HL,LONG_PAYLOAD
+	LD	(AUTO_EXPECT_PTR),HL
+	LD	A,LONG_SEND_CALLS
+	LD	(AUTO_CALLS_LEFT),A
+	LD	A,1
+	LD	(AUTO_ACK_MODE),A
+.long_send
+	XOR	A
+	LD	DE,LONG_PAYLOAD
+	LD	IX,LONG_SEND_LEN
+	ENTRY	UNET_FN_SEND
+	JP	C,FAIL
+	OR	A
+	JP	NZ,FAIL
+	LD	HL,LONG_SEND_LEN
+	OR	A
+	SBC	HL,DE
+	JP	NZ,FAIL
+	LD	HL,AUTO_CALLS_LEFT
+	DEC	(HL)
+	JR	NZ,.long_send
+	XOR	A
+	LD	(AUTO_ACK_MODE),A
+	EXPECT_BYTE AUTO_ACK_BAD, 0
+	EXPECT_BYTE AUTO_ACK_SEGS, LONG_SEND_CALLS * 3
+	LD	HL,(AUTO_ACK_TOTAL)
+	LD	DE,LONG_SEND_TOTAL
+	OR	A
+	SBC	HL,DE
+	JP	NZ,FAIL
+	LD	HL,(AUTO_EXPECT_PTR)
+	LD	DE,LONG_PAYLOAD
+	OR	A
+	SBC	HL,DE
+	JP	NZ,FAIL
+
+	CASE	23			; after every byte was fully acknowledged, the
+					; peer's HTTP 201 + FIN is delivered normally
+	CALL	BUILD_LONG_RESPONSE_FIN
+	XOR	A
+	LD	DE,RECV_BUF
+	LD	IX,RECV_BUF_SIZE
+	LD	IY,50
+	ENTRY	UNET_FN_RECV
+	JP	C,FAIL
+	OR	A
+	JP	NZ,FAIL
+	LD	HL,LONG_REPLY_LEN
+	OR	A
+	SBC	HL,DE
+	JP	NZ,FAIL
+	EXPECT_MEM RECV_BUF, LONG_REPLY, LONG_REPLY_LEN
+
+	CASE	24			; close follows only after the final reply byte
+	XOR	A
+	LD	DE,RECV_BUF
+	LD	IX,RECV_BUF_SIZE
+	LD	IY,0
+	ENTRY	UNET_FN_RECV
+	JP	C,FAIL
+	CP	NERR_CLOSED
+	JP	NZ,FAIL
+	LD	A,D
+	OR	E
+	JP	NZ,FAIL
+	EXPECT_BYTE A_CH_STATE, 0
 	EXPECT_BYTE A_CTX0 + CTX_STATE, TCP_STATE_CLOSED
 
 	JP	PASS
@@ -522,6 +715,98 @@ CAPTURE_FRAME
 	LD	A,(CAP_COUNT)
 	INC	A
 	LD	(CAP_COUNT),A
+	LD	A,(AUTO_ACK_MODE)
+	OR	A
+	JP	NZ,AUTO_ACK_CAPTURED
+	XOR	A
+	RET
+
+; Validate one captured data segment and queue an ACK covering exactly that
+; segment. The ACK is already present when SEND enters WAIT_FOR_EVENT, which
+; gives the 20-call stream deterministic no-retransmission geometry.
+AUTO_ACK_CAPTURED
+	PUSH	IX,IY
+	LD	HL,(CAP_LEN)
+	LD	DE,RX_PREFIX_LEN
+	OR	A
+	SBC	HL,DE
+	JR	NC,.length_ready
+	LD	A,1
+	LD	(AUTO_ACK_BAD),A
+	LD	HL,0
+.length_ready
+	LD	(AUTO_ACK_LEN),HL
+	LD	DE,TCP_MSS+1
+	OR	A
+	SBC	HL,DE
+	JR	C,.length_valid
+	LD	A,1
+	LD	(AUTO_ACK_BAD),A
+.length_valid
+	LD	IX,CAP_BUF+RX_PREFIX_LEN
+	LD	DE,(AUTO_EXPECT_PTR)
+	LD	BC,(AUTO_ACK_LEN)
+.compare
+	LD	A,B
+	OR	C
+	JR	Z,.compared
+	LD	A,(DE)
+	CP	(IX+0)
+	JR	Z,.byte_ok
+	LD	A,1
+	LD	(AUTO_ACK_BAD),A
+.byte_ok
+	INC	IX
+	INC	DE
+	LD	HL,LONG_PAYLOAD_END
+	OR	A
+	SBC	HL,DE
+	JR	NZ,.not_wrapped
+	LD	DE,LONG_PAYLOAD
+.not_wrapped
+	DEC	BC
+	JR	.compare
+.compared
+	LD	(AUTO_EXPECT_PTR),DE
+	LD	HL,(AUTO_ACK_TOTAL)
+	LD	DE,(AUTO_ACK_LEN)
+	ADD	HL,DE
+	LD	(AUTO_ACK_TOTAL),HL
+	LD	HL,AUTO_ACK_SEGS
+	INC	(HL)
+
+	; Start from the handshake ACK (peer tuple/sequence/window), then replace
+	; its ACK number by captured SEQ + captured payload length.
+	LD	HL,ACK_FRAME
+	LD	DE,DATA_ACK_FRAME
+	LD	BC,ACK_LEN
+	LDIR
+	LD	HL,CAP_BUF+38
+	LD	DE,DATA_ACK_FRAME+42
+	LD	BC,4
+	LDIR
+	LD	BC,(AUTO_ACK_LEN)
+	LD	A,(DATA_ACK_FRAME+45)
+	ADD	A,C
+	LD	(DATA_ACK_FRAME+45),A
+	LD	A,(DATA_ACK_FRAME+44)
+	ADC	A,B
+	LD	(DATA_ACK_FRAME+44),A
+	LD	A,(DATA_ACK_FRAME+43)
+	ADC	A,0
+	LD	(DATA_ACK_FRAME+43),A
+	LD	A,(DATA_ACK_FRAME+42)
+	ADC	A,0
+	LD	(DATA_ACK_FRAME+42),A
+	LD	IY,DATA_ACK_FRAME
+	CALL	FIX_TCP_CKSUM
+	LD	HL,DATA_ACK_FRAME
+	LD	(RX_QSRC),HL
+	LD	HL,ACK_LEN
+	LD	(RX_QLEN),HL
+	LD	HL,0
+	LD	(RX_QLEN2),HL
+	POP	IY,IX
 	XOR	A
 	RET
 
@@ -561,28 +846,40 @@ READ_FRAME_STUB
 	XOR	A			; CF=0
 	RET
 
-; Session-RX equivalents used by the optimized DLL wait loop. Every queued
-; passive-open vector is an optionless 54-byte control segment, exactly the
-; header capacity passed by WAIT_LOOP; RX_PAYLOAD therefore only has to close
-; the two-phase scope and promote the next queued frame.
+; Session-RX equivalents used by the optimized DLL wait loop. RX_BEGIN copies
+; the 54-byte optionless Ethernet/IP/TCP prefix; RX_PAYLOAD copies any tail
+; (the SEND/FIN cases carry an HTTP response), closes the two-phase scope and
+; promotes the next queued frame.
 RX_BEGIN_STUB
-	LD	A,(RX_QLEN)
-	LD	BC,(RX_QLEN)
-	OR	C
-	JR	Z,.none
-	EX	DE,HL
+	PUSH	HL
+	LD	HL,(RX_QLEN)
+	LD	A,H
+	OR	L
+	JR	Z,.none_pop
+	POP	DE			; DE = header destination
 	LD	HL,(RX_QSRC)
-	PUSH	BC
-	LDIR
-	POP	BC
+	LDIR				; caller's BC is the header capacity
+	LD	BC,(RX_QLEN)		; return the whole frame length
 	XOR	A
 	RET
+.none_pop
+	POP	HL
 .none
 	LD	BC,0
 	XOR	A
 	RET
 
 RX_PAYLOAD_STUB
+	LD	A,B
+	OR	C
+	JR	Z,.promote
+	LD	HL,(RX_QSRC)
+	PUSH	DE
+	LD	DE,RX_PREFIX_LEN
+	ADD	HL,DE
+	POP	DE
+	LDIR
+.promote
 	LD	HL,(RX_QSRC2)
 	LD	(RX_QSRC),HL
 	LD	HL,(RX_QLEN2)
@@ -630,17 +927,17 @@ BUILD_FIN
 	RET
 
 ; ------------------------------------------------------
-; BUILD_DATA_ACK stages the peer's acknowledgement of the SEND_LEN payload
-; bytes the SEND case is about to transmit: the handshake ACK with its
-; acknowledgement number advanced past them, and nothing else moved (the peer
-; sends no data of its own here). It has to be queued BEFORE the SEND,
-; because SEND blocks in its own wait loop until this frame is read.
+; BUILD_FULL_ACK_FIN stages a FIN carrying the full cumulative ACK for the
+; SEND_LEN payload. FIN after the complete ACK is success for this SEND; the
+; close is reported by the following RECV.
 ; ------------------------------------------------------
-BUILD_DATA_ACK
+BUILD_FULL_ACK_FIN
 	LD	HL,ACK_FRAME
 	LD	DE,DATA_ACK_FRAME
 	LD	BC,ACK_LEN
 	LDIR
+	LD	A,TCP_FLAG_FIN|TCP_FLAG_ACK
+	LD	(DATA_ACK_FRAME+47),A
 	LD	B,SEND_LEN
 .bump
 	PUSH	BC
@@ -656,9 +953,131 @@ BUILD_DATA_ACK
 	LD	(RX_QLEN),HL
 	RET
 
-; The SEND case's payload. It lives in the vectors' own image, i.e. in
+; ------------------------------------------------------
+; BUILD_RESPONSE_FIN stages the failure shape that motivated UNETRTL 0.3.8:
+; the peer acknowledges only three bytes of a seven-byte SEND, supplies an
+; HTTP status and closes in the same FIN|PSH|ACK segment.
+; ------------------------------------------------------
+BUILD_RESPONSE_FIN
+	LD	HL,ACK_FRAME
+	LD	DE,RESP_FIN_FRAME
+	LD	BC,ACK_LEN
+	LDIR
+	LD	HL,PEER_REPLY
+	LD	BC,PEER_REPLY_LEN
+	LDIR
+	LD	A,LOW (40 + PEER_REPLY_LEN)
+	LD	(RESP_FIN_FRAME+17),A
+	LD	A,TCP_FLAG_FIN|TCP_FLAG_PSH|TCP_FLAG_ACK
+	LD	(RESP_FIN_FRAME+47),A
+	LD	B,3
+.bump_ack
+	PUSH	BC
+	LD	HL,RESP_FIN_FRAME+45
+	CALL	INC32_AT
+	POP	BC
+	DJNZ	.bump_ack
+	LD	IY,RESP_FIN_FRAME
+	CALL	FIX_IP_CKSUM
+	CALL	FIX_TCP_CKSUM
+	LD	HL,RESP_FIN_FRAME
+	LD	(RX_QSRC),HL
+	LD	HL,ACK_LEN+PEER_REPLY_LEN
+	LD	(RX_QLEN),HL
+	LD	HL,0
+	LD	(RX_QLEN2),HL
+	RET
+
+; Same response geometry as BUILD_RESPONSE_FIN, split into PSH|ACK followed
+; by FIN|ACK. The second segment starts immediately after PEER_REPLY.
+BUILD_RESPONSE_THEN_FIN
+	CALL	BUILD_RESPONSE_FIN
+	; ECE forces this synthetic frame through the ordinary full parser. The
+	; optimized payload-only path is covered separately by cold vectors; here
+	; the point is that SEND keeps waiting across a data event until FIN.
+	LD	A,0x40|TCP_FLAG_PSH|TCP_FLAG_ACK
+	LD	(RESP_FIN_FRAME+47),A
+	LD	IY,RESP_FIN_FRAME
+	CALL	FIX_TCP_CKSUM
+	LD	HL,ACK_FRAME
+	LD	DE,FIN_ONLY_FRAME
+	LD	BC,ACK_LEN
+	LDIR
+	LD	A,TCP_FLAG_FIN|TCP_FLAG_ACK
+	LD	(FIN_ONLY_FRAME+47),A
+	LD	B,3
+.bump_ack
+	PUSH	BC
+	LD	HL,FIN_ONLY_FRAME+45
+	CALL	INC32_AT
+	POP	BC
+	DJNZ	.bump_ack
+	LD	B,PEER_REPLY_LEN
+.bump_seq
+	PUSH	BC
+	LD	HL,FIN_ONLY_FRAME+41
+	CALL	INC32_AT
+	POP	BC
+	DJNZ	.bump_seq
+	LD	IY,FIN_ONLY_FRAME
+	CALL	FIX_TCP_CKSUM
+	LD	HL,RESP_FIN_FRAME
+	LD	(RX_QSRC),HL
+	LD	HL,FIN_ONLY_FRAME
+	LD	(RX_QSRC2),HL
+	LD	HL,ACK_LEN+PEER_REPLY_LEN
+	LD	(RX_QLEN),HL
+	LD	HL,ACK_LEN
+	LD	(RX_QLEN2),HL
+	RET
+
+; Queue an HTTP 201 response plus FIN after the long-send vector. The ACK is
+; copied from the context's SND.UNA, proving that all preceding chunks were
+; already accepted; this close therefore belongs to RECV, not to SEND.
+BUILD_LONG_RESPONSE_FIN
+	LD	HL,ACK_FRAME
+	LD	DE,LONG_RESP_FRAME
+	LD	BC,ACK_LEN
+	LDIR
+	LD	HL,LONG_REPLY
+	LD	BC,LONG_REPLY_LEN
+	LDIR
+	LD	A,LOW (40 + LONG_REPLY_LEN)
+	LD	(LONG_RESP_FRAME+17),A
+	LD	A,TCP_FLAG_FIN|TCP_FLAG_PSH|TCP_FLAG_ACK
+	LD	(LONG_RESP_FRAME+47),A
+	LD	HL,A_CTX0+CTX_SND_UNA
+	LD	DE,LONG_RESP_FRAME+42
+	LD	BC,4
+	LDIR
+	LD	IY,LONG_RESP_FRAME
+	CALL	FIX_IP_CKSUM
+	CALL	FIX_TCP_CKSUM
+	LD	HL,LONG_RESP_FRAME
+	LD	(RX_QSRC),HL
+	LD	HL,ACK_LEN+LONG_REPLY_LEN
+	LD	(RX_QLEN),HL
+	LD	HL,0
+	LD	(RX_QLEN2),HL
+	RET
+
+; The SEND cases' payload. It lives in the vectors' own image, i.e. in
 ; window 2 with the DLL in window 1 -- the same split a normal DSS EXE has.
-SEND_PAYLOAD	DB "bink"
+SEND_PAYLOAD	DB "request"
+PEER_REPLY	DB "HTTP/1.1 400",13,10
+PEER_REPLY_LEN	EQU $ - PEER_REPLY
+LONG_REPLY	DB "HTTP/1.1 201",13,10
+LONG_REPLY_LEN	EQU $ - LONG_REPLY
+LASTERR_SEND_CLOSED DB "509B hw=1 st=03 nerr=07 tcp=20 el3=00/0000",0
+
+; Deterministic 1200-byte source. AUTO_ACK_CAPTURED walks this pattern across
+; segment and public-call boundaries and requires the pointer to wrap exactly
+; twenty times after 24,000 wire bytes.
+LONG_PAYLOAD
+	DUP LONG_SEND_LEN
+	DB ($ - LONG_PAYLOAD) & 0xFF
+	EDUP
+LONG_PAYLOAD_END
 
 ; INC32_AT: increment the big-endian 32-bit field whose LAST byte is at HL.
 INC32_AT
@@ -694,7 +1113,8 @@ FIX_TCP_CKSUM
 	LD	(PSEUDO+9),A
 	XOR	A
 	LD	(PSEUDO+10),A
-	LD	A,ACK_LEN-34
+	LD	A,(IY+17)
+	SUB	20			; TCP length = IPv4 total - fixed IP header
 	LD	(PSEUDO+11),A
 	LD	HL,0
 	LD	IX,PSEUDO
@@ -704,7 +1124,10 @@ FIX_TCP_CKSUM
 	POP	IX
 	LD	BC,34
 	ADD	IX,BC
-	LD	BC,ACK_LEN-34
+	LD	A,(IY+17)
+	SUB	20
+	LD	C,A
+	LD	B,0
 	CALL	CKSUM_ADD
 	LD	A,H
 	CPL
@@ -712,6 +1135,27 @@ FIX_TCP_CKSUM
 	LD	A,L
 	CPL
 	LD	(IY+51),A
+	RET
+
+; FIX_IP_CKSUM: recompute the fixed 20-byte IPv4 header after changing its
+; total length for RESP_FIN_FRAME. In: IY=frame.
+FIX_IP_CKSUM
+	XOR	A
+	LD	(IY+24),A
+	LD	(IY+25),A
+	LD	HL,0
+	PUSH	IY
+	POP	IX
+	LD	BC,14
+	ADD	IX,BC
+	LD	BC,20
+	CALL	CKSUM_ADD
+	LD	A,H
+	CPL
+	LD	(IY+24),A
+	LD	A,L
+	CPL
+	LD	(IY+25),A
 	RET
 
 ; ------------------------------------------------------

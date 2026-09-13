@@ -594,23 +594,14 @@ F_RECV_TCP
 	CALL	MAP_RECV_FAIL
 	CP	NERR_CLOSED
 	JR	NZ,.empty
-	; unet.inc's LISTEN contract: "CLOSE (or a peer close) of the
-	; accepted connection re-arms LISTEN on the same port". A peer close
-	; surfaces only here, so the re-arm has to happen here too -- the
-	; caller is told NERR_CLOSED and must NOT call CLOSE on top of it.
-	; ONLY for that accepted channel, though. An ordinary channel must
-	; survive its peer's FIN: unet.inc has RECV merely REPORT the close,
-	; TCPX.SEND deliberately accepts CLOSE_WAIT, and half-close is how a
-	; protocol finishes its side (binkp still owes its M_EOB when the boss
-	; hangs up first). Closing here also made the channel state 0, so the
-	; caller's NEXT poll got NERR_STATE where the contract promises a
-	; stable NERR_CLOSED.
-	CALL	IS_ACCEPTED_LISTEN
-	JR	NC,.peer_closed
+	; The final NERR_CLOSED consumes the orderly-close marker and frees the
+	; channel, matching UNETRTL. Payload is returned by earlier successful
+	; RECV calls, so no pending byte is discarded here. An accepted LISTEN
+	; channel is re-armed by RELEASE_OR_REARM instead of becoming idle.
 	LD	A,(UNET_ARG_A)
-	CALL	@TCPX.CLOSE		; our FIN, then release the context
+	CALL	@TCPX.SELECT_CONTEXT
+	CALL	@TCPX.CLEAR_CONTEXT
 	CALL	RELEASE_OR_REARM
-.peer_closed
 	LD	A,NERR_CLOSED
 	JR	.empty
 .idle
@@ -1156,10 +1147,10 @@ F_GETINFO
 	RET
 
 ; ------------------------------------------------------
-; Function 16 - LASTERR. DE=dest, IX=max. Formats the shim's own
-; diagnostic scalars (all zero/none until a real failure happens in
-; P2+); TX_BUF is idle whenever a diagnostic call runs, so the string
-; is staged there instead of costing its own BSS.
+; Function 16 - LASTERR. DE=dest, IX=max. Before the first failure the
+; mutable template is rebuilt from live state. RET_A formats it at every
+; failure; successful calls leave that snapshot untouched until the next
+; failure replaces it.
 ; ------------------------------------------------------
 F_LASTERR
 	LD	(UNET_ARG_DE),DE
@@ -1172,8 +1163,10 @@ F_LASTERR
 	LD	BC,(UNET_ARG_IX)
 	CALL	CHECK_BUF_RANGE
 	JP	C,RET_PARAM
-	CALL	BUILD_LASTERR
-	LD	HL,DLL_BSS + BSS_TX
+	LD	A,(UNET_LAST_NERR)
+	OR	A
+	CALL	Z,BUILD_LASTERR
+	LD	HL,LASTERR_BUF
 	LD	DE,(UNET_ARG_DE)
 	LD	BC,(UNET_ARG_IX)
 	CALL	COPY_LIMITED
@@ -1223,8 +1216,16 @@ F_SETOPT
 ; every UNET function returns status in A with CF=0.
 ; ======================================================
 RET_A					; A already set
-	LD	(UNET_LAST_NERR),A
 	OR	A
+	RET	Z
+	LD	(UNET_LAST_NERR),A
+	; BUILD_LASTERR uses the scratch register set but SEND/RECV return DE.
+	; IY is deliberately its table cursor so the public IX result survives.
+	PUSH	AF
+	PUSH	DE
+	CALL	BUILD_LASTERR
+	POP	DE
+	POP	AF
 	RET
 RET_PARAM
 	LD	A,NERR_PARAM
@@ -1651,34 +1652,30 @@ COPY_LIMITED
 	RET
 
 ; ------------------------------------------------------
-; BUILD_LASTERR: format the shim's diagnostic scalars into DLL_BSS+BSS_TX.
-; P1 has nothing to report yet (no NETINIT/CONNECT path exists); P2
-; wires UNET_STAGE/UNET_TCP_LAST/UNET_DIAG_EL3 to real values without
-; changing this function's shape.
+; BUILD_LASTERR: format the shim's diagnostic scalars in the mutable literal
+; LASTERR_BUF. The fixed bytes are part of the image and only the fields are
+; rewritten, so the frozen line needs no second 43-byte BSS allocation.
 ;   "509B hw=0 st=00 nerr=00 tcp=00 el3=00/0000"
 ; ------------------------------------------------------
 BUILD_LASTERR
-	LD	HL,LASTERR_TEMPLATE
-	LD	DE,DLL_BSS + BSS_TX
-	LD	BC,43			; fixed text including its NUL
-	LDIR
 	LD	A,(UNET_INITED)
 	ADD	A,'0'
-	LD	(DLL_BSS+BSS_TX+8),A
+	LD	(LASTERR_BUF+8),A
 	; The remaining six source bytes are contiguous. FORMAT_HEX_A advances DE;
-	; this compact gap table skips the fixed labels already copied above.
-	LD	HL,UNET_STAGE
-	LD	DE,DLL_BSS+BSS_TX+13
-	LD	IX,LASTERR_GAPS
+	; this compact gap table skips the fixed labels. IY, not IX, is the source
+	; cursor because RET_A must preserve RECV's public IX flags result.
+	LD	IY,UNET_STAGE
+	LD	DE,LASTERR_BUF+13
+	LD	HL,LASTERR_GAPS
 	LD	B,6
 .field
-	LD	A,(IX+0)
+	LD	A,(HL)
 	ADD	A,E			; BSS_TX+13..41 cannot cross a page
 	LD	E,A
-	LD	A,(HL)
-	INC	HL
+	LD	A,(IY+0)
+	INC	IY
 	CALL	FORMAT_HEX_A
-	INC	IX
+	INC	HL
 	DJNZ	.field
 	RET
 
@@ -1724,8 +1721,8 @@ INFO_NAME_TABLE
 
 LIT_509B	EQU @S9APP.V_509B
 LIT_EMPTY	DB 0
-LASTERR_TEMPLATE DB "509B hw=0 st=00 nerr=00 tcp=00 el3=00/0000",0
-	ASSERT $ - LASTERR_TEMPLATE == 43
+LASTERR_BUF	DB "509B hw=0 st=00 nerr=00 tcp=00 el3=00/0000",0
+	ASSERT $ - LASTERR_BUF == 43
 LASTERR_GAPS	DB 0,6,5,5,1,0
 
 N_NET_IPSRC	DB "NET_IP_SRC",0
