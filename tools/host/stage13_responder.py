@@ -6,7 +6,7 @@ stage11's TCP framing, reused here for TWO kinds of connection instead of one.
 The control channel (a fixed port, 21) pushes an unsolicited "220" banner the
 moment it comes up and answers a small FTP verb table; PASV self-announces a
 data port the same way the Stage 9 TFTP responder announces its own TID, and
-that data channel either pushes a fixture (RETR/LIST) or captures an upload
+that data channel either pushes a fixture (RETR/LIST/NLST) or captures an upload
 (STOR), filling the client's advertised window instead of replying one
 segment per received frame -- see test_response_fills_the_advertised_window
 in the unit tests below for why that distinction matters.
@@ -63,6 +63,7 @@ DNS_NAME = "ftp.stage13.test"
 SMALL = bytes((index * 13 + 5) & 0xFF for index in range(211))
 LARGE = bytes((index * 37 + 11) & 0xFF for index in range(3000))
 LISTING = b"-rw-r--r-- 1 owner group 211 Jan  1 00:00 SMALL.BIN\r\n"
+NLST_LISTING = b"SMALL.BIN\r\n"
 
 
 def fixtures():
@@ -109,7 +110,7 @@ class Responder:
         self.control_key = None
         self.next_data_port = FIRST_DATA_PORT
         # Extra frames generated out-of-band (pushing a data-channel fixture
-        # the instant a RETR/LIST command is accepted, or a "226" onto the
+        # the instant a RETR/LIST/NLST command is accepted, or a "226" onto the
         # control channel once a transfer's FIN goes out) -- collected here
         # and flushed into handle()'s own return value.
         self._extra = []
@@ -333,7 +334,9 @@ class Responder:
                 return "501 Invalid REST argument.\r\n"
             self.rest_offset = offset
             return "350 Restarting at %s.\r\n" % arg
-        if verb in ("RETR", "LIST", "STOR"):
+        if verb == "NLST" and self.profile == "refuse-nlst":
+            return "550 NLST not supported.\r\n"
+        if verb in ("RETR", "LIST", "NLST", "STOR"):
             # A real server only honors REST on the RETR it immediately
             # precedes; a fresh transfer without its own REST starts at 0
             # even if an earlier one left an offset behind.
@@ -350,7 +353,8 @@ class Responder:
         for key, connection in self.connections.items():
             if key[1] != self.data_port or not connection.established:
                 continue
-            body = LISTING if verb == "LIST" else fixtures().get(arg.upper(), b"")
+            body = (LISTING if verb == "LIST" else NLST_LISTING if verb == "NLST"
+                    else fixtures().get(arg.upper(), b""))
             connection.send_queue.extend(body[offset:])
             if connection.last_request is not None:
                 if not connection.send_queue and not connection.fin_sent:
@@ -425,7 +429,7 @@ def check_pcap(path):
     if b"USER " not in client_payload or b"PASV" not in client_payload:
         raise ValueError("pcap lacks a USER command and a PASV request")
     if (b"RETR " not in client_payload and b"STOR " not in client_payload and
-            b"LIST" not in client_payload):
+            b"LIST" not in client_payload and b"NLST" not in client_payload):
         raise ValueError("pcap lacks an FTP transfer verb")
     if not any(item["flags"] & 2 and item["source"] == CLIENT_IP and
                item["destination_port"] == CONTROL_PORT for item in tcp):
@@ -447,7 +451,7 @@ def main(argv=None):
     parser.add_argument("--interface")
     parser.add_argument("--pcap")
     parser.add_argument("--log")
-    parser.add_argument("--profile", choices=("clean", "refuse-pass", "suppress226"),
+    parser.add_argument("--profile", choices=("clean", "refuse-pass", "refuse-nlst", "suppress226"),
                         default="clean")
     parser.add_argument("--check-pcap")
     parser.add_argument("--prepare-fixtures")

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Stage 13 FTP actual-EXE scenarios: CLI, control dialog, GET/PUT/LIST,
+// Stage 13 FTP actual-EXE scenarios: CLI, control dialog, GET/PUT/LIST/NLST,
 // resume, fault-injection and cancellation, against the real FTP.EXE image.
 // SPDX-License-Identifier: BSD-3-Clause
 'use strict';
@@ -240,7 +240,7 @@ assert.strictEqual(normalized(result.output), golden.login_refused);
 checked(result);
 
 // ------------------------------------------------------------------
-// LIST and the documented -n/-l equivalence (no NLST fallback exists).
+// LIST, terse NLST, and the sibling-compatible 5xx NLST -> LIST fallback.
 // ------------------------------------------------------------------
 const LISTING = '-rw-r--r-- 1 owner group 36 Jan  1 00:00 SMALL.BIN\r\n';
 result = run('192.168.7.44 -l', scenario({listing: LISTING}));
@@ -250,13 +250,42 @@ assert.deepStrictEqual(result.ftpRequests.slice(-2), ['LIST', 'QUIT']);
 assert.strictEqual(normalized(result.output), golden.list);
 checked(result);
 
-const listResult = run('192.168.7.44 -l', scenario({listing: LISTING}));
-const nlstResult = run('192.168.7.44 -n', scenario({listing: LISTING}));
-assert.strictEqual(listResult.exitCode, 0);
-assert.strictEqual(nlstResult.exitCode, 0);
-assert.deepStrictEqual(nlstResult.ftpRequests, listResult.ftpRequests,
-  '-n has no NLST fallback in this build and must send the same LIST as -l');
-checked(listResult); checked(nlstResult);
+const NLST_LISTING = 'SMALL.BIN\r\n';
+result = run('192.168.7.44 pub -n', scenario({listing: LISTING, nlstListing: NLST_LISTING}));
+assert.strictEqual(result.exitCode, 0, result.output);
+assert.ok(result.output.includes('SMALL.BIN'));
+assert.ok(!result.output.includes('owner group 36'));
+assert.deepStrictEqual(result.ftpRequests.slice(-2), ['NLST pub', 'QUIT']);
+assert.strictEqual(normalized(result.output), golden.nlst);
+checked(result);
+
+result = run('192.168.7.44 -n', scenario({listing: LISTING, refuseVerbs: ['NLST']}));
+assert.strictEqual(result.exitCode, 0, result.output);
+assert.ok(result.output.includes('550 Failed.'));
+assert.ok(result.output.includes('[W] NLST not supported; retrying with LIST.'));
+assert.ok(result.output.includes('owner group 36'));
+assert.deepStrictEqual(result.ftpRequests.slice(-3), ['NLST', 'LIST', 'QUIT']);
+assert.strictEqual(result.ftpRequests.filter((request) => request === 'PASV').length, 1,
+  'NLST fallback must reuse the already-open PASV data channel');
+assert.strictEqual(normalized(result.output), golden.nlst_fallback);
+checked(result);
+
+result = run('192.168.7.44 -n', scenario({
+  refuseVerbs: ['NLST'], refuseReplies: {NLST: '450 Temporary failure.\r\n'},
+}));
+assert.strictEqual(result.exitCode, 6, result.output);
+assert.ok(result.output.includes('450 Temporary failure.'));
+assert.ok(!result.output.includes('retrying with LIST'));
+assert.ok(!result.ftpRequests.includes('LIST'), 'only 5xx may retry with LIST');
+checked(result);
+
+result = run('192.168.7.44 -n', scenario({refuseVerbs: ['NLST', 'LIST']}));
+assert.strictEqual(result.exitCode, 6, result.output);
+assert.deepStrictEqual(result.ftpRequests.slice(-2), ['NLST', 'LIST']);
+assert.strictEqual(result.ftpRequests.filter((request) => request === 'NLST').length, 1);
+assert.strictEqual(result.ftpRequests.filter((request) => request === 'LIST').length, 1,
+  'a failed LIST fallback must not retry or return to NLST');
+checked(result);
 
 result = run('192.168.7.44 -l', scenario({refuseList: true}));
 assert.strictEqual(result.exitCode, 6, result.output);

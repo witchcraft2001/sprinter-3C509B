@@ -211,7 +211,7 @@ class Stage13ResponderTest(unittest.TestCase):
         self.assertEqual(responder.data_port, stage13.FIRST_DATA_PORT)
 
         # ftp.asm opens the data channel (and completes its handshake)
-        # before ever sending RETR/STOR/LIST.
+        # before ever sending RETR/STOR/LIST/NLST.
         self.open_data_channel(responder, responder.data_port, client_seq=5000)
 
         retr_replies = session.send("RETR SMALL.BIN\r\n")
@@ -253,6 +253,38 @@ class Stage13ResponderTest(unittest.TestCase):
         data_frames = [frame for label, frame in retr_replies if label == "DATA"]
         received = b"".join(stage11.parse_tcp(frame)["payload"] for frame in data_frames)
         self.assertEqual(received, stage13.LARGE[2000:])
+
+    def test_nlst_returns_terse_names(self):
+        responder = stage13.Responder()
+        session = Session(responder)
+        session.send("USER anonymous\r\n")
+        session.send("PASS anonymous@\r\n")
+        session.send("TYPE I\r\n")
+        session.send("PASV\r\n")
+        self.open_data_channel(responder, responder.data_port, client_seq=6800)
+
+        replies = session.send("NLST\r\n")
+        data = b"".join(stage11.parse_tcp(frame)["payload"]
+                        for label, frame in replies if label == "DATA")
+        self.assertEqual(data, stage13.NLST_LISTING)
+        self.assertEqual(responder.requests[-1], "NLST")
+
+    def test_refused_nlst_leaves_data_channel_for_list_retry(self):
+        responder = stage13.Responder(profile="refuse-nlst")
+        session = Session(responder)
+        session.send("USER anonymous\r\n")
+        session.send("PASS anonymous@\r\n")
+        session.send("TYPE I\r\n")
+        session.send("PASV\r\n")
+        self.open_data_channel(responder, responder.data_port, client_seq=6900)
+
+        refused = session.send("NLST\r\n")
+        self.assertEqual(payloads_of(refused), [b"550 NLST not supported.\r\n"])
+        replies = session.send("LIST\r\n")
+        data = b"".join(stage11.parse_tcp(frame)["payload"]
+                        for label, frame in replies if label == "DATA")
+        self.assertEqual(data, stage13.LISTING)
+        self.assertEqual(responder.requests[-2:], ["NLST", "LIST"])
 
     def test_rest_at_eof_sends_fin_and_226(self):
         # An empty tail still has protocol completion: without the FIN-only

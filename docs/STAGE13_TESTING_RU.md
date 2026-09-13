@@ -64,10 +64,15 @@ complete.`, `Done. N bytes recv.`/`... sent.`, строка `  N bytes in S sec`
 влезли в потолок образа (см. `docs/FTP.md`, "Known limitations"); точные
 транскрипты зафиксированы в `tools/test-fixtures/stage13-ftp-golden.json`.
 `226` должен появляться и на мелких файлах: он приходит по control-каналу,
-пока ещё качается канал данных, и не теряется. Листинг (`-l`
-и `-n`) печатает содержимое каталога прямо на консоль без записи файла; `-n` в
-этой сборке выводит то же самое, что и `-l` (см. `docs/FTP.md`, раздел "Known
-limitations" — NLST-fallback не влезает в потолок образа 16256 байт).
+пока ещё качается канал данных, и не теряется. Листинг печатается прямо на
+консоль без записи файла: `-l` посылает `LIST`, а `-n` — `NLST` и в профиле
+`clean` выводит только имена. Для fallback перезапустите responder с
+`STAGE13_PROFILE=refuse-nlst tools/stage13-mame.sh responder`, затем выполните
+`FTP ftp.stage13.test -n`. Ожидаются `550 NLST not supported.`, предупреждение
+`[W] NLST not supported; retrying with LIST.`, полный LIST и `RESULT OK`.
+В responder log должны быть `CMD 'NLST'` и затем `CMD 'LIST'`, а в pcap —
+один PASV и один SYN на data-порт: повторного PASV/SYN между командами быть не
+должно.
 
 Перед тестом resume подготовьте `LARGE.BIN` с уже частично скачанным
 префиксом (например, тем же способом, что и `RANGE.BIN` в Stage 12 — см.

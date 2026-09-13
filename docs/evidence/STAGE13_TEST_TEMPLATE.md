@@ -66,8 +66,10 @@ ____________________  DLDIRECT.EXE
 
 ## Notes
 
-- Known, accepted limitations (not defects, do not re-report): `-n` behaves
-  identically to `-l` (no NLST fallback, see `docs/FTP.md`); `PUT` is
+- NLST acceptance: `-n` produces a terse names-only list; with responder
+  profile `refuse-nlst`, it prints the 5xx and the fallback warning, then
+  completes LIST on the same PASV data channel: ____________________
+- Known, accepted limitations (not defects, do not re-report): `PUT` is
   stop-and-wait and will not show the same throughput as `GET`; the message
   wording is shorter than the sibling client's.
 - Carry forward any caveat that isn't independently confirmed from a

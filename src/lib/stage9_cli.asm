@@ -551,9 +551,10 @@ PARSE_WGET
 ;   FTP host[:port] PUT local  [-u user] [-p pass] [-o remote-name]
 ;   FTP host[:port] [path] -l|-n ...
 ;   FTP /?
-; F13_FLAGS bits: 0 force, 1 resume, 2 dots, 3 list (-l and -n both set it;
-; the image-size budget didn't leave room for NLST's own fallback, so -n
-; just lists the same as -l -- see ftp.asm), 5 has -o, 6 has -u, 7 has -p.
+; F13_FLAGS bits: 0 force, 1 resume, 2 dots, 3 list, 4 request NLST (-n),
+; 5 has -o, 6 has -u, 7 has -p.  The NLST bit is consumed by ftp.asm when a
+; server rejects NLST with 5xx and it retries the already-open data channel
+; with LIST.
 ; F13_MODE is left 0 (GET-or-LIST, resolved by the
 ; caller once parsing is done) or set to 1 the moment the "PUT" keyword is
 ; recognised. F13_POS_COUNT tracks which positional comes next: 0 host,
@@ -596,10 +597,8 @@ PARSE_FTP
 	JP	Z,.F_PASSFLAG
 	CP	'O'
 	JP	Z,.F_OUTPUTFLAG
-	; L/N/Y/F/R/D just OR one bit into F13_FLAGS; a small table beats six
-	; more CP/JR pairs. N shares L's bit: -n folds into -l, both send LIST
-	; (see ftp.asm) since the image-size budget has no room for NLST's own
-	; fallback.
+	; L/N/Y/F/R/D just OR a bit mask into F13_FLAGS; a small table beats six
+	; more CP/JR pairs. -n includes the list-mode bit and its own NLST selector.
 	LD	C,A
 	LD	HL,SIMPLE_FLAGS
 .F_SCAN
@@ -734,7 +733,7 @@ PARSE_FTP
 	CP	1
 	JR	NZ,.F_HAVE_PATH
 	LD	A,(F13_FLAGS)
-	AND	0x08
+	AND	F13_FLAG_LIST_MASK
 	JP	Z,.F_BAD		; bare host only valid with -l/-n
 	XOR	A
 	LD	(F13_REMOTE_PATH),A
@@ -849,8 +848,8 @@ COPY_Z_NUL
 DEFAULT_FTP_USER DB "anonymous",0
 DEFAULT_FTP_PASS DB "anonymous@",0
 SIMPLE_FLAGS
-	DB	'L',0x08
-	DB	'N',0x08
+	DB	'L',F13_FLAG_LIST_MASK
+	DB	'N',F13_FLAG_LIST_MASK | F13_FLAG_NLST_MASK
 	DB	'Y',0x01
 	DB	'F',0x01
 	DB	'R',0x02

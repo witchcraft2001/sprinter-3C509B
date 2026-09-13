@@ -24,7 +24,7 @@ FTP /?
 | `-r`   | Resume a download through `REST`.                            |
 | `-d`   | Dot progress instead of the KB counter.                      |
 | `-l`   | List a remote directory.                                     |
-| `-n`   | Same as `-l` in this build; see "Known limitations".         |
+| `-n`   | List names through `NLST`; retry `LIST` after an NLST `5xx`.  |
 
 The port defaults to 21. `-u`/`-p` log in as that user/password; without
 either, the client logs in as `anonymous`/`anonymous@` (the conventional
@@ -51,7 +51,13 @@ continues it; `PUT` and listings have nothing to preserve on cancel.
 
 A missing or timed-out `226 Transfer complete` after the data channel closes
 is not fatal -- the transfer already succeeded once the server accepted
-`RETR`/`STOR`/`LIST` and the data channel closed cleanly.
+`RETR`/`STOR`/`LIST`/`NLST` and the data channel closed cleanly.
+
+`-l` sends `LIST` and prints the server's normal directory detail. `-n` sends
+`NLST` for a terse name-only list. If the server rejects `NLST` with a `5xx`,
+FTP prints a warning and sends `LIST` on the already-open PASV data channel;
+no second PASV negotiation or data connection is made. A `4xx` response and a
+failed fallback remain ordinary FTP errors.
 
 ## Progress display
 
@@ -65,7 +71,7 @@ path.
 `GET` receives each segment straight from the card into its disk buffer and
 writes whole 512-byte sectors as soon as the next segment would not fit, so a
 flush happens about once per segment and every write is sector-aligned.
-`-l`/`-n` streams the listing straight to the console instead. `-d` prints one
+`-l`/`-n` stream the listing straight to the console instead. `-d` prints one
 dot per flush instead of the KB counter.
 
 ## Examples
@@ -77,6 +83,7 @@ FTP files.lan pub/big.zip -r
 FTP files.lan PUT LOCAL.BIN -o incoming/local.bin -u alice -p secret
 FTP files.lan -l -u alice -p secret
 FTP files.lan pub -l
+FTP files.lan pub -n
 ```
 
 ## Exit codes
@@ -96,13 +103,6 @@ Every run ends with `RESULT OK` or `RESULT FAIL code=N`.
 
 ## Known limitations
 
-- **No NLST fallback.** The sibling RTL8019A kit's FTP client sends `NLST`
-  for `-n` and falls back to `LIST` on a 5xx reply. This build always sends
-  `LIST` for both `-l` and `-n` -- the fallback logic and the separate `NLST`
-  command didn't fit the 16256-byte image-size ceiling alongside everything
-  else PASV FTP needs. Functionally this only affects directory listing
-  *format* on servers that distinguish the two; the file itself transfers
-  identically either way.
 - **Shorter messages than the sibling.** The dialog and exit codes match the
   RTL8019A kit's client, but the wording is trimmed (`Host X -> Y`,
   `Opening data...`, `Done. N bytes recv.`) -- the full-length strings did not

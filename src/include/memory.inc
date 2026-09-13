@@ -723,10 +723,13 @@ S11_REMOTE_TEXT		EQU PAGE_BASE + 0x3700
 ; unlike WGET's single-context layout, this one packs flush with no spare
 ; gap of its own. Strings start right after S11_REMOTE_TEXT, same as W12's.
 F13_STATE_BASE		EQU S11_STATE_BASE + 0xA0
-; FLAGS bits: 0 force(-y/-f), 1 resume(-r), 2 dots(-d), 3 list(-l and -n
-; alike, see PARSE_FTP), 5 has -o, 6 has -u, 7 has -p. Bit 4 is unused and
-; PUT is not a flag: it sets F13_MODE.
+; FLAGS bits: 0 force(-y/-f), 1 resume(-r), 2 dots(-d), 3 list(-l and -n),
+; 4 request NLST (-n), 5 has -o, 6 has -u, 7 has -p. PUT is not a flag: it
+; sets F13_MODE.
 F13_FLAGS		EQU F13_STATE_BASE + 0x00
+F13_FLAG_LIST_MASK	EQU 0x08
+F13_FLAG_NLST_BIT	EQU 4
+F13_FLAG_NLST_MASK	EQU 0x10
 F13_MODE		EQU F13_STATE_BASE + 0x01	; 0 GET, 1 PUT, 2 LIST -- decided post-parse
 F13_CTRL_PORT		EQU F13_STATE_BASE + 0x02 ; word, host order, default 21
 F13_REPLY_CODE		EQU F13_STATE_BASE + 0x04 ; three ASCII digits, not NUL-terminated

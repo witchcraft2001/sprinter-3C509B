@@ -25,6 +25,7 @@ die "Stage 13 added EEPROM writes\n"
     if $code =~ /EEPROM_(?:WRITE|ERASE)|WRITE_EEPROM/i;
 
 my $ftp = slurp('src/apps/ftp.asm', 0);
+my $ftp_cli = slurp('src/lib/stage9_cli.asm', 0);
 my $dlspeed = slurp('src/apps/dlspeed.asm', 0);
 my $dldirect = slurp('src/apps/dldirect.asm', 0);
 my $libman = slurp('src/lib/libman13.asm', 0);
@@ -121,6 +122,17 @@ die "FTP client is not PASV-only (found an active-mode PORT command or a LISTEN 
     if $ftp =~ /DB\s+"PORT[\s"]|CMD_PORT|\bLISTEN\b/;
 die "FTP does not implement REST + RETR\n"
     unless $ftp =~ /CMD_REST\s+DB/ && $ftp =~ /CMD_RETR\s+DB/;
+die "FTP -n does not select NLST separately from LIST\n"
+    unless $memory =~ /F13_FLAG_LIST_MASK\s+EQU\s+0x08/ &&
+           $memory =~ /F13_FLAG_NLST_BIT\s+EQU\s+4/ &&
+           $memory =~ /F13_FLAG_NLST_MASK\s+EQU\s+0x10/ &&
+           $ftp_cli =~ /DB\s+'N',F13_FLAG_LIST_MASK\s*\|\s*F13_FLAG_NLST_MASK/ &&
+           $ftp =~ /CMD_NLST\s+DB/;
+die "FTP NLST does not retry LIST after exactly one 5xx refusal\n"
+    unless $ftp =~ /BIT\s+F13_FLAG_NLST_BIT,A[\s\S]{0,180}?CMD_NLST[\s\S]{0,700}?
+                 BIT\s+F13_FLAG_NLST_BIT,A[\s\S]{0,120}?CP\s+'5'[\s\S]{0,180}?
+                 RES\s+F13_FLAG_NLST_BIT,\(HL\)[\s\S]{0,240}?MSG_NLST_FALLBACK[\s\S]{0,180}?
+                 JP\s+\.SEND_LIST_VERB/x;
 die "FTP no longer treats REST-at-SIZE as an already complete file\n"
     unless $ftp =~ /RESUME_SIZE_COMPARE[\s\S]*?TRANSFER_SUMMARY/;
 die "FTP does not use two independent TCP channels\n"
@@ -202,9 +214,9 @@ die "Stage 13 developer/test artifacts leaked into ZIP\n"
 
 if (-f File::Spec->catfile($root, 'tools/host/stage13_responder.py')) {
     my $responder = slurp('tools/host/stage13_responder.py', 0);
-    for my $tag ('PASV', '227', '226') {
+    for my $tag ('PASV', '227', '226', 'NLST', 'refuse-nlst') {
         die "Stage 13 responder lacks $tag\n" unless $responder =~ /\Q$tag\E/;
     }
 }
 
-print "Stage 13 host contract: PASV-only, two channels, REST/RETR, bounded RTC/waits, golden pin, cleanup and artifacts passed\n";
+print "Stage 13 host contract: PASV-only, two channels, REST/RETR/LIST/NLST, bounded RTC/waits, golden pin, cleanup and artifacts passed\n";

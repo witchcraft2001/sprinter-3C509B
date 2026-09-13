@@ -313,9 +313,8 @@ START
 	JP	NZ,REST_REFUSED
 .NO_REST
 
-	; RETR / STOR / LIST. -n (terse NLST) folds into -l here: both list
-	; modes send the same LIST, which every server answering PASV also
-	; answers, instead of chancing NLST and needing a fallback retry.
+	; RETR / STOR / LIST/NLST. A 5xx NLST refusal retries LIST on this same
+	; already-open PASV data channel; bit 4 is cleared before that retry.
 	LD	A,(F13_MODE)
 	CP	1
 	JR	Z,.SEND_STOR
@@ -329,6 +328,13 @@ START
 	LD	BC,CMD_STOR_LEN
 	JR	.SEND_VERB
 .SEND_LIST_VERB
+	LD	A,(F13_FLAGS)
+	BIT	F13_FLAG_NLST_BIT,A
+	JR	Z,.SEND_LIST
+	LD	HL,CMD_NLST
+	LD	BC,CMD_NLST_LEN
+	JR	.SEND_VERB
+.SEND_LIST
 	LD	HL,CMD_LIST
 	LD	BC,CMD_LIST_LEN
 .SEND_VERB
@@ -343,7 +349,19 @@ START
 	JP	Z,.VERB_OK
 	CP	'2'
 	JP	Z,.VERB_OK
-	JP	REPLY_BAD
+	LD	A,(F13_FLAGS)
+	BIT	F13_FLAG_NLST_BIT,A
+	JP	Z,REPLY_BAD
+	LD	A,(F13_REPLY_CODE)
+	CP	'5'
+	JP	NZ,REPLY_BAD
+	LD	HL,F13_FLAGS
+	RES	F13_FLAG_NLST_BIT,(HL)
+	LD	HL,MSG_NLST_FALLBACK
+	CALL	@CONSOLE.STRING
+	LD	HL,@CONSOLE.CRLF
+	CALL	@CONSOLE.STRING
+	JP	.SEND_LIST_VERB
 .VERB_OK
 	LD	A,(F13_MODE)
 	CP	1
@@ -720,7 +738,7 @@ RESOLVE_MODE
 	OR	A
 	RET	NZ
 	LD	A,(F13_FLAGS)
-	AND	0x08
+	AND	F13_FLAG_LIST_MASK
 	RET	Z
 	LD	A,2
 	LD	(F13_MODE),A
@@ -1733,6 +1751,8 @@ CMD_QUIT	DB "QUIT"
 CMD_QUIT_LEN	EQU $ - CMD_QUIT
 CMD_LIST	DB "LIST "
 CMD_LIST_LEN	EQU $ - CMD_LIST
+CMD_NLST	DB "NLST "
+CMD_NLST_LEN	EQU $ - CMD_NLST
 CMD_STOR	DB "STOR "
 CMD_STOR_LEN	EQU $ - CMD_STOR
 CMD_SIZE	DB "SIZE "
@@ -1767,6 +1787,7 @@ MSG_RESOLVE	DB "[E] resolve fail.",0
 MSG_BAD_REPLY	DB "[E] bad FTP reply.",0
 MSG_E_PASV	DB "[E] bad PASV reply.",0
 MSG_E_NO_REST	DB "[E] REST refused, no -r.",0
+MSG_NLST_FALLBACK DB "[W] NLST not supported; retrying with LIST.",0
 MSG_E_DATA_OPEN DB "[E] data open fail 0x",0
 MSG_E_DATA_RX	DB "[E] data recv fail 0x",0
 MSG_FILE	DB "[E] file I/O fail.",0

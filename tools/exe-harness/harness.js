@@ -1100,7 +1100,7 @@ class EtherLinkIII {
   // data port picked on PASV, the same "own the dynamic endpoint" pattern
   // as the TFTP responder's server TID. Both channels are ordinary
   // respondTcp connections; FTP semantics hook in via onEstablished (push
-  // the unsolicited 220 banner / a RETR-LIST fixture), onData (parse
+  // the unsolicited 220 banner / a RETR-LIST-NLST fixture), onData (parse
   // control-channel command lines / capture a STOR upload) and onFinSent
   // (queue "226 Transfer complete" once a data channel closes), so the
   // handshake and window-filling machinery above is reused rather than
@@ -1143,7 +1143,7 @@ class EtherLinkIII {
       abortAfterBytes: ftp.dataAbortAfterBytes,
       stallAfterBytes: ftp.dataStallAfterBytes,
       onEstablished: (connection) => {
-        // Normally beaten to it by pushFtpDataIfReady() below, since RETR/LIST
+        // Normally beaten to it by pushFtpDataIfReady() below, since RETR/LIST/NLST
         // arrives on the control channel only after this data channel's own
         // handshake has already completed. Kept as a fallback for the
         // reverse ordering.
@@ -1173,8 +1173,9 @@ class EtherLinkIII {
   }
 
   resolveFtpFixture(pending, ftp) {
-    if (pending.verb === 'LIST') {
-      const listing = ftp.listing !== undefined ? ftp.listing : '';
+    if (pending.verb === 'LIST' || pending.verb === 'NLST') {
+      const listing = pending.verb === 'NLST' && ftp.nlstListing !== undefined
+        ? ftp.nlstListing : (ftp.listing !== undefined ? ftp.listing : '');
       return Buffer.isBuffer(listing) ? listing : Buffer.from(listing, 'latin1');
     }
     const fixtures = ftp.fixtures || {};
@@ -1190,7 +1191,7 @@ class EtherLinkIII {
     this.drainConnectionSendQueue(connection, connection.lastSegment, this.ftpControlOptions);
   }
 
-  // Once RETR/LIST is accepted, the data channel's handshake has already
+  // Once RETR/LIST/NLST is accepted, the data channel's handshake has already
   // completed (ftp.asm opens it, then optionally REST, before sending the
   // verb), so push straight into that connection's queue instead of waiting
   // for a triggering frame that will never come on an otherwise-idle
@@ -1260,10 +1261,11 @@ class EtherLinkIII {
         return `350 Restarting at ${arg}.\r\n`;
       case 'RETR':
       case 'STOR':
-      case 'LIST': {
+      case 'LIST':
+      case 'NLST': {
         const refusedNow = refused.has(verb) || (verb === 'RETR' && ftp.refuseRetr) ||
           (verb === 'STOR' && ftp.refuseStor) || (verb === 'LIST' && ftp.refuseList);
-        if (refusedNow) return '550 Failed.\r\n';
+        if (refusedNow) return (ftp.refuseReplies || {})[verb] || '550 Failed.\r\n';
         // Deferred to handleFtpControlData, once this "150" text is actually
         // queued: pushing the data-channel fixture from here can complete a
         // small transfer (and its "226") synchronously, before the caller
