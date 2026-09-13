@@ -568,6 +568,12 @@ CMP4
 	ENDIF	; UNET_DLL (PARSE_UDP_UNREACHABLE/CMP4 above)
 
 CHECK_CANCEL
+	IFDEF	UNET_DLL
+	; Same keys, same result contract as TCPX.CHECK_CANCEL, and in the DLL
+	; the same gate (SETOPT CANCELKEYS, default off): share it rather than
+	; carry a second copy inside the image's size budget.
+	JP	@TCPX.CHECK_CANCEL
+	ELSE
 	LD	C,DSS_SCANKEY
 	RST	DSS
 	JR	Z,.NO
@@ -591,6 +597,7 @@ CHECK_CANCEL
 	LD	A,NETDRV_ERR_CANCELLED
 	SCF
 	RET
+	ENDIF	; UNET_DLL (CHECK_CANCEL shared with TCPX)
 
 	ENDMODULE
 	ENDIF

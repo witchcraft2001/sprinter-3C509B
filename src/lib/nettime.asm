@@ -65,8 +65,19 @@ START
 	LD	(NETTIME_MS_PER_QUANTUM),HL
 	LD	HL,68			; > ceil(65535/1000)+2, monotonic limit stays primary
 	LD	(NETTIME_WALL_LIMIT),HL
+	; TICK consults the wall backstop only when the countdown crosses a
+	; multiple of NETTIME_WALL_EVERY, which a timeout of at most that many
+	; quanta never does -- so the reference read here would never be looked
+	; at. Skip it: READ_WALL is a DSS_SYSTIME (about 2 ms on a real
+	; Sprinter, see NETTIME_WALL_EVERY above), and it was the larger part
+	; of every one-quantum RECV poll a client makes with IY=0.
+	LD	HL,NETTIME_WALL_EVERY
+	OR	A
+	SBC	HL,BC			; CF=0: timeout <= WALL_EVERY quanta
+	JR	NC,.START_NO_WALL
 	CALL	READ_WALL
 	LD	(NETTIME_START_WALL),HL
+.START_NO_WALL
 	XOR	A
 	POP	IY,IX
 	RET
@@ -159,7 +170,6 @@ START
 ; A=EL3_ERR_RX_TIMEOUT/CF set when either monotonic or wall limit expires.
 TICK
 	PUSH	IX,IY
-	CALL	@S7APP.WAIT_TICK
 	LD	HL,(NETTIME_ELAPSED_MS)
 	LD	DE,(NETTIME_MS_PER_QUANTUM)
 	ADD	HL,DE
@@ -188,6 +198,12 @@ TICK
 	LD	A,H
 	OR	L
 	JR	Z,.EXPIRED
+	; Pace only a quantum that stays live: the last one expires the moment
+	; it is counted, and waiting first merely delayed that verdict by a
+	; millisecond. This turns a one-quantum RECV (UNET IY=0: "take what is
+	; there and return") into a pure card poll instead of a 1 ms stall on
+	; every idle call; every longer timeout simply ends one quantum early.
+	CALL	@S7APP.WAIT_TICK	; keeps HL
 	LD	A,L
 	AND	NETTIME_WALL_EVERY-1
 	JR	NZ,.LIVE		; between backstop checks

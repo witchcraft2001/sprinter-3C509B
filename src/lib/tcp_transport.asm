@@ -2791,6 +2791,18 @@ CHECK_CANCEL
 	XOR	A
 	RET
 	ELSE
+	IFDEF	UNET_DLL
+	; A library never grabs the keyboard uninvited: UNETAPI's SETOPT
+	; CANCELKEYS defaults to 0, and only a consumer that set it wants Esc
+	; polled here (UNETRTL gates its poll the same way). Polling
+	; unconditionally cost an interactive client every key it had not yet
+	; collected -- DSS_SCANKEY consumes, and a non-cancel key was simply
+	; dropped -- on every RECV/SEND wait iteration: SprinTalk lost about
+	; half of what was typed while connected through this DLL.
+	LD	A,(UNET_CANCEL_MODE)
+	OR	A
+	RET	Z			; A=0, CF=0: same as .NO_CANCEL
+	ENDIF
 	LD	C,DSS_SCANKEY
 	RST	DSS
 	JP	Z,.NO_CANCEL
