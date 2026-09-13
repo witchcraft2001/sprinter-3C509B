@@ -11,6 +11,7 @@ DSS		EQU 0x10
 ; number without going through DSS.
 BIOS		EQU 0x08
 BIOS_EMM_FN4	EQU 0xC4	; A=block_id, B=index -> A=phys page
+BIOS_EMM_FN5	EQU 0xC5	; A=block_id -> HL receives its physical-page list
 
 DSS_EXIT	EQU 0x41
 DSS_PUTCHAR	EQU 0x5B

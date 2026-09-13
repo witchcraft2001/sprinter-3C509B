@@ -2766,6 +2766,13 @@ FAIL_CONTEXT
 	RET
 
 CHECK_CANCEL
+	IFDEF	TCPX_DISABLE_CANCEL
+	; Interactive clients own the keyboard while their TCP operation is in
+	; flight.  In particular, an Esc transmitted to a BBS must not be treated
+	; as a local transport cancellation during SEND's ACK wait.
+	XOR	A
+	RET
+	ELSE
 	LD	C,DSS_SCANKEY
 	RST	DSS
 	JP	Z,.NO_CANCEL
@@ -2788,6 +2795,7 @@ CHECK_CANCEL
 	LD	A,NETDRV_ERR_CANCELLED
 	SCF
 	RET
+	ENDIF
 
 ; Four-byte sequence helpers use network byte order.
 COPY4

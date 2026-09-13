@@ -88,6 +88,59 @@ PYEOF
 }
 
 build_dll
+
+# TELNET.EXE is a Fido-style monolithic preloader container.  DSS loads only
+# the small loader; it streams WIN0, WIN1 and the modem overlay into freshly
+# allocated pages from the inherited EXE handle. No companion is shipped.
+build_telnet()
+{
+  local win0_path hot_path modem_path loader_path win0_size hot_size modem_size loader_size
+  win0_path="$build_dir/TELNET.WIN0"
+  hot_path="$build_dir/TELNET.HOT"
+  modem_path="$build_dir/TELNET.MODEM"
+  loader_path="$build_dir/TELNET.LOADER"
+
+  # Remove outputs from the former companion-file layout.  They are generated
+  # files only; retaining them after a rebuild would falsely suggest TELNET
+  # still needs a second disk file.
+  rm -f "$build_dir/TELMOD.BIN" "$build_dir/TELMOD.lst"
+
+  sjasmplus --nologo --fullpath --cleanonerror \
+    -I "$repo_root/src/include" \
+    -I "$repo_root/src/lib" \
+    -DTELNET_MONOBLOCK_HOT \
+    --lst="$build_dir/TELNET.lst" \
+    --raw="$hot_path" \
+    "$repo_root/src/apps/telnet.asm"
+  sjasmplus --nologo --fullpath --cleanonerror \
+    -I "$repo_root/src/include" \
+    -I "$repo_root/src/lib" \
+    --lst="$build_dir/TELWIN0.lst" \
+    --raw="$win0_path" \
+    "$repo_root/src/apps/telnet_win0.asm"
+  sjasmplus --nologo --fullpath --cleanonerror \
+    -I "$repo_root/src/include" \
+    -I "$repo_root/src/lib" \
+    --lst="$build_dir/TELMODEM.lst" \
+    --raw="$modem_path" \
+    "$repo_root/src/apps/telmodem.asm"
+  sjasmplus --nologo --fullpath --cleanonerror \
+    -I "$repo_root/src/include" \
+    -I "$repo_root/src/lib" \
+    --lst="$build_dir/TELNETL.lst" \
+    --raw="$loader_path" \
+    "$repo_root/src/apps/telnet_loader.asm"
+  python3 "$repo_root/tools/pack_telnet.py" "$build_dir/TELNET.EXE" \
+    "$loader_path" "$win0_path" "$hot_path" "$modem_path"
+  win0_size="$(wc -c < "$win0_path" | tr -d ' ')"
+  hot_size="$(wc -c < "$hot_path" | tr -d ' ')"
+  modem_size="$(wc -c < "$modem_path" | tr -d ' ')"
+  loader_size="$(wc -c < "$loader_path" | tr -d ' ')"
+  rm -f "$win0_path" "$hot_path" "$modem_path" "$loader_path"
+  echo "Built ${build_dir#$repo_root/}/TELNET.EXE (loader: $loader_size, win0: $win0_size, win1: $hot_size, cold: $modem_size bytes)"
+}
+
+build_telnet
 build_app hello HELLO
 build_app el3info EL3INFO
 build_app el3eep EL3EEP
