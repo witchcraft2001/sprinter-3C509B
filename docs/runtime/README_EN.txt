@@ -1,11 +1,12 @@
 ============================================================
-  Sprinter 3C509B Network Kit 0.1.1
+  Sprinter 3C509B Network Kit 0.1.2
   Network utilities for Sprinter DSS and a 3Com EtherLink
-  III 3C509B-TPO Ethernet card in an ISA slot
+  III 3C509B (TPO or TP) Ethernet card in an ISA slot
 ============================================================
 
 This package connects a Sprinter computer to an Ethernet network through a
-3Com EtherLink III 3C509B-TPO ISA card. It contains network setup tools,
+3Com EtherLink III 3C509B ISA card (the TPO and TP boards are supported; the
+TP's AUI connector is not used). It contains network setup tools,
 read-only card diagnostics, file-transfer clients, a network clock client,
 an ANSI Telnet client, and a loadable network library for other programs.
 

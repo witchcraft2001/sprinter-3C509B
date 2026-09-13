@@ -90,7 +90,7 @@ for my $entry ([UDPTEST => 0xBEE0], [TFTP => 0xBEE0]) {
             && unpack('v', substr($image, 20, 2)) == 0xBEF0;
     die "$name overlaps Stage 10 bootstrap stack reserve\n" if 0x8080 + length($image) > $limit;
     die "$name banner/version is missing\n"
-        unless index($image, "3C509B $name v0.1.1\0") >= 128;
+        unless index($image, "3C509B $name v0.1.2\0") >= 128;
     my $longest = 0;
     my $run = 0;
     for my $byte (unpack('C*', substr($image, 128))) {

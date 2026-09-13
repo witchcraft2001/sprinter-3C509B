@@ -41,7 +41,7 @@ check that rejected the card:
 
 | n | Check that failed              |
 |---|--------------------------------|
-| 1 | Product ID (expected `0x9550`) |
+| 1 | Product ID (expected `0x9550` or `0x9050`) |
 | 2 | 3Com manufacturer ID           |
 | 3 | MAC address                    |
 | 4 | Primary EEPROM checksum        |
@@ -49,6 +49,15 @@ check that rejected the card:
 
 An empty slot reads every word as `FFFF` and fails before this point, at
 discovery.
+
+Two product IDs are accepted: `0x9550` (a 3C509B-TPO, RJ-45 only) and `0x9050`
+(a 3C509B-TP, RJ-45 plus an unused AUI connector). The two boards share the
+EEPROM layout, the manufacturer ID, both checksum lanes and byte-identical
+media/config words `08`/`09`/`0D`; beyond the product ID their dumps differ
+only in per-unit data (MAC, date code, checksums). A product ID that is
+neither of these two verified values is still rejected as `FAIL=1`: this is a
+short allow-list built from real hardware, not a bitmask that would also
+accept unrelated boards.
 
 ## Examples
 

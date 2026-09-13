@@ -35,6 +35,26 @@ const cardScenario = () => ({
   eepromPatch: Object.fromEntries(CARD_WORDS.map((w, i) => [i, w])),
 });
 
+// A second physical card (3C509B-TP, slot 0, ID port 0110): product ID 0x9050
+// rather than the 0x9550 pinned above. Manufacturer ID and both checksum lanes
+// are built the same way and the media/config words 08/09/0D are identical to
+// the TPO card's; beyond word 03 the dumps differ only in per-unit data (MAC,
+// date code, checksums) -- see docs/EL3EEP.md.
+const CARD_WORDS_TP = [
+  0x0020, 0xAF4B, 0xAB97, 0x9050, 0xBE3D, 0x0041, 0x4741, 0x6D50,
+  0x0010, 0x3000, 0x0020, 0xAF4B, 0xAB97, 0x1310, 0x0000, 0x3923,
+  0x2083, 0x0000, 0x0000, 0x0004, 0x0001, 0x0000, 0x0000, 0x4505,
+  0x6D50, 0x9050, 0xAB97, 0xAF4B, 0x0ADF, 0x1010, 0x1982, 0x3300,
+  0x6F43, 0x206D, 0x4333, 0x3035, 0x4239, 0x4520, 0x6874, 0x7265,
+  0x694C, 0x6B6E, 0x4920, 0x4949, 0x5015, 0x506D, 0x0290, 0x411C,
+  0x80D0, 0x22F7, 0x9EA8, 0x0147, 0x0210, 0x03E0, 0x1010, 0x3C79,
+];
+const CARD_MAC_TP = [0x00, 0x20, 0xAF, 0x4B, 0xAB, 0x97];
+const tpCardScenario = () => ({
+  mac: CARD_MAC_TP,
+  eepromPatch: Object.fromEntries(CARD_WORDS_TP.map((w, i) => [i, w])),
+});
+
 function run(args, scenario = {}, program = exe) {
   const result = runExe(program, args, scenario);
   assert.deepStrictEqual(result.cleanup, {isaClosed: true, pagesFreed: true, done: true},
@@ -77,6 +97,37 @@ function dumpRows(result) { return lines(result).filter((l) => /^[0-9A-F]{2}: /.
   assert.match(result.output, /\[E2\] MAC=00:20:AF:5D:69:8B/);
   assert.match(result.output, /\[E5\] CHECKSUM=3223 SECONDARY=0205/);
   assert.match(result.output, /RESULT OK/);
+}
+
+// A second, distinct physical card: product ID 0x9050 rather than the 0x9550
+// pinned above must be accepted too, both at the raw EEPROM dump (EL3EEP) and
+// after activation, where EL3INFO's VERIFY_ACTIVE reads the Window 0
+// registers rather than the EEPROM directly.
+{
+  const result = run('-s 1 -p #110', tpCardScenario());
+  assert.strictEqual(result.exitCode, 0, 'a 0x9050 product ID card must validate');
+  const rows = dumpRows(result);
+  assert.strictEqual(rows[0], '00: 0020 AF4B AB97 9050 BE3D 0041 4741 6D50');
+  assert.match(result.output, /\[E2\] IDS MAC CHECKSUMS VALID/);
+}
+{
+  const result = run('-v -s 1 -p #110', tpCardScenario(), info);
+  assert.strictEqual(result.exitCode, 0);
+  assert.match(result.output, /\[E1\] PRODUCT=9050 IO=0300/);
+  assert.match(result.output, /\[E2\] MAC=00:20:AF:4B:AB:97/);
+  assert.match(result.output, /\[E5\] CHECKSUM=3923 SECONDARY=4505/);
+  assert.match(result.output, /RESULT OK/);
+}
+
+// A product ID that is neither pinned value is still rejected -- accepting
+// 0x9050/0x9550 is a two-entry allow-list from verified hardware, not a
+// bitmask that would also take unrelated boards.
+{
+  const result = run('-s 1 -p #110', {...tpCardScenario(),
+    eepromPatch: {...Object.fromEntries(CARD_WORDS_TP.map((w, i) => [i, w])), 3: 0x9150}});
+  assert.strictEqual(result.exitCode, 2);
+  assert.match(result.output, /\[E3\] FAIL=1 /);
+  assert.match(result.output, /RESULT FAIL code=3/);
 }
 
 // An empty slot: every word reads FF, and the first rejected check is the

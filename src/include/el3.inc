@@ -98,7 +98,15 @@ EL3_WAIT_QUANTA		EQU 100
 EL3_FIFO_WAIT_QUANTA	EQU 1000
 
 EL3_MFG_3COM		EQU 0x6D50
+; Both values are read from real cards (see docs/EL3EEP.md and
+; tools/test-stage3-exe.js). 0x9550 is a 1996 3C509B-TPO (RJ-45 only, ASIC
+; 40-0130-004); 0x9050 is a 1994 3C509B-TP (RJ-45 plus an unused AUI, ASIC
+; 40-0130-002). Same EEPROM layout, manufacturer ID and checksum lanes, and
+; the media/config words 08/09/0D are byte-identical: beyond the product ID
+; the two dumps differ only in per-unit data (MAC, date code, checksums).
+; Discovery accepts either; a card reporting neither is rejected.
 EL3_PRODUCT_3C509B_TPO	EQU 0x9550
+EL3_PRODUCT_3C509B_TP	EQU 0x9050
 
 EL3_OK			EQU 0
 EL3_ERR_USAGE		EQU 1

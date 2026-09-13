@@ -27,6 +27,8 @@
 ; netdrv.inc aliases one of its codes to el3.inc's, and el3.inc is hot-only
 ; (hardware); unet509b_cold.asm resolves it the same way, with a matching EQU.
 EL3_ERR_LINK_TIMEOUT	EQU 20
+EL3_ERR_NOT_FOUND	EQU 3		; EL3_VALIDATE: product/manufacturer/MAC
+EL3_ERR_CHECKSUM	EQU 5		; EL3_VALIDATE: a checksum lane
 
 	INCLUDE "coldctx.inc"
 	INCLUDE "unet.inc"		; NERR_* (frozen ABI constants)
@@ -1129,6 +1131,62 @@ TEST_START
 	EXPECT_C
 
 ; ------------------------------------------------------
+; EL3_VALIDATE (CFN_EL3_VALIDATE): HL=64-word EEPROM image (little-endian
+; words, as EEPROM_BUFFER holds it), DE=6-byte MAC destination. This is the
+; DLL's own rewrite of the hot VALIDATE -- NETINIT accepts or rejects the
+; card here -- and no vector executed it before these. Both physical dumps
+; must pass with the MAC in label order; a product ID that is neither
+; verified value must be refused before the checksums run; a corrupted
+; vital-lane word must still fail the secondary checksum.
+; ------------------------------------------------------
+	CASE	170			; 3C509B-TPO, product 9550, EA=0020AF5D698B
+	CALL	CLEAR_OUT
+	LD	HL,X_EEPROM_TPO
+	LD	DE,OUT_BUF
+	COLD	CFN_EL3_VALIDATE
+	EXPECT_NC
+	LD	HL,X_MAC_TPO
+	LD	B,6
+	CALL	EXPECT_BYTES
+
+	CASE	171			; 3C509B-TP, product 9050, EA=0020AF4BAB97
+	CALL	CLEAR_OUT
+	LD	HL,X_EEPROM_TP
+	LD	DE,OUT_BUF
+	COLD	CFN_EL3_VALIDATE
+	EXPECT_NC
+	LD	HL,X_MAC_TP
+	LD	B,6
+	CALL	EXPECT_BYTES
+
+	CASE	172			; product 9150: neither pinned value
+	LD	HL,X_EEPROM_TP
+	LD	DE,RXB
+	LD	BC,128
+	LDIR
+	LD	A,0x91			; high byte of word 03: 9050 -> 9150
+	LD	(RXB+7),A
+	LD	HL,RXB
+	LD	DE,OUT_BUF
+	COLD	CFN_EL3_VALIDATE
+	EXPECT_C
+	EXPECT_A EL3_ERR_NOT_FOUND
+
+	CASE	173			; word 18 is in the vital lane of word 17
+	LD	HL,X_EEPROM_TP
+	LD	DE,RXB
+	LD	BC,128
+	LDIR
+	LD	A,(RXB+0x18*2)
+	XOR	1
+	LD	(RXB+0x18*2),A
+	LD	HL,RXB
+	LD	DE,OUT_BUF
+	COLD	CFN_EL3_VALIDATE
+	EXPECT_C
+	EXPECT_A EL3_ERR_CHECKSUM
+
+; ------------------------------------------------------
 ; An out-of-range function code must be a no-op, not a wild jump.
 ; ------------------------------------------------------
 	CASE	90
@@ -1515,6 +1573,31 @@ T_HW_LOW	DB "0/#1F0",0
 T_HW_HIGH	DB "0/#3F0",0
 
 T_IP_HOST	DB "192.168.7.21",0
+; The two physical cards' EEPROMs as EL3EEP printed them (word n = Address(2n)
+; high byte, Address(2n+1) low byte), stored little-endian like EEPROM_BUFFER.
+; 3C509B-TPO, assembly 03-0020-002 rev 3, read 2026-09-08.
+X_EEPROM_TPO
+	DW 0x0020,0xAF5D,0x698B,0x9550,0xB434,0x0041,0x4A41,0x6D50
+	DW 0x0010,0x3000,0x0020,0xAF5D,0x698B,0x1310,0x0000,0x3223
+	DW 0x2083,0x0000,0x0000,0x0004,0x0001,0x0000,0x0000,0x0205
+	DW 0x6D50,0x9550,0x698B,0xAF5D,0x0A5B,0x1010,0x1982,0x3300
+	DW 0x6F43,0x206D,0x4333,0x3035,0x4239,0x4520,0x6874,0x7265
+	DW 0x694C,0x6B6E,0x4920,0x4949,0x5015,0x506D,0x0295,0x411C
+	DW 0x80D0,0x22F7,0x9EA8,0x0147,0x0210,0x03E0,0x1010,0x3779
+	DW 0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000
+X_MAC_TPO	DB 0x00,0x20,0xAF,0x5D,0x69,0x8B
+; 3C509B-TP, assembly 03-0021-201 rev A, read 2026-09-13.
+X_EEPROM_TP
+	DW 0x0020,0xAF4B,0xAB97,0x9050,0xBE3D,0x0041,0x4741,0x6D50
+	DW 0x0010,0x3000,0x0020,0xAF4B,0xAB97,0x1310,0x0000,0x3923
+	DW 0x2083,0x0000,0x0000,0x0004,0x0001,0x0000,0x0000,0x4505
+	DW 0x6D50,0x9050,0xAB97,0xAF4B,0x0ADF,0x1010,0x1982,0x3300
+	DW 0x6F43,0x206D,0x4333,0x3035,0x4239,0x4520,0x6874,0x7265
+	DW 0x694C,0x6B6E,0x4920,0x4949,0x5015,0x506D,0x0290,0x411C
+	DW 0x80D0,0x22F7,0x9EA8,0x0147,0x0210,0x03E0,0x1010,0x3C79
+	DW 0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000
+X_MAC_TP	DB 0x00,0x20,0xAF,0x4B,0xAB,0x97
+
 X_IP_HOST	DB 192,168,7,21
 T_IP_MASK	DB "255.255.255.0",0
 X_IP_MASK	DB 255,255,255,0

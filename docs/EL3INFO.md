@@ -1,6 +1,6 @@
 # EL3INFO.EXE
 
-`EL3INFO` performs bounded classic-ISA discovery of one 3Com 3C509B-TPO,
+`EL3INFO` performs bounded classic-ISA discovery of one 3Com 3C509B (TPO or TP),
 reads its EEPROM without modifying it, validates the IDs, MAC and checksums,
 and temporarily activates the operating register window. It is the first
 program to run on a new machine and the instrument to reach for whenever a
@@ -27,9 +27,10 @@ explicit `-b` changes only the current activation; it is never written to
 EEPROM, and nothing in this kit ever writes the EEPROM at all. The IRQ field
 is informational: Sprinter's ISA interrupt lines are not connected.
 
-Discovery accepts a card only when product ID `0x9550`, the 3Com manufacturer
-ID, a valid unicast MAC and both EEPROM checksums all agree, so a combo or AUI
-EtherLink III stops at the ID check rather than being half-configured.
+Discovery accepts a card only when the product ID is `0x9550` or `0x9050`
+(two verified boards; see `EL3EEP.TXT`), the 3Com manufacturer ID, a valid
+unicast MAC and both EEPROM checksums all agree, so an unrelated EtherLink III
+variant stops at the ID check rather than being half-configured.
 
 ## Examples
 

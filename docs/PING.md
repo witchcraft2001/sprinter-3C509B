@@ -24,7 +24,7 @@ PING /?
 ## Output
 
 ```text
-3C509B PING v0.1.1
+3C509B PING v0.1.2
 
 Pinging 192.168.7.1 with 32 bytes of data:
 Our IP=192.168.7.20

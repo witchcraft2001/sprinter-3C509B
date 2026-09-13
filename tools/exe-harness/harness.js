@@ -1405,8 +1405,13 @@ class EtherLinkIII {
     if (offset === 0x0e) return (this.window << 13);
     switch (this.window) {
       case 0:
-        if (offset === 0x00) return 0x6d50;
-        if (offset === 0x02) return 0x9550;
+        // Window 0 MFG_ID/PRODUCT_ID mirror EEPROM words 7/3 on real
+        // hardware, so a scenario's eepromPatch drives both the ID-sequence
+        // dump (EL3EEP) and the post-activation register check (EL3INFO's
+        // VERIFY_ACTIVE) consistently -- see docs/EL3EEP.md on the TP/TPO
+        // product-id difference.
+        if (offset === 0x00) return this.eeprom[7];
+        if (offset === 0x02) return this.eeprom[3];
         if (offset === 0x0a) return 0;
         if (offset === 0x0c) return 0;
         break;

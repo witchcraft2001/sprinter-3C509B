@@ -134,6 +134,47 @@ TEST_START
 	CP	EL3_ERR_CHECKSUM
 	JP	NZ,FAIL_27
 
+; The second physical card, a 3C509B-TP (assembly 03-0021-201 rev A, label
+; EA=0020AF4BAB97, slot 0 / ID port 0110), read by EL3EEP on 2026-09-13. Its
+; product ID is 9050, not 9550: the image must validate with the label MAC, a
+; third product ID must still be refused before the checksums run, and a
+; corrupted vital-lane word must still fail the secondary checksum.
+	LD	HL,EEPROM_CARD_TP
+	LD	DE,EEPROM_BUFFER
+	LD	BC,128
+	LDIR
+	CALL	@EL3ALG.VALIDATE
+	JP	C,FAIL_28
+	LD	HL,EL3_MAC
+	LD	DE,MAC_CARD_TP
+	LD	B,6
+.TP_MAC_LOOP
+	LD	A,(DE)
+	CP	(HL)
+	JP	NZ,FAIL_29
+	INC	DE
+	INC	HL
+	DJNZ	.TP_MAC_LOOP
+	LD	HL,EEPROM_BUFFER + 0x03*2 + 1
+	LD	A,(HL)
+	XOR	1			; 9050 -> 9150
+	LD	(HL),A
+	CALL	@EL3ALG.VALIDATE
+	JP	NC,FAIL_30
+	CP	EL3_ERR_NOT_FOUND
+	JP	NZ,FAIL_30
+	LD	A,(HL)
+	XOR	1
+	LD	(HL),A
+	LD	HL,EEPROM_BUFFER + 0x18*2
+	LD	A,(HL)
+	XOR	1
+	LD	(HL),A
+	CALL	@EL3ALG.VALIDATE
+	JP	NC,FAIL_31
+	CP	EL3_ERR_CHECKSUM
+	JP	NZ,FAIL_31
+
 ; EL3INFO minimum and maximum numeric boundaries.
 	LD	HL,CMD_INFO_MIN
 	LD	(CMDLINE_SOURCE),HL
@@ -217,7 +258,7 @@ TEST_START
 	LD	(TEST_COMPLETE),A
 	XOR	A
 	LD	(TEST_RESULT),A
-	JR	TEST_DONE
+	JP	TEST_DONE		; the FAIL_n chain below is past JR range
 
 FAIL_1:  LD A,1
 	JR FAIL
@@ -272,8 +313,21 @@ FAIL_25: LD A,25
 FAIL_26: LD A,26
 	JR FAIL
 FAIL_27: LD A,27
+	JR FAIL
+FAIL_28: LD A,28
+	JR FAIL
+FAIL_29: LD A,29
+	JR FAIL
+FAIL_30: LD A,30
+	JR FAIL
+FAIL_31: LD A,31
 FAIL
 	LD	(TEST_RESULT),A
+	; A failure reaches TEST_DONE too: the runner reads TEST_COMPLETE first,
+	; and without this mark every failing case was reported as "did not reach
+	; TEST_DONE" instead of by its number.
+	LD	A,0xA5
+	LD	(TEST_COMPLETE),A
 TEST_DONE
 	NOP
 
@@ -317,6 +371,20 @@ EEPROM_CARD
 	DW 0x80D0,0x22F7,0x9EA8,0x0147,0x0210,0x03E0,0x1010,0x3779
 	DW 0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000
 MAC_CARD	DB 0x00,0x20,0xAF,0x5D,0x69,0x8B
+
+; Physical 3C509B-TP, assembly 03-0021-201 rev A, label EA=0020AF4BAB97,
+; slot 0 / ID port 0110 on a real Sprinter. Read by EL3EEP on 2026-09-13.
+; Product ID 9050; media/config words 08/09/0D identical to EEPROM_CARD.
+EEPROM_CARD_TP
+	DW 0x0020,0xAF4B,0xAB97,0x9050,0xBE3D,0x0041,0x4741,0x6D50
+	DW 0x0010,0x3000,0x0020,0xAF4B,0xAB97,0x1310,0x0000,0x3923
+	DW 0x2083,0x0000,0x0000,0x0004,0x0001,0x0000,0x0000,0x4505
+	DW 0x6D50,0x9050,0xAB97,0xAF4B,0x0ADF,0x1010,0x1982,0x3300
+	DW 0x6F43,0x206D,0x4333,0x3035,0x4239,0x4520,0x6874,0x7265
+	DW 0x694C,0x6B6E,0x4920,0x4949,0x5015,0x506D,0x0290,0x411C
+	DW 0x80D0,0x22F7,0x9EA8,0x0147,0x0210,0x03E0,0x1010,0x3C79
+	DW 0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000
+MAC_CARD_TP	DB 0x00,0x20,0xAF,0x4B,0xAB,0x97
 
 	MACRO CMD name,text
 name

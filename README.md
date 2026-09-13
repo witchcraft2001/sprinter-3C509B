@@ -1,7 +1,7 @@
 # Sprinter 3C509B Network Kit
 
 A polling-only network stack and utility set for Sprinter DSS, targeting the
-3Com EtherLink III 3C509B-TPO in a Sprinter ISA slot. It doubles as a
+3Com EtherLink III 3C509B (TPO and TP boards) in a Sprinter ISA slot. It doubles as a
 development kit: the driver, the TCP transport and `UNET509B.DLL` are meant to
 be reused by other Sprinter DSS programs.
 
@@ -15,7 +15,7 @@ log. Repository conventions are in `CLAUDE.md` / `AGENTS.md`.
 
 ## Status
 
-Version 0.1.1. The release archive carries the end-user utilities:
+Version 0.1.2. The release archive carries the end-user utilities:
 
 - **Setup and diagnostics:** `EL3INFO` (read-only discovery), `NETCFG`
   (transactional `NET_*` environment), `IFUP` (static, DHCP acquire, renew and
@@ -41,26 +41,35 @@ step of every code change.
 
 ## Supported cards
 
-The driver is written against one specific board. Discovery reads the EEPROM
-through the ID port and then requires **all** of: product ID `0x9550`,
-3Com manufacturer ID `0x6D50`, a valid unicast MAC, and both EEPROM checksums.
-Only the TPO variant answers that, so only it is accepted today:
+The driver is written against the 3C509B EEPROM layout, not one single board.
+Discovery reads the EEPROM through the ID port and requires **all** of: a
+recognized product ID, the 3Com manufacturer ID `0x6D50`, a valid unicast MAC,
+and both EEPROM checksums. Two boards have answered that end to end:
 
 | Card | Product ID | Media | `NET.CFG` |
 |------|-----------|-------|-----------|
 | 3Com EtherLink III 3C509B-TPO | `0x9550` | RJ-45, 10BASE-T half duplex | none (`HW=AUTO`) |
+| 3Com EtherLink III 3C509B-TP  | `0x9050` | RJ-45, 10BASE-T half duplex (also populates a 15-pin AUI connector, unused) | none (`HW=AUTO`) |
 
-The card this kit is written for — 3C509B-TPO, 10 Mbps signalling rate, RJ-45
-only, FCC ID `DF63C509B-TPO`, with the Parallel Tasking ASIC `40-0130-004` in
-the middle of the board:
+The two boards' EEPROM images are otherwise built the same way and their
+media/config words (`08`/`09`/`0D`) agree: both ship configured for the TP
+transceiver, which is the only media path this driver implements (see below),
+so accepting the second product ID needed no change to `el3_regs.asm`.
+
+3C509B-TPO, 10 Mbps signalling rate, RJ-45 only, FCC ID `DF63C509B-TPO`, with
+the Parallel Tasking ASIC `40-0130-004` in the middle of the board — assembly
+`03-0020-002` rev 3, the one verified end to end on a real Sprinter, in
+physical slot 0 at ID port `#110`:
 
 ![3Com EtherLink III 3C509B-TPO ISA network card](docs/img/card-3c509b-tpo.jpg)
 
-The one verified end to end on a real Sprinter so far is assembly
-`03-0020-002` rev 3, in physical slot 0 at ID port
-`#110`.
+3C509B-TP, assembly `03-0021-201` rev A, FCC ID `DF63C509B`, with the same
+Parallel Tasking ASIC (`40-0130-002`), an RJ-45 jack and a populated 15-pin AUI
+D-sub below it, no BNC:
 
-Note the board carries a full 16-bit ISA edge connector while Sprinter's slot
+![3Com EtherLink III 3C509B-TP ISA network card](docs/img/card-3c509b-tp.jpg)
+
+Note both boards carry a full 16-bit ISA edge connector while Sprinter's slot
 drives only the first, 8-bit section. That is exactly how the kit is meant to
 run: every 16-bit card register is accessed as two adjacent byte cycles, low
 byte first, with no other card access allowed in between, and the FIFO is read
@@ -68,15 +77,18 @@ and written only through the low port.
 
 ### Other EtherLink III variants
 
-Combo and AUI boards (BNC or 15-pin connectors) are **not** supported. They
-report a different product ID, so discovery stops at the first check with
-`RESULT FAIL code=3` rather than misconfiguring a card it does not understand.
-Adding one means more than widening that comparison: the coax transceiver needs
-the Start Coax / Stop Coax commands and their settling delays, and media
-selection in Window 4 differs. The ID check lives in
-`src/lib/el3_algorithms.asm` (`VALIDATE`), the TPO media setup — link beat and
-jabber protection over Window 4 — in `src/lib/el3_regs.asm`, and
-`docs/STAGE1_AUDIT.md` records which commands are deliberately unimplemented.
+A board whose EEPROM reports neither `0x9550` nor `0x9050` is **not**
+supported: discovery stops at the first check with `RESULT FAIL code=3` rather
+than misconfiguring a card it does not understand. This includes a true Combo
+or BNC-only board even if its product ID happened to match one of the two
+above, because this driver never selects a transceiver: the coax transceiver
+needs the Start Coax / Stop Coax commands and their settling delays, and AUI
+needs its own Window 4 media selection, and neither is implemented here — only
+the TP media setup (link beat and jabber protection) is. A 3C509B-TP's unused
+AUI port is exactly this case: present in hardware, never driven. The ID check
+lives in `src/lib/el3_algorithms.asm` (`VALIDATE`), the TP media setup in
+`src/lib/el3_regs.asm`, and `docs/STAGE1_AUDIT.md` records which commands are
+deliberately unimplemented.
 
 Multiple 3Com cards in one ISA segment are also out of scope for version 1:
 the kit activates exactly one selected adapter.
