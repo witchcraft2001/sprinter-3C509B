@@ -59,7 +59,13 @@ for (const name of ['PING', 'PINGALT']) {
 for (const name of ['PING', 'PINGALT']) {
   for (const help of ['-h', '/H', '-?']) {
     const result = run(name, help, {cardPresent: false});
-    assert.strictEqual(result.exitCode, 0); assert.match(result.output, /Usage: PING/); checked(result);
+    assert.strictEqual(result.exitCode, 0);
+    // Sibling-style multi-line usage: a syntax line, a "PING /?" line, then
+    // one option per line with its default/range.
+    assert.match(result.output, new RegExp(`Usage:\\r?\\n\\s+${name} \\[-t\\]`));
+    assert.match(result.output, /-n count {2}number of echo requests \(default 4, max 65535\)\./);
+    assert.match(result.output, /-w ms {5}per-reply wait timeout \(default 1000 ms\)\./);
+    checked(result);
   }
   for (const bad of [
     '', '192.168.7.44 extra', '-n 0 192.168.7.44',
@@ -84,7 +90,15 @@ for (const name of ['PING', 'PINGALT']) {
 // Direct/static and routed/DHCP paths execute both independent EXEs.
 for (const name of ['PING', 'PINGALT']) {
   let result = run(name, '-n 1 192.168.7.44', direct());
-  assert.strictEqual(result.exitCode, 0); assert.match(result.output, /bytes=32 ttl=63 time~=/);
+  assert.strictEqual(result.exitCode, 0);
+  // Column order, the reply's own TTL, the header block and the closing
+  // statistics all follow the sibling RTL8019AS/Wi-Fi kits.
+  assert.match(result.output, /\nPinging 192\.168\.7\.44 with 32 bytes of data:\r?\n/);
+  assert.match(result.output, /\nOur IP=192\.168\.7\.20\r?\n/);
+  assert.match(result.output, /\nNext-hop MAC=02:00:00:00:00:2C\r?\n/);
+  assert.match(result.output, /bytes=32 time[<=]\d+ms TTL=63/);
+  assert.match(result.output, /\nPing statistics for 192\.168\.7\.44:\r?\n/);
+  assert.match(result.output, /\n {4}Packets: Sent = 1, Received = 1, Lost = 0\.\r?\n/);
   assert.strictEqual(result.transmittedFrames.length, 2); checked(result);
 
   result = run(name, '-n 1 -l 1 -i 255 203.0.113.10',
@@ -180,11 +194,35 @@ checked(result);
 // Partial loss succeeds; complete loss, remote unreachable and cancellation
 // use stable statuses and distinct DSS exit classes.
 result = run('PING', '-n 3 -w 1 192.168.7.44', direct({icmp: {mode: 'echo', drop: 1}}));
-assert.strictEqual(result.exitCode, 0); assert.strictEqual(result.transmittedFrames.length, 4); checked(result);
+assert.strictEqual(result.exitCode, 0); assert.strictEqual(result.transmittedFrames.length, 4);
+assert.match(result.output, /Packets: Sent = 3, Received = 2, Lost = 1\./); checked(result);
+
+// A reply that arrives after the first quantum reports a measured time; the
+// approximation counts poll quanta, so it only has to be non-zero and bounded.
+result = run('PING', '-n 1 192.168.7.44', direct({icmp: {mode: 'echo', delayPolls: 7}}));
+assert.strictEqual(result.exitCode, 0);
+const rtt = result.output.match(/time=(\d+)ms/);
+assert.ok(rtt && Number(rtt[1]) > 0 && Number(rtt[1]) <= 7, `unmeasured RTT: ${result.output}`);
+checked(result);
+
+// Arming a wait must not cost time proportional to its length. The conversion
+// used to run one loop iteration per millisecond of -w, so a four-second
+// timeout spent about a tenth of a second with the card unwatched between the
+// request and the first poll -- long enough to consume the whole round trip
+// and print the reply as "time<1ms". Cap the spread at one percent.
+{
+  const cheap = run('PING', '-n 1 -w 1 192.168.7.44', direct());
+  const dear = run('PING', '-n 1 -w 65535 192.168.7.44', direct());
+  assert.strictEqual(cheap.exitCode, 0); assert.strictEqual(dear.exitCode, 0);
+  assert.ok(dear.steps - cheap.steps < cheap.steps / 100,
+    `arming cost scales with -w: ${cheap.steps} -> ${dear.steps}`);
+  cases++;
+}
 
 for (const name of ['PING', 'PINGALT']) {
   result = run(name, '-n 1 -w 1 192.168.7.44', direct({icmp: {mode: 'drop'}}));
-  assert.strictEqual(result.exitCode, 3); assert.match(result.output, /\[E2\] TIMEOUT.*RESULT FAIL code=14/s); checked(result);
+  assert.strictEqual(result.exitCode, 3); assert.match(result.output, /\[E2\] TIMEOUT.*RESULT FAIL code=14/s);
+  assert.match(result.output, /Packets: Sent = 1, Received = 0, Lost = 1\./); checked(result);
 
   result = run(name, '-n 1 203.0.113.10', routed({icmp: {mode: 'unreachable'}}));
   assert.strictEqual(result.exitCode, 6); assert.match(result.output, /\[E3\] UNREACHABLE code=24.*RESULT FAIL code=24/s); checked(result);

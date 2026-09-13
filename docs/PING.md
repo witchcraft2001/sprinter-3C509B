@@ -21,12 +21,47 @@ PING /?
 `target` is a dotted IPv4 address or an ASCII hostname resolved through
 `NET_DNS1`/`NET_DNS2`. Flags accept `-` or `/` and are case-insensitive.
 
+## Output
+
+```text
+3C509B PING v0.1.1
+
+Pinging 192.168.7.1 with 32 bytes of data:
+Our IP=192.168.7.20
+Next-hop MAC=02:00:00:00:00:01
+Reply from 192.168.7.1: bytes=32 time=1ms TTL=63
+Reply from 192.168.7.1: bytes=32 time<1ms TTL=63
+Reply from 192.168.7.1: bytes=32 time=2ms TTL=63
+Reply from 192.168.7.1: bytes=32 time=1ms TTL=63
+
+Ping statistics for 192.168.7.1:
+    Packets: Sent = 4, Received = 4, Lost = 0.
+RESULT OK
+```
+
+`Next-hop MAC=` is the address the requests are really sent to: the peer
+itself on the local subnet, otherwise `NET_GW`. It separates a routing mistake
+from an unanswered echo.
+
+`time=` is the round trip measured with the same approximately 1 ms poll tick
+that drives the reply timeout, so its resolution is one millisecond and a
+reply that beats the first tick prints `time<1ms`. The figure can only err
+high: the receive loop charges a tick per drained non-matching frame, so
+heavy broadcast traffic inflates it rather than hiding a slow reply.
+
+`TTL=` is the TTL carried by the reply, which is what shows how many hops away
+the peer is. It is not the TTL of the request; `-i` sets that one.
+
+The statistics block closes every run, including one stopped with Esc or
+Ctrl+C. A request with no reply prints `[E2] TIMEOUT stage=ICMP` with the
+elapsed time, slot, base, controller status and target in place of its reply
+line, and counts as lost.
+
 ## Behaviour
 
 `-t` cannot be combined with `-n`. Duplicate flags and extra arguments are
 rejected before the card is accessed. Requests are spaced by approximately
-1000 ms. The displayed RTT is based on the fixed 21 MHz `CYCLES21` timebase
-used by Sprinter.
+1000 ms.
 
 Malformed packets, bad IPv4/ICMP checksums and unrelated replies are consumed
 and ignored without restarting the deadline. A finite run succeeds if at least

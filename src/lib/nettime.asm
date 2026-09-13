@@ -94,46 +94,18 @@ START
 	CALL	INIT
 	LD	(NETTIME_TIMEOUT_MS),BC
 	LD	HL,0
-	LD	(NETTIME_QUANTA_LEFT),HL
 	LD	(NETTIME_ELAPSED_MS),HL
-	LD	DE,0			; fractional qps/1000 accumulator
-.QUANTUM_MS
-	LD	HL,(NETTIME_QPS)
-	ADD	HL,DE
-	EX	DE,HL
-	LD	HL,DE
-	LD	DE,1000
-	OR	A
-	SBC	HL,DE
-	JR	C,.NO_WHOLE_QUANTUM
-	EX	DE,HL			; DE=remainder
-	LD	HL,(NETTIME_QUANTA_LEFT)
-	INC	HL
-	LD	(NETTIME_QUANTA_LEFT),HL
-	JR	.NEXT_MS
-.NO_WHOLE_QUANTUM
-	ADD	HL,DE			; restore pre-subtraction accumulator
-	EX	DE,HL
-.NEXT_MS
-	DEC	BC
-	LD	A,B
-	OR	C
-	JR	NZ,.QUANTUM_MS
-	LD	A,D
-	OR	E
-	JR	Z,.QUANTA_READY
-	LD	HL,(NETTIME_QUANTA_LEFT)
-	INC	HL
-	LD	(NETTIME_QUANTA_LEFT),HL
-.QUANTA_READY
-	LD	HL,(NETTIME_QUANTA_LEFT)
-	LD	A,H
-	OR	L
-	JR	NZ,.HAVE_QUANTA
-	INC	HL
-	LD	(NETTIME_QUANTA_LEFT),HL
-.HAVE_QUANTA
-	LD	(NETTIME_QUANTA_TOTAL),HL
+	; INIT fixes the base at one quantum per millisecond, so the old
+	; millisecond-by-millisecond accumulator loop could only ever return the
+	; timeout itself -- but it charged about 57 memory accesses for each
+	; millisecond of that timeout before the first poll ran. Arming a four
+	; second wait therefore burned roughly a tenth of a second with the card
+	; unwatched, long enough to swallow a whole WAN round trip and report it
+	; back as "time<1ms". The conversion is an assignment; keep it O(1).
+	ASSERT NETTIME_FIXED_QPS == 1000
+	ASSERT NETTIME_FIXED_MS == 1
+	LD	(NETTIME_QUANTA_LEFT),BC
+	LD	(NETTIME_QUANTA_TOTAL),BC
 	; ceil(timeout_ms/1000)+2 seconds for a stopped DSS wall clock.
 	LD	HL,(NETTIME_TIMEOUT_MS)
 	LD	BC,0

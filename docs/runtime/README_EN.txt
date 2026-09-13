@@ -66,6 +66,15 @@ GETTING STARTED
        NETCFG -c
        NETCFG -i
 
+   The number in `RESULT FAIL code=N` is a detailed diagnostic, not the
+   command's ERRORLEVEL. `NETCFG` with `code=3` has read NET.CFG but did not
+   accept a card at HW/IDPORT: run `EL3INFO -v`. `stage=E3 code=3` means its
+   EEPROM Product ID, manufacturer, or MAC was rejected; another stage means
+   no ID-sequence response. After that failure, `IFUP` and `PING` correctly
+   show `code=22` because NETCFG
+   did not publish the `NET_*` variables. The corresponding batch statuses
+   are ERRORLEVEL 2 and 4.
+
 6. Bring the interface up and verify connectivity:
 
        IFUP

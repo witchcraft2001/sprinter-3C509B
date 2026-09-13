@@ -72,15 +72,41 @@ NETCFG
 NETCFG -d
 ```
 
-## Exit codes
+## Failure and exit codes
 
-| Code | Meaning                                                    |
-|------|------------------------------------------------------------|
-| 0    | OK                                                         |
-| 1    | Usage error                                                |
-| 2    | 3C509B not detected                                        |
-| 4    | `NET.CFG` missing, malformed, oversized, or a key invalid  |
-| 5    | Environment could not be written                           |
+`RESULT FAIL code=N` is the detailed diagnostic code printed on screen. The
+process status (`ERRORLEVEL`, register `B` at `DSS_EXIT`) is a broader class;
+the two numbers are deliberately not the same.
+
+For example, `NETCFG -i` showing `RESULT FAIL code=3` has successfully read
+and parsed `NET.CFG`, but did not find an accepted 3C509B at the selected
+`HW`/`IDPORT`. Run `EL3INFO -v` before changing the configuration. A following
+`IFUP` or `PING` may then show `RESULT FAIL code=22`: `NETCFG` did not publish
+the required `NET_*` environment after the failed discovery.
+
+Common printed diagnostic codes are:
+
+| `RESULT FAIL code` | Meaning |
+|---:|---|
+| 3 | No accepted adapter: no ID-sequence response, or Product ID/manufacturer/MAC validation rejected the EEPROM. `EL3INFO` `stage=E3` means the latter. |
+| 4 | Controller timer expired during discovery |
+| 5 | EEPROM checksum validation failed |
+| 6 | Invalid or unusable I/O base |
+| 7 | Active controller-window verification failed |
+| 8 | ISA window state could not be established or restored |
+| 18 | DSS page allocation or release failed |
+| 21 | Invalid `NETCFG` command-line arguments |
+| 22 | `NET.CFG` missing, unreadable, malformed, oversized, or a key/value invalid |
+
+The `ERRORLEVEL` returned by `NETCFG` is:
+
+| `ERRORLEVEL` | Meaning |
+|---:|---|
+| 0 | OK |
+| 1 | Usage error |
+| 2 | Hardware/discovery failure |
+| 4 | Configuration failure |
+| 5 | DSS local-memory or environment-write failure |
 
 `-i` fails with 2 or 4 when it cannot obtain a MAC for `NET_MAC`. Nothing
 downstream works without it, so it reports the failure at that point instead

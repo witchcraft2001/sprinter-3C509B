@@ -19,8 +19,10 @@ All utilities follow a DOS / Windows convention:
 
 ## Exit codes
 
-Every network utility writes one of these values to `ERRORLEVEL` on exit
-(register `B` at `DSS_EXIT`). Batch scripts can branch on them:
+`RESULT FAIL code=N` on the console is a detailed driver/protocol diagnostic.
+It is not the process status. Every network utility writes one of the broader
+values below to `ERRORLEVEL` on exit (register `B` at `DSS_EXIT`), which is
+what batch scripts must branch on:
 
 | Code | Meaning                                                       |
 |------|---------------------------------------------------------------|
@@ -42,8 +44,12 @@ or ID not found, 4 timer timeout, 5 EEPROM checksum, 6 base, 7 active-window
 verification, 8 ISA window state. See `EL3INFO.TXT`.
 
 Each utility prints `RESULT OK` (`B=0`) or `RESULT FAIL code=N` (`B != 0`) as
-its last line, so visual inspection and machine-readable batch checks agree.
-Failure is never inferred from printed text alone.
+its last line. The printed code identifies the failed operation; `B` identifies
+its class. For example, `NETCFG` may print `code=3` (no accepted 3C509B) while
+returning `ERRORLEVEL 2`; `EL3INFO stage=E3 code=3` narrows it to an EEPROM
+Product ID, manufacturer, or MAC rejection. After that failed publication,
+`IFUP`/`PING` print `code=22` and return `ERRORLEVEL 4` until `NETCFG -i`
+succeeds.
 
 ## Cancelling a wait
 

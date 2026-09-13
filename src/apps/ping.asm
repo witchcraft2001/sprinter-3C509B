@@ -50,7 +50,7 @@ START
 	CP	EL3_CLI_HELP
 	JP	NZ,USAGE_FAIL
 	LD	HL,MSG_HELP
-	CALL	@CONSOLE.LINE
+	CALL	@CONSOLE.STRING		; MSG_HELP already ends in one CRLF
 	JP	SUCCESS
 .ARGS_OK
 	LD	HL,MSG_BANNER
@@ -71,13 +71,18 @@ START
 	JP	Z,CANCEL_FAIL
 	JP	NETWORK_FAIL
 .NAME_OK
+	CALL	PRINT_HEADER
 	CALL	RESOLVE_TARGET
 	JR	NC,.RESOLVED
 	CP	NETDRV_ERR_CANCELLED
 	JP	Z,CANCEL_FAIL
 	JP	NETWORK_FAIL
 .RESOLVED
+	CALL	PRINT_NEXT_HOP
 	CALL	PING_LOOP
+	PUSH	AF			; the statistics block closes every run
+	CALL	PRINT_STATISTICS
+	POP	AF
 	JP	NC,SUCCESS
 	CP	NETDRV_ERR_CANCELLED
 	JP	Z,CANCEL_FAIL
@@ -620,6 +625,43 @@ CMP4
 	DJNZ	.CMP_LOOP
 	RET
 
+; "Pinging <target> with <n> bytes of data:" and the local address, printed
+; once the target is known and before the next hop is resolved.
+PRINT_HEADER
+	LD	HL,@CONSOLE.CRLF
+	CALL	@CONSOLE.STRING
+	LD	HL,MSG_PINGING
+	CALL	@CONSOLE.STRING
+	LD	HL,NET_TARGET_IP
+	CALL	PRINT_IP
+	LD	HL,MSG_WITH
+	CALL	@CONSOLE.STRING
+	LD	HL,(PING_SIZE)
+	CALL	@CONSOLE.DEC16
+	LD	HL,MSG_BYTES_DATA
+	CALL	@CONSOLE.LINE
+	LD	HL,MSG_OUR_IP
+	CALL	@CONSOLE.STRING
+	LD	HL,NET_LOCAL_IP
+	CALL	PRINT_IP
+	LD	HL,@CONSOLE.CRLF
+	JP	@CONSOLE.STRING
+
+; NET_RESULT_MAC is the address every request is actually addressed to, so
+; printing it separates a routing mistake from an unanswered echo.
+PRINT_NEXT_HOP
+	LD	HL,MSG_NEXT_HOP
+	CALL	@CONSOLE.STRING
+	LD	HL,NET_RESULT_MAC
+	CALL	@CONSOLE.MAC
+	LD	HL,@CONSOLE.CRLF
+	JP	@CONSOLE.STRING
+
+; The reply line keeps the column order of the sibling kits:
+; "Reply from A.B.C.D: bytes=N time=Nms TTL=N". The time is the elapsed
+; millisecond count of the poll loop, so it is an approximation that errs
+; high under broadcast traffic rather than hiding a slow reply; TTL is the
+; one carried by the reply, not the requested -i value.
 PRINT_REPLY
 	LD	HL,MSG_REPLY
 	CALL	@CONSOLE.STRING
@@ -629,22 +671,55 @@ PRINT_REPLY
 	CALL	@CONSOLE.STRING
 	LD	HL,(PING_SIZE)
 	CALL	@CONSOLE.DEC16
-	LD	HL,MSG_TTL
-	CALL	@CONSOLE.STRING
-	LD	A,(IPV4_PARSE_DESC+IP4P_TTL)
-	CALL	@CONSOLE.DEC8
 	LD	HL,MSG_TIME
 	CALL	@CONSOLE.STRING
 	LD	HL,(NETTIME_ELAPSED_MS)
 	LD	A,H
 	OR	L
-	JR	NZ,.TIME_VALUE
-	LD	A,'<'
+	JR	NZ,.TIME_EXACT
+	LD	A,'<'			; the reply beat the first quantum
 	CALL	@CONSOLE.CHAR
-	LD	HL,1
+	INC	HL			; HL=1 -> "time<1ms"
+	JR	.TIME_VALUE
+.TIME_EXACT
+	LD	A,'='
+	CALL	@CONSOLE.CHAR
 .TIME_VALUE
 	CALL	@CONSOLE.DEC16
-	LD	HL,MSG_MS
+	LD	HL,MSG_MS_TTL
+	CALL	@CONSOLE.STRING
+	LD	A,(IPV4_PARSE_DESC+IP4P_TTL)
+	CALL	@CONSOLE.DEC8
+	LD	HL,@CONSOLE.CRLF
+	JP	@CONSOLE.STRING
+
+; Sent/received/lost for the whole run, printed for success, timeout and
+; cancellation alike so an interrupted -t run still reports its totals.
+PRINT_STATISTICS
+	LD	HL,@CONSOLE.CRLF
+	CALL	@CONSOLE.STRING
+	LD	HL,MSG_STATS
+	CALL	@CONSOLE.STRING
+	LD	HL,NET_TARGET_IP
+	CALL	PRINT_IP
+	LD	HL,MSG_COLON
+	CALL	@CONSOLE.LINE
+	LD	HL,MSG_PACKETS
+	CALL	@CONSOLE.STRING
+	LD	HL,(PING_SENT)
+	CALL	@CONSOLE.DEC16
+	LD	HL,MSG_RECEIVED
+	CALL	@CONSOLE.STRING
+	LD	HL,(PING_RECEIVED)
+	CALL	@CONSOLE.DEC16
+	LD	HL,MSG_LOST
+	CALL	@CONSOLE.STRING
+	LD	HL,(PING_SENT)
+	LD	DE,(PING_RECEIVED)
+	OR	A
+	SBC	HL,DE
+	CALL	@CONSOLE.DEC16
+	LD	HL,MSG_PERIOD
 	JP	@CONSOLE.LINE
 
 PRINT_ARP_TIMEOUT
@@ -701,7 +776,7 @@ SUCCESS
 	DSS_RETURN DSS_EXIT_OK
 USAGE_FAIL
 	LD	HL,MSG_HELP
-	CALL	@CONSOLE.LINE
+	CALL	@CONSOLE.STRING		; MSG_HELP already ends in one CRLF
 	LD	A,NETDRV_ERR_PARAMETER
 	LD	B,DSS_EXIT_ARGUMENT
 	JR	FAIL
@@ -753,16 +828,44 @@ BOOT_FAIL
 
 	IFDEF PING_ALT_BUILD
 MSG_BANNER	DB "3C509B PINGALT v",PACKAGE_VERSION,0
-MSG_HELP	DB "Usage: PINGALT [-t] [-n count] [-l size] [-i ttl] [-w ms] target",0
+MSG_HELP
+	DB "Usage:",13,10
+	DB "  PINGALT [-t] [-n count] [-l size] [-i TTL] [-w ms] target",13,10
+	DB "  PINGALT /?",13,10,13,10
+	DB "  -t        ping until interrupted (Esc/Ctrl+C).",13,10
+	DB "  -n count  number of echo requests (default 4, max 65535).",13,10
+	DB "  -l size   payload size in bytes (default 32, max 1472).",13,10
+	DB "  -i TTL    IP TTL on outgoing requests (default 64).",13,10
+	DB "  -w ms     per-reply wait timeout (default 1000 ms).",13,10
+	DB "  target    destination IPv4 or hostname (e.g. 192.168.7.1).",13,10,0
 	ELSE
 MSG_BANNER	DB "3C509B PING v",PACKAGE_VERSION,0
-MSG_HELP	DB "Usage: PING [-t] [-n count] [-l size] [-i ttl] [-w ms] target",0
+MSG_HELP
+	DB "Usage:",13,10
+	DB "  PING [-t] [-n count] [-l size] [-i TTL] [-w ms] target",13,10
+	DB "  PING /?",13,10,13,10
+	DB "  -t        ping until interrupted (Esc/Ctrl+C).",13,10
+	DB "  -n count  number of echo requests (default 4, max 65535).",13,10
+	DB "  -l size   payload size in bytes (default 32, max 1472).",13,10
+	DB "  -i TTL    IP TTL on outgoing requests (default 64).",13,10
+	DB "  -w ms     per-reply wait timeout (default 1000 ms).",13,10
+	DB "  target    destination IPv4 or hostname (e.g. 192.168.7.1).",13,10,0
 	ENDIF
+MSG_PINGING	DB "Pinging ",0
+MSG_WITH	DB " with ",0
+MSG_BYTES_DATA	DB " bytes of data:",0
+MSG_OUR_IP	DB "Our IP=",0
+MSG_NEXT_HOP	DB "Next-hop MAC=",0
 MSG_REPLY	DB "Reply from ",0
 MSG_BYTES	DB ": bytes=",0
-MSG_TTL		DB " ttl=",0
-MSG_TIME	DB " time~=",0
-MSG_MS		DB "ms",0
+MSG_TIME	DB " time",0
+MSG_MS_TTL	DB "ms TTL=",0
+MSG_STATS	DB "Ping statistics for ",0
+MSG_COLON	DB ":",0
+MSG_PACKETS	DB "    Packets: Sent = ",0
+MSG_RECEIVED	DB ", Received = ",0
+MSG_LOST	DB ", Lost = ",0
+MSG_PERIOD	DB ".",0
 MSG_ARP_TIMEOUT DB "[E1] TIMEOUT stage=ARP elapsed_ms=2000",0
 MSG_ICMP_TIMEOUT DB "[E2] TIMEOUT stage=ICMP elapsed_ms=",0
 MSG_UNREACHABLE DB "[E3] UNREACHABLE code=24",0
