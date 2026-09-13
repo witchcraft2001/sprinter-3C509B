@@ -1422,7 +1422,7 @@ TERM_CHAR
 	CP	CR
 	JR	Z,.CR
 	CP	LF
-	JR	Z,TERM_LF
+	JR	Z,.LF
 	CP	0x08
 	JR	Z,.BS
 	CP	0x09
@@ -1432,6 +1432,13 @@ TERM_CHAR
 	XOR	A
 	LD	(CUR_COL),A
 	RET
+.LF
+	; A Unix PTY can emit bare LF after Telnet BINARY is negotiated. Treat it
+	; as a display newline so the next line starts in column zero. An ordinary
+	; CR/LF pair remains unchanged because the second reset is idempotent.
+	XOR	A
+	LD	(CUR_COL),A
+	JP	TERM_LF
 .BS
 	LD	A,(CUR_COL)
 	OR	A

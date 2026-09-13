@@ -36,6 +36,8 @@ die "TELNET does not assemble a preloaded WIN1 payload\n"
 die "TELNET BSS does not assert the cold-page ABI\n"
     unless $telnet =~ /ASSERT\s+CANCELLED\s*==\s*TELMODEM_CANCELLED/
         && $telnet =~ /TRANSFER_BSS_END\s+EQU\s+TELMODEM_BSS_END/;
+die "TELNET screen renderer does not normalize a bare LF to a new line\n"
+    unless $telnet =~ /TERM_CHAR.*?CP\s+LF\s*\n\s*JR\s+Z,\.LF.*?\.LF\s*\n.*?XOR\s+A\s*\n\s*LD\s+\(CUR_COL\),A\s*\n\s*JP\s+TERM_LF/s;
 
 die "cold modem page lacks its fixed dispatcher at 0x0180\n"
     unless $cold =~ /MODEM_ENTRY\s*\n\s*CP\s+TELMODEM_FN_Z_RECEIVE/;
