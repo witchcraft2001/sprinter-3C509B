@@ -5,10 +5,19 @@ I/O. Both discard the response body into a 6 KiB application buffer, report
 the exact body byte count, elapsed whole RTC seconds and KB/s, and ship only in
 the FAT12 diagnostic IMG.
 
+## Usage
+
 ```text
 DLDIRECT http://host[:port]/path
 DLSPEED  http://host[:port]/path
+DLDIRECT /?
+DLSPEED /?
 ```
+
+Both take a single plain-HTTP URL and no options. Run `NETCFG -i` and `IFUP`
+first.
+
+## The two paths
 
 `DLDIRECT.EXE` is the optimized native path: 3C509B polling driver, TCPX and
 direct delivery into the application buffer. It keeps `FAST_DATAPATH`,
@@ -89,9 +98,9 @@ The shared streaming parser applies the same rules to both programs regardless
 of how TCP divides the headers or body:
 
 - only a syntactically valid HTTP/1.x `2xx` response is accepted;
-- `Content-Length` is matched case-insensitively, must fit in 32 bits, and ends the measurement at
-  exactly the declared number of body bytes, even if the server keeps the
-  connection open;
+- `Content-Length` is matched case-insensitively, must fit in 32 bits, and
+  ends the measurement at exactly the declared number of body bytes, even if
+  the server keeps the connection open;
 - a response without `Content-Length` is accepted as HTTP/1.0 close-delimited
   framing and completes only when the peer closes;
 - closing before a declared length is a truncated-transfer error;
@@ -152,6 +161,16 @@ Repeat the same two-image comparison on the real Sprinter after read-only
 discovery. Record card, slot, base, MAC, rates, console logs and pcap; do not
 infer hardware acceptance from the MAME medians.
 
-Exit classes are 0 success, 1 arguments, 2 hardware/DLL/RTC, 3 network or
-timeout, 4 configuration, 6 HTTP/server error or too-short sample, and 7
-cancellation.
+## Exit codes
+
+| Code | Meaning                                                    |
+|------|------------------------------------------------------------|
+| 0    | OK                                                         |
+| 1    | Usage error                                                |
+| 2    | Hardware, DLL load, or RTC failure                         |
+| 3    | Network or timeout error                                   |
+| 4    | `NET_*` environment missing or invalid; run `NETCFG -i`    |
+| 6    | HTTP/server error, or a sample too short to time           |
+| 7    | Cancelled by the user                                      |
+
+Every run ends with `RESULT OK` or `RESULT FAIL code=N`.

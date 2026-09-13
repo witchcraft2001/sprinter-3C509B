@@ -1,8 +1,9 @@
 # Быстрый старт Sprinter 3C509B Network Kit
 
-Версия 0.0.1 включает локальную реализацию этапов до Stage 10: polling-only
-`NETDRV`, DHCP, ARP, PING, DNS, NTP и TFTP. Read-only диагностики `EL3INFO`,
-`EL3EEP` и `ISAPROBE` сохранены; EEPROM writes и IRQ routing отсутствуют.
+Версия 0.1.1 включает локальную реализацию этапов до Stage 14: polling-only
+`NETDRV`, DHCP, ARP, PING, DNS, NTP, TFTP, WGET, FTP и загружаемую библиотеку
+`UNET509B.DLL`. Read-only диагностики `EL3INFO`, `EL3EEP` и `ISAPROBE`
+сохранены; EEPROM writes и IRQ routing отсутствуют.
 
 ## Сборка на хосте
 
@@ -25,7 +26,7 @@ EL3INFO -s 1 -p #110 -b AUTO
 Ожидаемый вывод:
 
 ```text
-3C509B EL3INFO v0.0.1
+3C509B EL3INFO v0.1.1
 [E0] SLOT=1 IDPORT=0110
 [E1] PRODUCT=9550 IO=0300
 [E2] MAC=...

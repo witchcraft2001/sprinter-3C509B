@@ -90,7 +90,7 @@ for my $name (qw(EL3TX EL3RX)) {
             && unpack('v', substr($image, 20, 2)) == 0xBFF0;
     die "$name crosses 0xC000\n" if 0x8080 + length($image) > 0xC000;
     die "$name banner/version is missing\n"
-        unless index($image, "3C509B $name v0.0.1\0") >= 128;
+        unless index($image, "3C509B $name v0.1.1\0") >= 128;
 }
 
 my $artifacts = slurp('tools/artifacts.sh', 0);

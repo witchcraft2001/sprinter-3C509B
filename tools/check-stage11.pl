@@ -97,7 +97,7 @@ die "TCPTEST header is invalid\n"
 die "TCPTEST overlaps bootstrap stack reserve\n"
     if 0x8080 + length($image) > 0xBEE0;
 die "TCPTEST banner/version is missing\n"
-    unless index($image, "3C509B TCPTEST v0.0.1\0") >= 128;
+    unless index($image, "3C509B TCPTEST v0.1.1\0") >= 128;
 my ($longest, $run) = (0, 0);
 for my $byte (unpack('C*', substr($image, 128))) {
     $run = $byte ? 0 : $run + 1;

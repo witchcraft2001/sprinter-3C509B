@@ -100,7 +100,7 @@ for my $name (qw(NETCFG IFUP ARP)) {
             && unpack('v', substr($image, 20, 2)) == ($name eq 'IFUP' ? 0xBEF0 : 0xBFF0);
     die "$name crosses 0xC000\n" if 0x8080 + length($image) > 0xC000;
     die "$name banner/version is missing\n"
-        unless index($image, "3C509B $name v0.0.1\0") >= 128;
+        unless index($image, "3C509B $name v0.1.1\0") >= 128;
 }
 
 my $local = slurp('src/include/unet.inc', 1);

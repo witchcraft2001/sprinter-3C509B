@@ -1,33 +1,263 @@
-# Safe hardware setup
+# Sprinter 3C509B Network Kit -- HOWTO
 
-Before using a real Sprinter, record the card label, physical slot, ID port and
-base. Begin with read-only `EL3INFO`; do not blind-scan ISA space. EEPROM is
-never written and the IRQ shown by diagnostics is not connected or used.
+Conventions, configuration, exit codes and batch examples shared across every
+utility in the kit. Per-utility command details live in the matching
+`<NAME>.TXT` document; `USAGE.TXT` is the index.
 
-Place `NET.CFG` beside `NETCFG.EXE`. For DHCP use `IP=DHCP`; for static mode set
-`IP`, `NETMASK`, and optionally `GATEWAY`, `DNS1`, and `DNS2`. Run
-`NETCFG -i -v`, then `IFUP`. `CONNECT.BAT` performs the non-verbose two-command
-sequence after the configuration has been reviewed.
+## Command-line flags
+
+All utilities follow a DOS / Windows convention:
+
+- Flags are single ASCII characters with either prefix: `-x` and `/x` are
+  equivalent. Letter case is not significant.
+- A flag that takes a value reads the *next* token: `-n 5`, not `-n5` or
+  `-n=5`.
+- Long flags (`--xxx`) are NOT supported.
+- Help is requested with `/?`, `-?`, or `-h` (any of these).
+- Hexadecimal arguments (an I/O base, an ID port) are written with a leading
+  `#`: `#0300`, `#110`. A `0x` prefix is not accepted.
+
+## Exit codes
+
+Every network utility writes one of these values to `ERRORLEVEL` on exit
+(register `B` at `DSS_EXIT`). Batch scripts can branch on them:
+
+| Code | Meaning                                                       |
+|------|---------------------------------------------------------------|
+| 0    | OK                                                            |
+| 1    | Usage error (unknown / missing / malformed argument)          |
+| 2    | 3C509B not detected at the configured slot / I/O base         |
+| 3    | Network unreachable (ARP / TCP connect / RX timeout, no link, |
+|      | DNS resolution failure)                                       |
+| 4    | Configuration error (`NET.CFG` missing, or `NET_*` env var    |
+|      | not set -- run `NETCFG -i` first)                             |
+| 5    | Local file create / write / close / delete failure            |
+| 6    | Server-side rejection (HTTP 4xx/5xx, FTP non-2xx incl. 550,   |
+|      | TFTP OP_ERROR, redirect failure, ICMP unreachable)            |
+| 7    | Cancelled by user (Esc / Ctrl+C)                              |
+
+`EL3INFO` is the one exception. As the discovery tool it reports which stage
+of discovery failed instead of a class: 1 usage, 2 invalid parameter, 3 card
+or ID not found, 4 timer timeout, 5 EEPROM checksum, 6 base, 7 active-window
+verification, 8 ISA window state. See `EL3INFO.TXT`.
+
+Each utility prints `RESULT OK` (`B=0`) or `RESULT FAIL code=N` (`B != 0`) as
+its last line, so visual inspection and machine-readable batch checks agree.
+Failure is never inferred from printed text alone.
+
+## Cancelling a wait
+
+Utilities that wait for the network respond to **Esc** and **Ctrl+C** while
+polling for replies, and return `B=7`. `TELNET` is the exception: it forwards
+Esc to the remote host (or to an active Z/Ymodem transfer) and closes the
+session with **Alt+X**.
+
+Every wait in the kit is bounded. The driver is polling-only -- Sprinter's ISA
+interrupt lines are not connected -- so each loop carries a finite timeout and
+returns an explicit status code when it expires. A timeout or an unexpected
+card status closes the ISA window, releases the mapped DSS page, prints
+`RESULT FAIL`, and returns control to DSS. Timeout diagnostics include the
+stage, elapsed ticks, selected slot/base, controller status and, where it
+applies, the target.
+
+## Hostnames vs IPv4 literals
+
+Utilities that take a destination (`PING`, `TFTP`, `NTP`, `WGET`, `FTP`,
+`TELNET`, and the IMG-only `UDPTEST`) accept either a dotted-decimal IPv4
+address or a DNS hostname. When a hostname is supplied, the utility issues a
+DNS A-record query to `NET_DNS1` before the actual operation. If `NET_DNS1` is
+unset, the utility reports a configuration error -- pass an IPv4 literal or
+run `NETCFG -i` / `IFUP` first.
+
+For *off-subnet* destinations (anything outside `NET_IP & NET_MASK`) the
+utility ARPs `NET_GW` instead of the target itself; without a valid `NET_GW`
+the operation fails before any frame is sent.
+
+`NSLOOKUP` is a separate utility for explicit DNS testing; the inline resolver
+in the other utilities uses the same library.
+
+## Output paths (`-o`)
+
+Utilities that transfer files (`WGET`, `FTP`, `TFTP`) accept an output
+filename that may include a directory part. The default (when `-o` is omitted)
+is the *basename* of the source -- `WGET http://host/pub/foo.zip` saves as
+`foo.zip`, `FTP host pub/foo.zip` saves as `foo.zip`. An empty basename
+becomes `OUTPUT.BIN`. Override with `-o`:
+
+| Form                  | Effect                          |
+|-----------------------|---------------------------------|
+| `file.zip`            | save in current working dir     |
+| `test\file.zip`       | save into existing `test\` dir  |
+| `\file.zip`           | save in volume root             |
+| `C:\foo\bar\file.zip` | absolute path, drive included   |
+
+The kit splits the path at the last `/` or `\` (both accepted), CHDIRs into
+the directory for the duration of the file create, then restores the previous
+working directory before returning. The whole path is bounded to 95 bytes. A
+non-existent directory is a local file error (`B=5`); the kit does NOT
+auto-create intermediate directories.
+
+If the output file already exists, `WGET` and `FTP` ask whether to Overwrite,
+Resume or Cancel, and `TFTP` asks `Y/N`. `-y` or `-f` answers the prompt in
+advance; `-r` (`WGET`, `FTP` download) resumes silently and takes precedence
+over the overwrite flags. An interrupted or failed download keeps what was
+already written, so a later `-r` run can continue it.
+
+## Configuration
+
+The kit relies on DSS environment variables published by `NETCFG -i` from
+`NET.CFG`:
+
+| Variable        | Source / role                                        |
+|-----------------|------------------------------------------------------|
+| `NET`           | Backend selector, always `509B` for this kit          |
+| `NET_HW`        | Slot and I/O base the card was actually found at,     |
+|                 | `S/#HHH` form (e.g. `0/#300`) -- not a copy of the    |
+|                 | `HW=` key: `HW=AUTO` publishes what the probe found   |
+| `NET_IDPORT`    | ISA ID port used for discovery (`#100..#1F0`)         |
+| `NET_MAC`       | Local MAC (always populated by `NETCFG -i`)           |
+| `NET_IP_SRC`    | `STATIC` or `DHCP` (selects how IFUP runs)            |
+| `NET_IP`        | Local IPv4 (set by `NETCFG -i` for STATIC, by `IFUP`  |
+|                 | for DHCP)                                             |
+| `NET_MASK`      | Subnet mask                                           |
+| `NET_GW`        | Default gateway                                       |
+| `NET_DNS1/2`    | DNS servers                                           |
+| `NET_NTP`       | Default NTP server                                    |
+| `NET_TZ`        | Timezone offset, quarter-hour resolution              |
+| `NET_DHCP_SRV`  | DHCP server that issued the lease (DHCP only)         |
+| `NET_LEASE_SEC` | Remaining lease seconds (DHCP only)                   |
+
+`NET.CFG` keys recognised by the parser:
+
+```text
+NET=509B                  backend selector; must be 509B
+HW=AUTO                   let discovery locate the card, or pin it as
+HW=0/#300                 <slot>/#<base>; slot is 0 or 1, base
+                          #200..#3E0 on a 16-byte boundary
+IDPORT=#110               ISA ID port, #100..#1F0 on a 16-byte boundary
+MAC=                      optional MAC override; empty uses the EEPROM
+                          address.  An override applies to the current
+                          session only and is never written to the card
+IP=192.168.7.5            IPv4 literal -> static config
+IP=DHCP                   request a DHCP lease from IFUP
+NETMASK=255.255.255.0     required for a static IP, ignored when IP=DHCP
+GATEWAY=192.168.7.1       ignored when IP=DHCP
+DNS1=1.1.1.1              ignored when IP=DHCP
+DNS2=8.8.8.8              ignored when IP=DHCP
+NTP=pool.ntp.org          for NTP.EXE
+TZ=+5:45                  [+|-]H, HH, H:MM or HH:MM; minutes are 00, 15,
+                          30 or 45; range -12:00..+14:00; empty is UTC
+```
+
+Lines starting with `#` are comments. Unknown or repeated keys raise a
+warning; the last value of a repeated key wins. A malformed or oversized
+file, a card error, or an environment error leaves the previous environment
+intact.
+
+There is deliberately no IRQ key. The IRQ field printed by the diagnostics is
+read out of the card's EEPROM for information only; Sprinter never uses it.
+
+`NETCFG -i` sets `NET_IP_SRC` to `STATIC` or `DHCP` from the `IP=` line. In
+DHCP mode it clears any stale `NET_IP / NET_MASK / NET_GW / NET_DNS1 /
+NET_DNS2 / NET_DHCP_SRV / NET_LEASE_SEC` so a previous lease does not linger;
+`IFUP` then populates them from the DHCP reply. `NETCFG -i` itself fails
+(2 / 3 / 4) when it cannot obtain a MAC for `NET_MAC` -- nothing downstream
+works without it, and it says so at the point of failure. `NETCFG.EXE` is the
+only utility in the kit that opens `NET.CFG`; every other program reads the
+environment.
+
+Bring-up sequence (typical `AUTOEXEC.BAT`):
+
+```text
+NETCFG -i
+IF ERRORLEVEL 4 GOTO NOCFG
+IFUP
+IF ERRORLEVEL 3 GOTO NOLINK
+```
+
+Without `NETCFG -i` the network utilities exit `B=4` with a diagnostic. `IFUP`
+picks STATIC vs DHCP from `NET_IP_SRC`; `IFUP -r` renews the active lease
+without discarding it on timeout, and `IFUP -d` sends a best-effort RELEASE
+and clears the dynamic fields.
+
+## Safe hardware setup
+
+Before using a real Sprinter, record the card label, physical slot, ID port
+and base. Begin with read-only `EL3INFO`; do not blind-scan ISA space, and do
+not use `ISAPROBE` (developer image) without an explicitly identified range --
+reads of unknown hardware can have side effects. EEPROM is never written by
+anything in this kit.
+
+Place `NET.CFG` beside `NETCFG.EXE`. Run `NETCFG -c` to check the file
+without touching the card, then `NETCFG -i` to validate against the card and
+publish, then `IFUP`. `CONNECT.BAT` runs the non-verbose `NETCFG -I` + `IFUP`
+pair once the configuration has been reviewed.
 
 After `IFUP` reports success, verify IPv4 routing with `PING 192.168.7.1` or
-another address. Use `NSLOOKUP name` to verify DNS, and then the same hostname
-with PING, UDPTEST, or TFTP. `PING -t target` runs until Esc or Ctrl-C.
+another address on your LAN. Use `NSLOOKUP name` to verify DNS, then the same
+hostname with `PING`, `WGET` or `TFTP`. `PING -t target` runs until Esc or
+Ctrl-C. Use `NTP` to query `NET_NTP`, apply `NET_TZ`, and set the DSS clock;
+timezone examples are `+5:45`, `+9:30`, `+12:45`, and `-3:30`.
 
-For DHCP, `IFUP -r` renews the current lease without discarding it on timeout;
-`IFUP -d` sends a best-effort RELEASE and clears the dynamic fields. Use `NTP`
-to query `NET_NTP`, apply `NET_TZ`, and set the DSS clock. Timezone examples
-are `+5:45`, `+9:30`, `+12:45`, and `-3:30`.
+## Batch examples
 
-For TFTP, use `TFTP host GET remote` or `TFTP host PUT local`. Add
-`:port` for a nonstandard request port and `-o name` to select the other file
-name. GET asks before replacing an existing local file; `-y` or `-f` permits
-replacement without the prompt. Interrupted or failed GET files are retained
-as partial data so they can be inspected.
+A typical `AUTOEXEC.BAT` fragment to bring the network up:
 
-For plain HTTP, use `WGET http://host/path`. Add `-o name` to choose the local
-file, `-y` or `-f` to overwrite without prompting, `-r` to resume through a
-Range/206 exchange, or `-d` for dot progress. HTTPS redirects are rejected.
-Timeout and cancellation retain the partial file for a later resume.
+```text
+NETCFG -i
+IF ERRORLEVEL 4 GOTO NOCFG
+IFUP
+IF ERRORLEVEL 3 GOTO NOLINK
+PING -n 1 192.168.7.1
+IF ERRORLEVEL 3 GOTO NOLINK
+ECHO Network up.
+GOTO END
+:NOCFG
+ECHO NET.CFG missing or invalid; copy NETSMPL.CFG to NET.CFG.
+GOTO END
+:NOLINK
+ECHO Gateway unreachable.
+:END
+```
 
-If a timeout or unexpected status occurs, stop. The program closes the ISA
-window, releases its DSS page, prints `RESULT FAIL`, and returns control to DSS.
+Polling a service before continuing:
+
+```text
+:WAIT
+PING -n 1 192.168.7.1
+IF ERRORLEVEL 3 GOTO WAIT
+ECHO Gateway is up.
+```
+
+Conditional download:
+
+```text
+TFTP 192.168.7.1 GET BOOT.BIN
+IF ERRORLEVEL 1 ECHO Download failed
+```
+
+HTTP fetch with overwrite and a status-aware exit:
+
+```text
+WGET http://192.168.7.1/BOOT.BIN -y
+IF ERRORLEVEL 3 ECHO HTTP error -- check the [E] line above
+IF ERRORLEVEL 1 GOTO HFAIL
+ECHO Download OK.
+GOTO :EOF
+:HFAIL
+ECHO Download failed.
+```
+
+Listing a remote FTP directory before pulling a specific file:
+
+```text
+FTP server.lan -l -u alice -p secret
+FTP server.lan target.zip -u alice -p secret -y
+```
+
+Resuming an interrupted download:
+
+```text
+WGET http://server.lan/big.zip -r
+IF ERRORLEVEL 1 ECHO Resume failed; the partial file is kept.
+```

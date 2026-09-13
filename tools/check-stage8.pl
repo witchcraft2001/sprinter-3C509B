@@ -90,7 +90,7 @@ for my $name (qw(PING PINGALT)) {
     die "$name overlaps Stage 10 bootstrap stack reserve\n"
         if 0x8080 + length($image) > 0xBEE0;
     die "$name banner/version is missing\n"
-        unless index($image, "3C509B $name v0.0.1\0") >= 128;
+        unless index($image, "3C509B $name v0.1.1\0") >= 128;
 }
 die "PING and PINGALT unexpectedly have identical executables\n"
     if slurp('build/PING.EXE', 1) eq slurp('build/PINGALT.EXE', 1);

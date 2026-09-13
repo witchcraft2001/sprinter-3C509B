@@ -273,4 +273,4 @@ outcome is unknown.
 floppy image, so a consumer can take the ready-built file without
 installing the assembler or libman. Its L1 header records the ABI
 line in the numeric version field and the full package revision in
-the 15-byte text tag, for example `UNET509B v0.0.1`.
+the 15-byte text tag, for example `UNET509B v0.1.1`.

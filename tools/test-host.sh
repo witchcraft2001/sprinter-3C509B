@@ -185,8 +185,8 @@ text_copy="$(mktemp "${TMPDIR:-/tmp}/sprinter-509b-text.XXXXXX")"
 binary_copy="$(mktemp "${TMPDIR:-/tmp}/sprinter-509b-binary.XXXXXX")"
 trap 'rm -f "$expected_img" "$expected_zip" "$actual_names" "$text_copy" "$binary_copy"' EXIT
 
-printf '%s\n' ARP.EXE ARP.TXT CONNECT.BAT DLDIRECT.EXE DLSPEED.EXE DLSPEED.TXT EL3EEP.EXE EL3INFO.EXE EL3INFO.TXT EL3LB.EXE EL3LB.TXT EL3REG.EXE EL3REG.TXT EL3RX.EXE EL3RX.TXT EL3TX.EXE EL3TX.TXT FTP.EXE FTP.TXT HELLO.EXE HOWTO.TXT IFUP.EXE IFUP.TXT ISAPROBE.EXE \
-  LICENSE.TXT NETCFG.EXE NETCFG.TXT NETPROF.EXE NETSMPL.CFG NSLOOKUP.EXE NSLOOKUP.TXT NTP.EXE NTP.TXT PING.EXE PING.TXT PINGALT.EXE README.TXT READMERU.TXT S10TEST.TXT S11TEST.TXT S12TEST.TXT S13TEST.TXT S14TEST.TXT S9TEST.TXT TCPTEST.EXE TCPTEST.TXT TELNET.EXE TELNET.TXT TESTING.TXT TFTP.EXE TFTP.TXT UDPTEST.EXE UDPTEST.TXT UNET509B.DLL UNET509B.TXT UNETTEST.EXE USAGE.TXT WGET.EXE WGET.TXT \
+printf '%s\n' ARP.EXE ARP.TXT CONNECT.BAT DLDIRECT.EXE DLSPEED.EXE DLSPEED.TXT EL3EEP.EXE EL3EEP.TXT EL3INFO.EXE EL3INFO.TXT EL3LB.EXE EL3LB.TXT EL3REG.EXE EL3REG.TXT EL3RX.EXE EL3RX.TXT EL3TX.EXE EL3TX.TXT FTP.EXE FTP.TXT HELLO.EXE HOWTO.TXT IFUP.EXE IFUP.TXT ISAPROBE.EXE ISAPROBE.TXT \
+  LICENSE.TXT NETCFG.EXE NETCFG.TXT NETPROF.EXE NETPROF.TXT NETSMPL.CFG NSLOOKUP.EXE NSLOOKUP.TXT NTP.EXE NTP.TXT PING.EXE PING.TXT PINGALT.EXE README.TXT READMERU.TXT S10TEST.TXT S11TEST.TXT S12TEST.TXT S13TEST.TXT S14TEST.TXT S9TEST.TXT TCPTEST.EXE TCPTEST.TXT TELNET.EXE TELNET.TXT TESTING.TXT TFTP.EXE TFTP.TXT UDPTEST.EXE UDPTEST.TXT UNET509B.DLL UNET509B.TXT UNETTEST.EXE USAGE.TXT WGET.EXE WGET.TXT \
   | LC_ALL=C sort > "$expected_img"
 artifact_names IMG | LC_ALL=C sort > "$actual_names"
 diff -u "$expected_img" "$actual_names"
@@ -257,19 +257,19 @@ artifact_copy binary "$repo_root/build/UNET509B.DLL" "$binary_copy" "$script_dir
 cmp "$repo_root/build/UNET509B.DLL" "$binary_copy"
 
 version="$(tr -d '\r\n' < "$repo_root/VERSION")"
-if [ "$version" != "0.0.1" ] || ! grep -q 'PACKAGE_VERSION.*"0.0.1"' \
+if [ "$version" != "0.1.1" ] || ! grep -q 'PACKAGE_VERSION.*"0.1.1"' \
   "$repo_root/src/include/version.inc"; then
   echo "Error: package version declarations disagree" >&2
   exit 1
 fi
 for binary in EL3INFO EL3EEP EL3REG EL3LB EL3TX EL3RX ISAPROBE NETCFG IFUP ARP PING PINGALT UDPTEST TFTP NSLOOKUP NTP TCPTEST WGET FTP TELNET DLSPEED DLDIRECT UNETTEST; do
-  if ! grep -a -q "v0.0.1" "$repo_root/build/$binary.EXE"; then
-    echo "Error: $binary banner is not version 0.0.1" >&2
+  if ! grep -a -q "v0.1.1" "$repo_root/build/$binary.EXE"; then
+    echo "Error: $binary banner is not version 0.1.1" >&2
     exit 1
   fi
 done
-if ! grep -a -q "v0.0.1" "$repo_root/build/UNET509B.DLL"; then
-  echo "Error: UNET509B.DLL name field is not version 0.0.1" >&2
+if ! grep -a -q "v0.1.1" "$repo_root/build/UNET509B.DLL"; then
+  echo "Error: UNET509B.DLL name field is not version 0.1.1" >&2
   exit 1
 fi
 

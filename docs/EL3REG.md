@@ -1,34 +1,62 @@
-# EL3REG
+# EL3REG.EXE
 
-`EL3REG` — диагностическая программа регистрового слоя 3C509B. Она один раз
-безопасно обнаруживает и активирует карту, затем выполняет заданное число циклов
-`INIT -> SNAPSHOT -> DONE`. EEPROM только читается; IRQ не используется.
+`EL3REG` is the register-layer diagnostic for the 3C509B. It safely discovers
+and activates the card once, then runs the requested number of
+`INIT -> SNAPSHOT -> DONE` cycles. The EEPROM is only read, and no IRQ is
+used. It is included only in the developer floppy image.
+
+## Usage
 
 ```text
 EL3REG [-v] [-s 0|1] [-p #100..#1F0] [-b AUTO|#200..#3E0] [-n 1..100]
+EL3REG /?
 ```
 
-По умолчанию используются slot 1, ID-порт `#110`, база `AUTO` и один цикл.
-Ключ `-n 100` проверяет повторную инициализацию без повторной EEPROM-активации.
+| Option | Meaning                                                      |
+|--------|--------------------------------------------------------------|
+| `-s`   | Physical ISA slot, `0` or `1`. Default `1`.                  |
+| `-p`   | ISA ID port, `#100..#1F0`. Default `#110`.                   |
+| `-b`   | I/O base, `AUTO` or `#200..#3E0`. Default `AUTO`.            |
+| `-n`   | Cycles, `1..100`. Default `1`.                               |
+| `-v`   | Verbose output.                                              |
 
-Профиль `CYCLES21` использует конечный программный квант не короче 21 023
-T-state. Один `waitq` занимает не менее 1 мс на 21 МГц и около 6 мс на
-3,5 МГц. Поэтому 100-квантовый timeout физически находится в диапазоне примерно
-100-601 мс; это не точное измерение миллисекунд.
+`-n 100` checks repeated initialisation without repeating EEPROM activation.
 
-Успешный вывод содержит строки `[E0]`–`[E5]`, снимок v1 длиной 60 байт,
-`CYCLES OK=N` и `RESULT OK`. Ошибка заканчивается строкой
-`RESULT FAIL code=N`. Основные дополнительные коды:
+## Behaviour
+
+The `CYCLES21` profile uses a finite software quantum of no less than 21023
+T-states. One `waitq` takes at least 1 ms at 21 MHz and about 6 ms at 3.5 MHz,
+so a 100-quantum timeout is physically somewhere in the 100..601 ms range.
+It is not an exact millisecond measurement.
+
+Threshold commands send the requested value `#07FF`, but Window 5 reflects
+thresholds with DWORD granularity as `#07FC`. That is a normal readback, not
+an initialisation error.
+
+Successful output contains the lines `[E0]` through `[E5]`, a 60-byte v1
+snapshot, `CYCLES OK=N`, and `RESULT OK`.
+
+## Examples
 
 ```text
-9   Command-In-Progress не снят за 100 waitq
-10  readback INIT не совпал с ожидаемым состоянием
-11  неверный номер окна
+EL3REG
+EL3REG -v
+EL3REG -n 100
+EL3REG -s 0 -b #0300 -n 10
 ```
 
-Threshold-команды передают требуемое значение `#07FF`, но Window 5 отражает
-пороги с DWORD-гранулярностью как `#07FC`. Это нормальный readback, а не ошибка
-инициализации. При `code=10` строка `[EV] VERIFY` показывает номер поля,
-фактическое и ожидаемое значение. Поля: `01` MAC, `02` Media Status, `03` RX Filter,
-`04` Interrupt Mask, `05` Read Zero Mask, `06` RX Early, `07` TX Available,
-`08` TX Start, `09` selected window.
+## Exit codes
+
+A failure ends with `RESULT FAIL code=N`. Beyond the discovery codes shared
+with `EL3INFO`, the register layer adds:
+
+| Code | Meaning                                          |
+|------|--------------------------------------------------|
+| 9    | Command-In-Progress not cleared within 100 waitq |
+| 10   | INIT readback did not match the expected state   |
+| 11   | Invalid window number                            |
+
+On `code=10` the `[EV] VERIFY` line shows the field number, the actual value
+and the expected one. The fields are `01` MAC, `02` Media Status, `03` RX
+Filter, `04` Interrupt Mask, `05` Read Zero Mask, `06` RX Early, `07` TX
+Available, `08` TX Start, and `09` selected window.

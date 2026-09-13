@@ -15,7 +15,7 @@ log. Repository conventions are in `CLAUDE.md` / `AGENTS.md`.
 
 ## Status
 
-Version 0.0.1. The release archive carries the end-user utilities:
+Version 0.1.1. The release archive carries the end-user utilities:
 
 - **Setup and diagnostics:** `EL3INFO` (read-only discovery), `NETCFG`
   (transactional `NET_*` environment), `IFUP` (static, DHCP acquire, renew and

@@ -1,17 +1,62 @@
-# Network kit quick reference
+# Sprinter 3C509B Network Kit -- Index
 
-Copy `NETSMPL.CFG` to `NET.CFG`, edit it, then run:
+This is the entry point for the user-facing documentation shipped in the kit.
+Common conventions, configuration, exit codes and batch examples live in
+`HOWTO.TXT`; each utility has its own short reference page.
+
+Read these in order on a fresh setup:
+
+1. `README.TXT` -- what the package is and how to install it
+   (`READMERU.TXT` is the same text in Russian).
+2. `EL3INFO.TXT` -- find the card, read-only, before configuring anything.
+3. `HOWTO.TXT` -- conventions, env vars, exit codes, batch idioms.
+4. `NETCFG.TXT` -- `NETCFG -i` to publish the environment from `NET.CFG`.
+5. `IFUP.TXT` -- bring the link up (static or DHCP).
+6. `PING.TXT` -- verify reachability.
+
+Then use whichever utility you need. Every per-utility `<NAME>.TXT` page uses
+the same layout: usage syntax with an option table, behaviour, examples, and
+exit codes. `UNET509B.TXT` is the exception -- it is an API reference for
+program authors rather than a command page.
+
+| File            | Utility / topic                                       |
+|-----------------|-------------------------------------------------------|
+| `README.TXT`    | Package guide: install, configure, everyday commands  |
+| `READMERU.TXT`  | The package guide in Russian                          |
+| `HOWTO.TXT`     | Common conventions and configuration (start here)     |
+| `EL3INFO.TXT`   | Read-only 3C509B discovery: slot, ID port, base, MAC  |
+| `NETCFG.TXT`    | NET.CFG / `NET_*` env-var management                  |
+| `IFUP.TXT`      | Static or DHCP interface bring-up                     |
+| `PING.TXT`      | ICMP echo                                             |
+| `NSLOOKUP.TXT`  | DNS A-record lookup                                   |
+| `NTP.TXT`       | NTP client; sets the DSS clock from `NET_TZ`          |
+| `WGET.TXT`      | HTTP/1.0 download with redirects and `-r` resume      |
+| `FTP.TXT`       | Passive FTP download, upload and directory listing    |
+| `TFTP.TXT`      | TFTP octet-mode transfer with RFC 2348 `blksize`      |
+| `TELNET.TXT`    | ANSI/VT100 Telnet client with Zmodem and Ymodem       |
+| `UNET509B.TXT`  | UNET DLL: TCP/UDP/DNS/ping, two channels, program API |
+| `LICENSE.TXT`   | BSD-3-Clause license and third-party attribution      |
+
+`UNET509B.DLL` is for developers: it exposes the kit's network stack to your
+own DSS programs through the same numbered API the sibling RTL8019AS and
+Wi-Fi kits implement, so one consumer binary can drive any of them. It ships
+in both the archive and the floppy image.
+
+## Quick reference
+
+Configure and bring the interface up:
 
 ```text
-NETCFG -i -v
+NETCFG -c
+NETCFG -i [-v]
 IFUP
 ```
 
-`NETCFG` without arguments displays the current environment. `NETCFG -c`
-checks syntax without publishing; `NETCFG -d` removes it. DHCP acquisition is
-performed by each plain `IFUP` run. `IFUP -r` renews the active lease and
-`IFUP -d` sends best-effort RELEASE and clears it. To switch to static addressing, edit `NET.CFG`,
-run `NETCFG -i`, then run `IFUP` again.
+`NETCFG` without arguments displays the published environment; `-c` checks
+`NET.CFG` without publishing, `-d` removes it. Every plain `IFUP` run performs
+DHCP acquisition when `IP=DHCP`; `IFUP -r` renews the active lease and
+`IFUP -d` sends a best-effort RELEASE and clears it. To switch to static
+addressing, edit `NET.CFG`, run `NETCFG -i`, then `IFUP` again.
 
 Resolve a name or set the clock after `IFUP`:
 
@@ -22,33 +67,14 @@ NTP [server]
 
 `NTP` without a server uses `NET_NTP` and the quarter-hour `NET_TZ` offset.
 
-Ping an IPv4 address or hostname after `IFUP`:
+Ping an IPv4 address or hostname:
 
 ```text
 PING [-t] [-n count] [-l size] [-i ttl] [-w milliseconds] target
 ```
 
-Defaults are `-n 4 -l 32 -i 64 -w 1000`. See `PING.TXT` for ranges, exit
-codes and timeout behavior. The IMG also contains `ARP.EXE` and `PINGALT.EXE`
-for bounded developer diagnostics; they are not included in the user ZIP.
-
-Test a UDP echo service from the developer IMG:
-
-```text
-UDPTEST [-n count] [-l size] [-w milliseconds] target port
-```
-
-Defaults are `1`, `16`, and `5000`; the maximum payload is 1472 bytes. See
-`UDPTEST.TXT` for exact ranges and reply matching.
-
-Test two simultaneous TCP echo channels from the developer IMG:
-
-```text
-TCPTEST [-n count] [-l 0..4096] [-w milliseconds] IPv4 port
-```
-
-Defaults are `1`, `2048`, and `5000`. The native MSS is 536 bytes; larger
-buffers are divided into MSS-sized segments transparently. See `TCPTEST.TXT`.
+Defaults are `-n 4 -l 32 -i 64 -w 1000`. See `PING.TXT` for ranges, exit codes
+and timeout behaviour.
 
 Transfer a file in TFTP octet mode:
 
@@ -66,8 +92,62 @@ Download a plain HTTP resource:
 WGET url [-o output] [-y|-f] [-r] [-d]
 ```
 
-The default output is the URL basename or `OUTPUT.BIN`. Existing files prompt
-for Overwrite/Resume/Cancel. `-r` requests the remainder and appends only after
-a 206 response. `-d` emits one dot per 8 KiB flush instead of the KB counter;
-the final time/speed summary remains. See `WGET.TXT` for redirects and failure
-retention rules.
+The default output is the URL basename or `OUTPUT.BIN`. An existing file
+prompts for Overwrite/Resume/Cancel. `-r` requests the remainder and appends
+only after a `206` response. `-d` prints one dot per disk-buffer flush instead
+of the KB counter; the final time/speed summary remains. See `WGET.TXT` for
+redirects, `Content-Length` framing and failure retention rules.
+
+Transfer files or list a directory over FTP:
+
+```text
+FTP host[:port] path [-u user] [-p pass] [-o out] [-y|-f] [-r] [-d]
+FTP host[:port] PUT local [-u user] [-p pass] [-o remote]
+FTP host[:port] [path] -l|-n [-u user] [-p pass]
+```
+
+The port defaults to 21 and the mode is always passive; without `-u`/`-p` the
+client logs in as `anonymous`. The control and data sessions are two
+independent TCP channels. See `FTP.TXT`.
+
+Open a terminal session:
+
+```text
+TELNET host[:port]
+```
+
+The default port is 23. The terminal is 80x32 ANSI/VT100 with a status row;
+`Alt+X` closes the session, Zmodem receive starts automatically, and
+`Alt+D` / `Alt+U` / `Alt+G` drive Ymodem. See `TELNET.TXT`.
+
+## Developer floppy image only
+
+These programs and their pages ship on the FAT12 developer image, never in
+the release archive. They are diagnostics and measurement tools, not part of
+normal use.
+
+| File           | Utility / topic                                      |
+|----------------|------------------------------------------------------|
+| `EL3EEP.TXT`   | Read-only dump of all 64 EEPROM words                |
+| `ISAPROBE.TXT` | Read-only dump of an explicit ISA window range       |
+| `EL3REG.TXT`   | Register-window snapshot of an activated card        |
+| `EL3LB.TXT`    | Internal loopback of the transmit/receive FIFOs      |
+| `EL3TX.TXT`    | Bounded raw frame transmit                           |
+| `EL3RX.TXT`    | Bounded raw frame receive                            |
+| `ARP.TXT`      | Bounded ARP request/reply diagnostic                 |
+| `UDPTEST.TXT`  | UDP echo/generator against a host responder          |
+| `TCPTEST.TXT`  | Two simultaneous TCP echo channels                   |
+| `DLSPEED.TXT`  | HTTP throughput benchmark, DLL path versus native    |
+| `NETPROF.TXT`  | Where the seconds go during network bring-up         |
+| `TESTING.TXT`  | Stage 8 manual test procedure (Russian)              |
+| `S9TEST.TXT` .. `S14TEST.TXT` | Later per-stage manual procedures      |
+
+`HELLO.EXE`, `PINGALT.EXE`, `DLDIRECT.EXE` and `UNETTEST.EXE` have no page of
+their own: `PINGALT` takes the same options as `PING`, `DLDIRECT` is covered
+by `DLSPEED.TXT`, `UNETTEST` by `UNET509B.TXT`, and `HELLO` only prints a
+banner.
+
+Nothing in the kit ever writes the card EEPROM, and `ISAPROBE` reads only a
+range you name in full. For driver-level details, card register descriptions
+and MAME setup, see `specs.md`, `docs/STAGE1_AUDIT.md` and
+`docs/MAME_NETWORK.md` in the source tree.

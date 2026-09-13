@@ -29,7 +29,7 @@ die "initial stack is not 0x8100\n"
 die "DSS header is not exactly 128 bytes\n"
     unless substr($data, 22, 106) eq "\0" x 106;
 die "banner is missing from HELLO.EXE\n"
-    unless index($data, "3C509B DEV HELLO v0.0.1\0") >= 128;
+    unless index($data, "3C509B DEV HELLO v0.1.1\0") >= 128;
 die "success marker is missing from HELLO.EXE\n"
     unless index($data, "RESULT OK\0") >= 128;
 die "DSS exit sequence does not return status 0\n"
