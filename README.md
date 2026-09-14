@@ -5,9 +5,10 @@ A polling-only network stack and utility set for Sprinter DSS, targeting the
 development kit: the driver, the TCP transport and `UNET509B.DLL` are meant to
 be reused by other Sprinter DSS programs.
 
-The card is driven entirely by status polling. Sprinter's ISA interrupt lines
-are intentionally not wired, so there is no IRQ setting anywhere in the kit and
-every wait loop is bounded and returns an explicit status code on expiry.
+The card is driven entirely by status polling: the driver never uses ISA
+interrupts and never programs one into the card. There is therefore no IRQ
+setting anywhere in the kit, and every wait loop is bounded and returns an
+explicit status code on expiry.
 EEPROM access is read-only: nothing here ever reprograms a card.
 
 `specs.md` is the authoritative specification, staged roadmap and acceptance

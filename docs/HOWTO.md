@@ -58,9 +58,9 @@ polling for replies, and return `B=7`. `TELNET` is the exception: it forwards
 Esc to the remote host (or to an active Z/Ymodem transfer) and closes the
 session with **Alt+X**.
 
-Every wait in the kit is bounded. The driver is polling-only -- Sprinter's ISA
-interrupt lines are not connected -- so each loop carries a finite timeout and
-returns an explicit status code when it expires. A timeout or an unexpected
+Every wait in the kit is bounded. The driver is polling-only -- it never uses
+ISA interrupts -- so each loop carries a finite timeout and returns an
+explicit status code when it expires. A timeout or an unexpected
 card status closes the ISA window, releases the mapped DSS page, prints
 `RESULT FAIL`, and returns control to DSS. Timeout diagnostics include the
 stage, elapsed ticks, selected slot/base, controller status and, where it

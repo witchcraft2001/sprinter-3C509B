@@ -10,10 +10,12 @@ TP's AUI connector is not used). It contains network setup tools,
 read-only card diagnostics, file-transfer clients, a network clock client,
 an ANSI Telnet client, and a loadable network library for other programs.
 
-The card is driven by status polling only. The Sprinter ISA interrupt lines
-are not wired, so this kit has no IRQ setting anywhere and the IRQ value
-printed by the diagnostics is informational. The card EEPROM is read for
-identity and MAC only; nothing in this package ever writes to it.
+The card is driven by status polling only: the driver never uses ISA
+interrupts and never programs one into the card. This kit therefore has no
+IRQ setting anywhere, and the IRQ value printed by the diagnostics is
+informational -- it is what the card's EEPROM holds, and nothing acts on it.
+The card EEPROM is read for identity and MAC only; nothing in this package
+ever writes to it.
 
 
 GETTING STARTED

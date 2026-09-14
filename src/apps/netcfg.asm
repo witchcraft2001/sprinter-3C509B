@@ -109,8 +109,7 @@ DELETE
 	JR	SUCCESS
 
 HELP
-	LD	HL,MSG_HELP
-	CALL	@CONSOLE.LINE
+	CALL	PRINT_HELP
 	JR	SUCCESS
 
 WRITE_CONFIG
@@ -167,7 +166,7 @@ LOCAL_FAIL_DIRECT
 
 PRINT_HELP
 	LD	HL,MSG_HELP
-	JP	@CONSOLE.LINE
+	JP	@CONSOLE.STRING
 
 PRINT_PARSED
 	LD	HL,MSG_VERIFIED
@@ -337,7 +336,23 @@ NEXT_NAME
 	RET
 
 MSG_BANNER	DB "3C509B NETCFG v",PACKAGE_VERSION,0
-MSG_HELP	DB "Usage: NETCFG [-i|-c|-d|-w] [-v]",0
+MSG_HELP
+	DB	"Usage:",13,10
+	DB	"  NETCFG           show published NET_* values",13,10
+	DB	"  NETCFG -i [-v]   read NET.CFG, check card, publish NET_*",13,10
+	DB	"  NETCFG -c [-v]   check NET.CFG; -v also checks card",13,10
+	DB	"  NETCFG -d        delete published NET_* values",13,10
+	DB	"  NETCFG -v        detailed file/card check; do not publish",13,10
+	DB	"  NETCFG -W        interactively create or edit NET.CFG",13,10
+	DB	"  NETCFG /?        help (-? and -h are also accepted)",13,10
+	DB	"Flags accept - or / and are case-insensitive.",13,10
+	DB	"-W cannot combine with -i, -c, -d, or -v.",13,10
+	DB	"-W never publishes NET_*; run NETCFG -i and IFUP to apply.",13,10
+	DB	"New file: confirm probe of slots 0/1 at the selected IDPORT.",13,10
+	DB	"The probe may reset the adapter; EEPROM remains read-only.",13,10
+	DB	"A valid existing file loads without a hardware probe.",13,10
+	DB	"Exit: 0 OK, 1 arguments, 2 hardware, 4 config,",13,10
+	DB	"      5 local error, 7 cancelled.",13,10,0
 MSG_CURRENT	DB "[C0] Published environment",0
 MSG_INDENT	DB "  ",0
 MSG_EQUALS	DB "=",0

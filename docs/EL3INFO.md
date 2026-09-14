@@ -25,7 +25,8 @@ EL3INFO /?
 Defaults are slot 1, ID port `#110`, and the I/O base stored in EEPROM. An
 explicit `-b` changes only the current activation; it is never written to
 EEPROM, and nothing in this kit ever writes the EEPROM at all. The IRQ field
-is informational: Sprinter's ISA interrupt lines are not connected.
+is informational: the driver never uses ISA interrupts, so the stored value is
+reported but never acted on.
 
 Discovery accepts a card only when the product ID is `0x9550` or `0x9050`
 (two verified boards; see `EL3EEP.TXT`), the 3Com manufacturer ID, a valid

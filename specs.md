@@ -1121,10 +1121,10 @@ hardware evidence остаётся открытым.
   Esc/Backspace/overflow/invalid, сохранность старого файла, путь/CRLF,
   cleanup и неизменность environment (`tools/test-stage7-exe.js`).
 - [x] 2026-09-14: обязательный `make test-host package image` прошёл;
-  actual-EXE harness: 97 Stage 7 сценариев. SHA-256: `NETCFG.EXE`
-  `6e0fb878c735e48382bfeffe7d8091e95e27541215e918131ab4daf16447345a`,
-  ZIP `597b933dd348c0c52b510e59e007b6665eb63a88b60f85d1d367430f37c444dd`,
-  IMG `6da27c1d8494a9dccbed3a68790f0a799d56347538d7dba5176ce4b99ae23485`.
+  actual-EXE harness: 98 Stage 7 сценариев. SHA-256: `NETCFG.EXE`
+  `befb1e8c4b90a5ba1e0123c1caf85db610f9119b8d38f36fecfea86d6e4de807`,
+  ZIP `b10b5f7fad092e82d75a8da898a3797828f665ecd70af6ad1ab075d313351613`,
+  IMG `f1041f33d368d2aeebc5b3dfbd01ff6015aaa9e20dca56c0c02e8fa118073481`.
 - [ ] Проверить `NETCFG -W` в MAME и сохранить фактические экраны диалога и
   созданный DHCP/static `NET.CFG`: ____________________
 - [ ] Проверить `NETCFG -W` на реальном Sprinter/3C509B и сохранить экраны,

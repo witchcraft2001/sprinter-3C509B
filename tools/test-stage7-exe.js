@@ -90,6 +90,15 @@ for (const name of ['NETCFG', 'IFUP', 'ARP']) {
   cases++;
 }
 
+// Built-in help follows the multi-line mode table and documents the editor.
+result = run('NETCFG', '/?', {appDir});
+assert.strictEqual(result.exitCode, 0, result.output);
+assert.match(result.output, /Usage:[\s\S]*NETCFG -W\s+interactively create or edit NET\.CFG/i);
+assert.match(result.output, /probe of slots 0\/1 at the selected IDPORT/i);
+assert.match(result.output, /EEPROM remains read-only/i);
+assert.match(result.output, /run NETCFG -i and IFUP to apply/i);
+cleanup(result);
+
 // NETCFG -W edits the actual EXE-side file without publishing NET_*.
 const untouchedWriteEnv = {NET: 'OLD', KEEP: 'yes'};
 result = run('NETCFG', '-w', {
