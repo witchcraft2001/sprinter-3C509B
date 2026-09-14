@@ -13,6 +13,7 @@ const exe = (name) => path.join(root, 'build', `${name}.EXE`);
 const appDir = 'C:\\NET';
 const cfgPath = `${appDir}\\NET.CFG`;
 let cases = 0;
+let result;
 
 const dhcpConfig = [
   '# Stage 7 sample', 'NET=509B', 'HW=AUTO', 'IDPORT=#110', 'MAC=',
@@ -60,6 +61,25 @@ function baseDhcpEnv() {
     NET_IP_SRC: 'DHCP', NET_NTP: 'pool.ntp.org', NET_TZ: '+4',
   };
 }
+function canonicalConfig(values = {}) {
+  const v = {
+    HW: 'AUTO', IDPORT: '#110', MAC: '', IP: 'DHCP', NETMASK: '', GATEWAY: '',
+    DNS1: '', DNS2: '', NTP: 'pool.ntp.org', TZ: '+3', ...values,
+  };
+  return [
+    'NET=509B', `HW=${v.HW}`, `IDPORT=${v.IDPORT}`, `MAC=${v.MAC}`, `IP=${v.IP}`,
+    `NETMASK=${v.NETMASK}`, `GATEWAY=${v.GATEWAY}`, `DNS1=${v.DNS1}`,
+    `DNS2=${v.DNS2}`, `NTP=${v.NTP}`, `TZ=${v.TZ}`, '',
+  ].join('\r\n');
+}
+function assertCanonicalWrite(result, expected) {
+  assert.strictEqual(result.files[cfgPath].toString('ascii'), expected);
+  assert.ok(!result.files[cfgPath].toString('ascii').replace(/\r\n/g, '').includes('\n'));
+  assert.ok(!Object.keys(result.files).some((name) => name !== cfgPath));
+}
+const sampleEffective = fs.readFileSync(path.join(root, 'config', 'NETSMPL.CFG'), 'utf8')
+  .split(/\r?\n/).filter((line) => line && !line.startsWith('#')).join('\r\n') + '\r\n';
+assert.strictEqual(canonicalConfig(), sampleEffective, 'editor defaults must match NETSMPL.CFG');
 
 for (const name of ['NETCFG', 'IFUP', 'ARP']) {
   const image = fs.readFileSync(exe(name));
@@ -70,9 +90,139 @@ for (const name of ['NETCFG', 'IFUP', 'ARP']) {
   cases++;
 }
 
+// NETCFG -W edits the actual EXE-side file without publishing NET_*.
+const untouchedWriteEnv = {NET: 'OLD', KEEP: 'yes'};
+result = run('NETCFG', '-w', {
+  appDir, files: {}, environment: untouchedWriteEnv, base: 0x320,
+  echoKeys: '\r'.repeat(7), traceDss: true,
+});
+assert.strictEqual(result.exitCode, 0, result.output);
+assertCanonicalWrite(result, canonicalConfig({HW: '1/#320'}));
+assert.deepStrictEqual(result.probedSlots, [0, 1]);
+assert.deepStrictEqual(result.probedIdPorts, [0x110]);
+assert.deepStrictEqual(untouchedWriteEnv, {NET: 'OLD', KEEP: 'yes'});
+assert.deepStrictEqual(result.dssEvents.filter((event) => event.startsWith('CREATE ')),
+  [`CREATE ${cfgPath}`]);
+cleanup(result);
+
+// A declined probe is explicit and non-fatal; the static branch asks all four
+// address fields, and '-' clears an optional value.
+const staticWriteKeys = '\r' + 'n' + '\r' + '\r' +
+  '192.168.7.2\r' + '255.255.255.0\r' + '192.168.7.1\r' +
+  '1.1.1.1\r' + '-\r' + '\r' + '-4\r';
+result = run('NETCFG', '/W', {appDir, files: {}, echoKeys: staticWriteKeys});
+assert.strictEqual(result.exitCode, 0, result.output);
+assert.match(result.output, /\[W0\] PROBE SKIPPED code=23/);
+assert.deepStrictEqual(result.probedSlots, []); assert.deepStrictEqual(result.probedIdPorts, []);
+assertCanonicalWrite(result, canonicalConfig({
+  IP: '192.168.7.2', NETMASK: '255.255.255.0', GATEWAY: '192.168.7.1',
+  DNS1: '1.1.1.1', DNS2: '', TZ: '-4',
+}));
+cleanup(result);
+
+// A missing adapter also continues with HW=AUTO after exactly slots 0 and 1.
+result = run('NETCFG', '-W', {appDir, files: {}, cardPresent: false, echoKeys: '\r'.repeat(7)});
+assert.strictEqual(result.exitCode, 0, result.output);
+assert.match(result.output, /\[W1\] PROBE FAIL code=3/);
+assert.deepStrictEqual(result.probedSlots, [0, 1]);
+assert.deepStrictEqual(result.probedIdPorts, [0x110]);
+assertCanonicalWrite(result, canonicalConfig()); cleanup(result);
+
+// IDPORT is validated before the probe. Backspace edits instead of truncating,
+// and no other ID port in #100..#1F0 is touched.
+result = run('NETCFG', '-W', {
+  appDir, files: {}, idPort: 0x120, echoKeys: '#120x\b\r' + '\r'.repeat(6),
+});
+assert.strictEqual(result.exitCode, 0, result.output);
+assert.deepStrictEqual(result.probedIdPorts, [0x120]);
+assertCanonicalWrite(result, canonicalConfig({IDPORT: '#120', HW: '1/#300'}));
+cleanup(result);
+
+// An overflowing replacement is rejected wholesale, then the field is
+// re-entered. An invalid ID port is likewise re-prompted through the shared
+// parser rather than being accepted or silently rounded.
+result = run('NETCFG', '-W', {
+  appDir, files: {}, idPort: 0x120,
+  echoKeys: '#12345678\r#111\r#120\r' + 'n' + '\r'.repeat(5),
+});
+assert.strictEqual(result.exitCode, 0, result.output);
+assert.match(result.output, /\[E2\] INPUT TOO LONG/);
+assert.match(result.output, /\[E1\] INVALID VALUE/);
+assert.deepStrictEqual(result.probedIdPorts, []);
+assertCanonicalWrite(result, canonicalConfig({IDPORT: '#120'})); cleanup(result);
+
+// Every parsed field rejects a bad replacement in place; final validation is
+// still authoritative before CREATE_OVERWRITE.
+const invalidFieldKeys = '\r' + 'n' +
+  '2/#300\r\r' + '01:00:00:00:00:01\r\r' +
+  '999.1.1.1\r192.168.9.2\r' +
+  '255.999.0.0\r255.255.255.0\r' +
+  '999.1.1.1\r-\r' + 'bad\r-\r' + '300.1.1.1\r-\r' +
+  '\r' + '+14:15\r+5\r';
+result = run('NETCFG', '-W', {appDir, files: {}, echoKeys: invalidFieldKeys});
+assert.strictEqual(result.exitCode, 0, result.output);
+assert.ok((result.output.match(/\[E1\] INVALID VALUE/g) || []).length >= 7);
+assertCanonicalWrite(result, canonicalConfig({
+  IP: '192.168.9.2', NETMASK: '255.255.255.0', TZ: '+5',
+}));
+cleanup(result);
+
+// A valid existing file is loaded as defaults and never probes hardware.
+// Switching it to DHCP clears all static fields and skips their prompts.
+const oldStatic = canonicalConfig({
+  HW: '0/#300', MAC: '02:11:22:33:44:55', IP: '10.0.0.2',
+  NETMASK: '255.255.255.0', GATEWAY: '10.0.0.1', DNS1: '1.1.1.1', DNS2: '8.8.8.8', TZ: '+4',
+});
+result = run('NETCFG', '-W', cfgScenario(oldStatic, {
+  cardPresent: false, echoKeys: '\r\r\rDHCP\r-\r\r', traceDss: true,
+}));
+assert.strictEqual(result.exitCode, 0, result.output);
+assert.deepStrictEqual(result.probedSlots, []); assert.deepStrictEqual(result.probedIdPorts, []);
+assertCanonicalWrite(result, canonicalConfig({HW: '0/#300', MAC: '02:11:22:33:44:55', NTP: '', TZ: '+4'}));
+cleanup(result);
+
+// Esc, malformed existing content and unreadable existing content all leave
+// the old bytes untouched and never reach CREATE_OVERWRITE.
+for (const scenario of [
+  cfgScenario(oldStatic, {echoKeys: '\x1b', traceDss: true}),
+  cfgScenario(oldStatic, {echoKeys: '#111\r\x1b', traceDss: true}),
+  cfgScenario('BROKEN\r\n', {echoKeys: '', traceDss: true}),
+  cfgScenario('X'.repeat(2048), {echoKeys: '', traceDss: true}),
+  cfgScenario(oldStatic, {echoKeys: '', fileOpenError: 8, traceDss: true}),
+  cfgScenario(oldStatic, {echoKeys: '', fileReadFailAt: 1, traceDss: true}),
+  cfgScenario(oldStatic, {echoKeys: '', fileCloseFailAt: 1, traceDss: true}),
+  cfgScenario(oldStatic, {echoKeys: '', fileReadFailAt: 1, fileCloseFailAt: 1, traceDss: true}),
+]) {
+  const before = Buffer.from(scenario.files[cfgPath]);
+  result = run('NETCFG', '-W', scenario);
+  assert.ok([4, 7].includes(result.exitCode), result.output);
+  assert.deepStrictEqual(result.files[cfgPath], before);
+  assert.ok(!result.dssEvents.some((event) => event.startsWith('CREATE ')));
+  assert.deepStrictEqual(result.probedSlots, []); cleanup(result);
+}
+
+// Invalid new input remains interactive; Esc cancels after the diagnostic and
+// no empty/truncated NET.CFG appears.
+result = run('NETCFG', '-W', {appDir, files: {}, echoKeys: '#111\r\x1b', traceDss: true});
+assert.strictEqual(result.exitCode, 7); assert.match(result.output, /\[E1\] INVALID VALUE/);
+assert.strictEqual(result.files[cfgPath], undefined);
+assert.ok(!result.dssEvents.some((event) => event.startsWith('CREATE '))); cleanup(result);
+
+// Create/write/close failures return the local-I/O class and still release all
+// handles and the page. Validation has already completed before each attempt.
+for (const fault of [
+  {fileCreateError: 10}, {fileWriteFailAt: 1}, {fileCloseFailAt: 1},
+]) {
+  result = run('NETCFG', '-W', {
+    appDir, files: {}, echoKeys: '\r' + 'n' + '\r'.repeat(5), ...fault,
+  });
+  assert.strictEqual(result.exitCode, 5, result.output);
+  cleanup(result);
+}
+
 // NETCFG modes, parser boundaries and persistent environment.
 const environment = {NET_IP: 'stale', NET_LEASE_SEC: 'stale'};
-let result = run('NETCFG', '-i -v', cfgScenario(dhcpConfig, {environment}));
+result = run('NETCFG', '-i -v', cfgScenario(dhcpConfig, {environment}));
 assert.strictEqual(result.exitCode, 0); assert.match(result.output, /warnings=0/);
 assert.deepStrictEqual(environment, {
   NET: '509B', NET_HW: '1/#300', NET_IDPORT: '#110', NET_MAC: '02:60:8C:12:34:56',
@@ -141,7 +291,7 @@ for (const bad of [
   result = run('NETCFG', '-c', scenario);
   assert.strictEqual(result.exitCode, 4); assert.match(result.output, /RESULT FAIL code=22/); cleanup(result);
 }
-for (const args of ['-i -c', '-d -v', '-x']) {
+for (const args of ['-i -c', '-d -v', '-w -i', '/W -c', '-W -d', '-w -v', '-x']) {
   result = run('NETCFG', args); assert.strictEqual(result.exitCode, 1); cleanup(result);
 }
 

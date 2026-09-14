@@ -43,7 +43,18 @@ GETTING STARTED
    card that answered. Record the card label, physical slot and ID port
    before testing, and never scan the ISA space blindly.
 
-3. Install the sample configuration:
+3. Create the configuration interactively:
+
+       NETCFG -W
+
+   For a missing file, NETCFG asks for IDPORT and requests confirmation
+   before probing only ISA slots 0 and 1 at that port. Discovery can briefly
+   runtime-reset the adapter. It never scans other ID ports and never writes
+   EEPROM. Declining or finding no card leaves HW=AUTO and continues. Esc
+   cancels without writing. A valid existing file is loaded without probing;
+   a corrupt or unreadable one is not overwritten.
+
+   Alternatively install the sample configuration:
 
        REN NETSMPL.CFG NET.CFG
 
@@ -62,7 +73,7 @@ GETTING STARTED
    value must match what EL3INFO printed. IDPORT is #100..#1F0 on a 16-byte
    boundary. There is deliberately no IRQ key.
 
-5. Check and load the configuration:
+5. Check and load the configuration (NETCFG -W itself does not publish NET_*):
 
        NETCFG -c
        NETCFG -i
@@ -118,7 +129,7 @@ NET.CFG.
 PROGRAMS
 --------
 
-  NETCFG.EXE    check NET.CFG and publish NET_* environment variables
+  NETCFG.EXE    create/check NET.CFG and publish NET_* environment variables
   IFUP.EXE      bring up a static interface or request a DHCP lease
   PING.EXE      check host reachability
   NSLOOKUP.EXE  resolve a DNS A record
@@ -218,3 +229,9 @@ that failed, with its own codes 1..8 documented in EL3INFO.TXT.
 Every utility ends with RESULT OK or RESULT FAIL code=N, so the screen and
 ERRORLEVEL always agree. For full syntax and utility-specific status codes,
 read HOWTO.TXT and the matching <NAME>.TXT file.
+
+
+----------------------------------------------------------------
+Package author: Dmitry Mikhalchenkov.
+FidoNet: 2:5030/1997.10
+BSD 3-Clause; see LICENSE.TXT.

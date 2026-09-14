@@ -1,5 +1,4 @@
 ; Common DSS macros for the Sprinter 3C509B Network Kit.
-; Based on DSS scaffolding by Roman Boykov, copyright (c) 2024.
 ; SPDX-License-Identifier: BSD-3-Clause
 
 	IFNDEF	_MACRO_INC

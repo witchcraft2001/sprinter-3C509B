@@ -16,7 +16,8 @@ sub slurp {
 
 my @network_sources = qw(
     src/lib/netdrv.asm src/lib/ethernet.asm src/lib/arp.asm src/lib/dhcp.asm
-    src/lib/netparse.asm src/lib/netenv.asm src/lib/stage7_app.asm
+    src/lib/netparse.asm src/lib/netparse_file.asm src/lib/netcfg_write.asm
+    src/lib/netenv.asm src/lib/stage7_app.asm
     src/apps/netcfg.asm src/apps/ifup.asm src/apps/arp.asm
     src/include/netdrv.inc src/include/netcfg.inc src/include/memory.inc
 );
@@ -79,6 +80,22 @@ die "DHCP reply validation is incomplete\n"
         && $dhcp =~ /DHCP_SERVER_PORT/ && $dhcp =~ /PARSE_OPTIONS/
         && $dhcp =~ /\@ETHERNET\.VERIFY_CHECKSUM/;
 die "Stage 10 introduced forbidden NET_STATE\n" if $ifup =~ /NET_STATE/;
+
+my $netcfg = slurp('src/apps/netcfg.asm', 0);
+my $writer = slurp('src/lib/netcfg_write.asm', 0);
+my $dss = slurp('src/include/dss.inc', 0);
+my $netcfg_inc = slurp('src/include/netcfg.inc', 0);
+die "NETCFG -W action/keyboard ABI missing\n"
+    unless $netcfg_inc =~ /NETCFG_ACTION_WRITE/
+        && $dss =~ /DSS_ECHOKEY\s+EQU\s+0x32/i
+        && $netcfg =~ /NETCFG_ACTION_WRITE/
+        && $writer =~ /DSS_ECHOKEY/;
+die "NETCFG -W does not validate before overwrite\n"
+    unless $writer =~ /CALL\s+BUILD_AND_VALIDATE[\s\S]*?CALL\s+SAVE/i
+        && $writer =~ /^BUILD_AND_VALIDATE[\s\S]*?\@NETPARSE\.PARSE/m
+        && $writer =~ /SAVE[\s\S]*?DSS_CREATE_OVERWRITE/i;
+die "NETCFG -W bypasses the required discovery lifecycle\n"
+    unless $writer =~ /S7APP\.INIT_DRIVER[\s\S]*?S7APP\.RECORD_HW[\s\S]*?NETDRV\.DONE/i;
 
 my $arp = slurp('src/lib/arp.asm', 0);
 my $arp_app = slurp('src/apps/arp.asm', 0);

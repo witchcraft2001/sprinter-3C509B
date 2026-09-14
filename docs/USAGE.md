@@ -10,7 +10,7 @@ Read these in order on a fresh setup:
    (`READMERU.TXT` is the same text in Russian).
 2. `EL3INFO.TXT` -- find the card, read-only, before configuring anything.
 3. `HOWTO.TXT` -- conventions, env vars, exit codes, batch idioms.
-4. `NETCFG.TXT` -- `NETCFG -i` to publish the environment from `NET.CFG`.
+4. `NETCFG.TXT` -- `NETCFG -W` to edit and `NETCFG -i` to publish `NET.CFG`.
 5. `IFUP.TXT` -- bring the link up (static or DHCP).
 6. `PING.TXT` -- verify reachability.
 
@@ -47,13 +47,15 @@ in both the archive and the floppy image.
 Configure and bring the interface up:
 
 ```text
+NETCFG -W
 NETCFG -c
 NETCFG -i [-v]
 IFUP
 ```
 
 `NETCFG` without arguments displays the published environment; `-c` checks
-`NET.CFG` without publishing, `-d` removes it. Every plain `IFUP` run performs
+`NET.CFG` without publishing, `-W` edits it without publishing, and `-d`
+removes the environment. Every plain `IFUP` run performs
 DHCP acquisition when `IP=DHCP`; `IFUP -r` renews the active lease and
 `IFUP -d` sends a best-effort RELEASE and clears it. To switch to static
 addressing, edit `NET.CFG`, run `NETCFG -i`, then `IFUP` again.

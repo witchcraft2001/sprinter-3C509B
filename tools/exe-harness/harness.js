@@ -1574,6 +1574,7 @@ function runExe(exePath, args = '', inputScenario = {}) {
   // both from the harness result instead of re-deriving them from a trace.
   let memoryAccessCount = 0, isaSessionCount = 0;
   const probedSlots = new Set();
+  const probedIdPorts = new Set();
   const pages = new Map(), allocations = new Map();
   const allocated = (id) => pages.has(id);
   const environment = scenario.environment || {};
@@ -1631,6 +1632,9 @@ function runExe(exePath, args = '', inputScenario = {}) {
   let nextHandle = 4, envSetCount = 0, clockSecond = scenario.clockSecond || 0;
   let fileReadCalls = 0, fileWriteCalls = 0, fileCloseCalls = 0, totalWritten = 0;
   let clockReads = 0, scanCount = 0, keyDelivered = false;
+  const echoInput = scenario.echoKeys === undefined ? '' : scenario.echoKeys;
+  const echoKeys = Array.from(typeof echoInput === 'string' ? Buffer.from(echoInput, 'latin1') : echoInput);
+  let echoKeyReads = 0;
   const dssEvents = [];
   let stdout = '', exitCode = null, exitIff = null;
   let steps = 0, minimumSp = stack, minimumPageSp = 0x10000;
@@ -1718,6 +1722,8 @@ function runExe(exePath, args = '', inputScenario = {}) {
     memoryAccessCount++;
     if (address >= 0xc000 && isaOpen) {
       const port = cardPort(address);
+      if (!card.active && port >= 0x100 && port <= 0x1f0 && (port & 0x0f) === 0)
+        probedIdPorts.add(port);
       if (!card.active && port === (scenario.idPort || 0x110)) probedSlots.add(selectedSlot);
       if (!assertCardSlot()) return 0xff;
       if (!card.active && port === (scenario.idPort || 0x110)) return card.idRead();
@@ -1735,6 +1741,8 @@ function runExe(exePath, args = '', inputScenario = {}) {
     memoryAccessCount++;
     if (address >= 0xc000 && isaOpen) {
       const port = cardPort(address);
+      if (!card.active && port >= 0x100 && port <= 0x1f0 && (port & 0x0f) === 0)
+        probedIdPorts.add(port);
       if (!card.active && port === (scenario.idPort || 0x110)) probedSlots.add(selectedSlot);
       if (!assertCardSlot()) return;
       if (!card.active && port === (scenario.idPort || 0x110)) return card.idWrite(value);
@@ -1863,6 +1871,9 @@ function runExe(exePath, args = '', inputScenario = {}) {
         const name = canonicalName(cstr((s.h << 8) | s.l));
         const data = files.get(name);
         if (scenario.traceDss) dssEvents.push(`OPEN ${name} ${data ? data.length : 'missing'}`);
+        if (scenario.fileOpenError !== undefined) {
+          setCarry(s, true); s.a = scenario.fileOpenError; return ret(s);
+        }
         if (!data || ![0, 1, 2].includes(s.a)) { setCarry(s, true); s.a = 3; return ret(s); }
         const handle = nextHandle++;
         openFiles.set(handle, {name, data, offset: 0});
@@ -1896,6 +1907,9 @@ function runExe(exePath, args = '', inputScenario = {}) {
       case 0x0a:
       case 0x0b: {
         const name = canonicalName(cstr((s.h << 8) | s.l));
+        if (scenario.fileCreateError !== undefined) {
+          s.a = scenario.fileCreateError; setCarry(s, true); return ret(s);
+        }
         if (fn === 0x0b && files.has(name)) { s.a = 7; setCarry(s, true); return ret(s); }
         const data = Buffer.alloc(0); files.set(name, data);
         const handle = nextHandle++; openFiles.set(handle, {name, data, offset: 0});
@@ -1955,6 +1969,14 @@ function runExe(exePath, args = '', inputScenario = {}) {
         }
         currentDir = /^[A-Z]:\\/.test(requested) || requested.startsWith('\\') ? requested : canonicalName(requested);
         if (scenario.traceDss) dssEvents.push(`CHDIR ${currentDir}`);
+        setCarry(s, false); return ret(s);
+      }
+      case 0x32: {
+        if (!echoKeys.length) throw new Error('DSS_ECHOKEY input queue exhausted');
+        const key = echoKeys.shift() & 0xff;
+        echoKeyReads++;
+        stdout += String.fromCharCode(key);
+        s.a = key; s.e = key; s.d = 0; s.b = 0;
         setCarry(s, false); return ret(s);
       }
       case 0x35: {
@@ -2204,6 +2226,8 @@ function runExe(exePath, args = '', inputScenario = {}) {
     maxInFlight: card.maxInFlight,
     maxClientInFlight: card.maxClientInFlight,
     probedSlots: [...probedSlots].sort(),
+    probedIdPorts: [...probedIdPorts].sort((a, b) => a - b),
+    echoKeyReads,
     memoryAccesses: memoryAccessCount,
     isaSessions: isaSessionCount,
     mappedExecutableHits,

@@ -194,7 +194,15 @@ not use `ISAPROBE` (developer image) without an explicitly identified range --
 reads of unknown hardware can have side effects. EEPROM is never written by
 anything in this kit.
 
-Place `NET.CFG` beside `NETCFG.EXE`. Run `NETCFG -c` to check the file
+Place `NET.CFG` beside `NETCFG.EXE`, or run `NETCFG -W` to create it
+interactively. For a missing file, `-W` asks for an ID port and asks for
+confirmation before probing only slots 0 and 1 at that port. Discovery may
+briefly runtime-reset the adapter; declining or finding no card leaves
+`HW=AUTO` and continues. It never scans other ID ports and never writes the
+EEPROM. An existing valid file is loaded without a hardware probe; an invalid
+or unreadable one is not overwritten. Esc cancels without writing.
+
+Run `NETCFG -c` to check the file
 without touching the card, then `NETCFG -i` to validate against the card and
 publish, then `IFUP`. `CONNECT.BAT` runs the non-verbose `NETCFG -I` + `IFUP`
 pair once the configuration has been reviewed.

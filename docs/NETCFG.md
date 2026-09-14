@@ -13,6 +13,7 @@ NETCFG -i [-v]
 NETCFG -c [-v]
 NETCFG -d
 NETCFG -v
+NETCFG -w
 NETCFG /?
 ```
 
@@ -24,6 +25,10 @@ NETCFG /?
 | `-c -v`      | Validate the file and also validate the card.              |
 | `-d`         | Remove every variable owned by this package.               |
 | `-v`         | Detailed file-and-card check without committing.           |
+| `-w`         | Interactively create or edit `NET.CFG`; do not publish.     |
+
+`-w` cannot be combined with `-i`, `-c`, `-d`, or `-v`. Options accept either
+`-` or `/` and are case-insensitive.
 
 Every run ends with `RESULT OK` or `RESULT FAIL code=N`.
 
@@ -33,6 +38,25 @@ Every run ends with `RESULT OK` or `RESULT FAIL code=N`.
 CRLF, treats whole `#` lines as comments, warns about unknown or repeated
 keys, and uses the last value of a repeated key. A malformed or oversized
 file, a card error, or an environment error leaves the old environment intact.
+
+`NETCFG -W` loads a valid existing file as the editor defaults without touching
+the adapter. A missing file starts with the values from `NETSMPL.CFG` and asks
+for `IDPORT` first. It then asks before probing exactly ISA slots 0 and 1 at
+that one ID port; it never scans `#100..#1F0`. Discovery can briefly perform a
+runtime reset of the adapter. Accepting the prompt records the EEPROM-selected
+base as `HW=<slot>/#<base>` when a card is found. Declining prints
+`[W0] PROBE SKIPPED code=23`; no card prints `[W1] PROBE FAIL code=3`; both
+leave `HW=AUTO` and continue editing. EEPROM access remains read-only.
+
+The editor asks for `IDPORT`, `HW`, `MAC`, and `IP`. `IP=DHCP` clears and skips
+`NETMASK`, `GATEWAY`, `DNS1`, and `DNS2`; a static address asks for all four.
+It then asks for `NTP` and `TZ`. Enter keeps the shown value, a single `-`
+clears an optional field, Backspace edits, and Esc cancels without writing.
+An overlong or invalid replacement is rejected and re-prompted. Before opening
+the output for overwrite, the complete configuration is checked by the normal
+`NETPARSE` path. A corrupt or unreadable existing file is never replaced
+automatically. Successful output is a complete canonical CRLF file beside
+`NETCFG.EXE`; `NET=509B` is written automatically.
 
 The keys are `NET`, `HW`, `IDPORT`, `MAC`, `IP`, `NETMASK`, `GATEWAY`, `DNS1`,
 `DNS2`, `NTP`, and `TZ`. `NET` must be `509B`; `HW` is `AUTO` or
@@ -66,6 +90,7 @@ It does not contact a DHCP server; run `IFUP` next.
 
 ```text
 REN NETSMPL.CFG NET.CFG
+NETCFG -W
 NETCFG -c
 NETCFG -i -v
 NETCFG
@@ -97,6 +122,8 @@ Common printed diagnostic codes are:
 | 18 | DSS page allocation or release failed |
 | 21 | Invalid `NETCFG` command-line arguments |
 | 22 | `NET.CFG` missing, unreadable, malformed, oversized, or a key/value invalid |
+| 23 | Interactive editing cancelled with Esc |
+| 26 | File create/write/close failure |
 
 The `ERRORLEVEL` returned by `NETCFG` is:
 
@@ -107,6 +134,10 @@ The `ERRORLEVEL` returned by `NETCFG` is:
 | 2 | Hardware/discovery failure |
 | 4 | Configuration failure |
 | 5 | DSS local-memory or environment-write failure |
+| 7 | Interactive operation cancelled |
+
+`-W` never changes `NET_*`. Apply a saved file explicitly with `NETCFG -i`,
+then bring the interface up with `IFUP`.
 
 `-i` fails with 2 or 4 when it cannot obtain a MAC for `NET_MAC`. Nothing
 downstream works without it, so it reports the failure at that point instead

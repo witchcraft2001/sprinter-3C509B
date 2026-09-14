@@ -425,7 +425,7 @@ GATEWAY=
 DNS1=
 DNS2=
 NTP=pool.ntp.org
-TZ=+4
+TZ=+3
 ```
 
 Правила:
@@ -449,6 +449,20 @@ TZ=+4
 - `IP=DHCP` включает DHCP.
 - Для static mode в `IP` указывается адрес, а `NETMASK` обязателен.
 - `CONNECT.BAT` последовательно запускает `NETCFG` и `IFUP`.
+- `NETCFG -W` интерактивно создаёт/редактирует полный канонический `NET.CFG`
+  с CRLF рядом с `NETCFG.EXE`, но не публикует `NET_*`. Enter сохраняет
+  показанное значение, `-` очищает необязательное поле, Backspace редактирует,
+  Esc отменяет без записи. Для DHCP static-поля очищаются и не запрашиваются.
+- При отсутствии файла `NETCFG -W` сначала проверяет введённый `IDPORT` тем же
+  parser-ом, затем до аппаратного обращения спрашивает подтверждение. Probe
+  ограничен слотами 0 и 1 на единственном выбранном ID-порту и может кратко
+  выполнить runtime-reset карты; диапазон ID-портов не сканируется, EEPROM
+  остаётся read-only. Успех подставляет `HW=<slot>/#<EEPROM-base>`, отказ или
+  отсутствие карты оставляет `HW=AUTO` с диагностическим кодом.
+- Корректный существующий файл `-W` загружает без аппаратного опроса;
+  повреждённый/нечитаемый не затирает. Полный текст проходит штатный
+  `NETPARSE` до `DSS_CREATE_OVERWRITE`, поэтому отмена и validation error не
+  изменяют старый файл.
 - `NETCFG -i` предназначен также для `AUTOEXEC.BAT`; приложения не перечитывают
   конфигурационный файл во время сетевой операции.
 - Неизвестные ключи дают предупреждение; некорректные обязательные значения —
@@ -511,10 +525,12 @@ NETCFG -i            прочитать NET.CFG и опубликовать ок
 NETCFG -c            проверить синтаксис без изменения окружения
 NETCFG -d            удалить опубликованные NET_* значения
 NETCFG -v            подробно проверить файл и карту без публикации
+NETCFG -w            интерактивно создать/редактировать NET.CFG без публикации
 IFUP                 static init либо DHCP acquire
 ```
 
 `NETCFG -v` также допустим как модификатор `NETCFG -i -v` и `NETCFG -c -v`.
+`NETCFG -w` нельзя сочетать с `-i`, `-c`, `-d` или `-v`.
 Renewal, RELEASE, `IFUP -r`, `IFUP -d` и `NET_STATE` не входят в Stage 7.
 
 Обязательные формы пользовательских сетевых программ:
@@ -1097,6 +1113,23 @@ hardware evidence остаётся открытым.
   cache hit/expiry/eviction, gateway/broadcast/unknown и DHCP wire/checksums.
 - [x] Расширить actual-EXE harness виртуальными файлами/environment/time и
   реактивными ARP/DHCP ACK/NAK/drop сценариями.
+- [x] Реализовать интерактивный `NETCFG -W`: defaults из `NETSMPL.CFG`,
+  bounded single-IDPORT discovery, page-backed редактор, проверка штатным
+  `NETPARSE`, полный CRLF-файл рядом с EXE и отсутствие публикации `NET_*`.
+- [x] Проверить actual `NETCFG.EXE`: DHCP/static, загрузку существующего файла,
+  success/decline/not-found discovery, нестандартный IDPORT без сканирования,
+  Esc/Backspace/overflow/invalid, сохранность старого файла, путь/CRLF,
+  cleanup и неизменность environment (`tools/test-stage7-exe.js`).
+- [x] 2026-09-14: обязательный `make test-host package image` прошёл;
+  actual-EXE harness: 97 Stage 7 сценариев. SHA-256: `NETCFG.EXE`
+  `6e0fb878c735e48382bfeffe7d8091e95e27541215e918131ab4daf16447345a`,
+  ZIP `597b933dd348c0c52b510e59e007b6665eb63a88b60f85d1d367430f37c444dd`,
+  IMG `6da27c1d8494a9dccbed3a68790f0a799d56347538d7dba5176ce4b99ae23485`.
+- [ ] Проверить `NETCFG -W` в MAME и сохранить фактические экраны диалога и
+  созданный DHCP/static `NET.CFG`: ____________________
+- [ ] Проверить `NETCFG -W` на реальном Sprinter/3C509B и сохранить экраны,
+  созданный `NET.CFG`, slot/IDPORT/base и результат bounded discovery:
+  ____________________
 - [x] Добавить host responder для macOS BPF/Linux AF_PACKET, classic pcap и
   единый runbook `docs/STAGE7_TESTING_RU.md`.
 - [x] Проверить общий `unet.inc` побайтно относительно ESP и RTL sibling ABI.
@@ -2665,6 +2698,10 @@ LICENSE.TXT
 - EXE, DLL и другие бинарные файлы копируются без преобразования.
 - Исходные `docs/*.md` хранятся в UTF-8; упаковщик создаёт перечисленные `.TXT`
   и не меняет исходные Markdown-файлы.
+- `README.TXT`, `READMERU.TXT` и `README.md` завершаются блоком авторства
+  пакета (`Dmitry Mikhalchenkov, FidoNet: 2:5030/1997.10`) с указанием
+  лицензии и атрибуции заимствованного DSS-кода, как в сиблинге
+  `sprinter_wifi/network`. Имя автора продублировано в `LICENSE`/`LICENSE.TXT`.
 - C/Pascal bindings и исходные примеры остаются в исходном репозитории, но не
   включаются в runtime ZIP.
 - `docs/MAME_NETWORK.md`, таблица аудита референсов и host-test инструкции

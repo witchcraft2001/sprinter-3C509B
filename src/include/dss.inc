@@ -1,5 +1,4 @@
 ; Minimal DSS definitions for the Sprinter 3C509B Network Kit.
-; Based on DSS scaffolding by Roman Boykov, copyright (c) 2024.
 ; SPDX-License-Identifier: BSD-3-Clause
 
 	IFNDEF	_DSS_INC
@@ -21,6 +20,7 @@ DSS_CREATE_FILE EQU 0x0B
 DSS_DELETE	EQU 0x0E
 DSS_WRITE	EQU 0x14
 DSS_WAITKEY	EQU 0x30
+DSS_ECHOKEY	EQU 0x32
 DSS_K_CLEAR	EQU 0x35
 DSS_CHDIR	EQU 0x1D
 DSS_CURDIR	EQU 0x1E

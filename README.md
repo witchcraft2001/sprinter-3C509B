@@ -13,6 +13,15 @@ EEPROM access is read-only: nothing here ever reprograms a card.
 `specs.md` is the authoritative specification, staged roadmap and acceptance
 log. Repository conventions are in `CLAUDE.md` / `AGENTS.md`.
 
+## Attribution
+
+Sprinter 3C509B Network Kit project author:
+
+- Dmitry Mikhalchenkov, FidoNet: 2:5030/1997.10
+
+Licensing and third-party components are covered in `LICENSE` and
+`THIRD_PARTY.md`.
+
 ## Status
 
 Version 0.1.2. The release archive carries the end-user utilities:
@@ -118,7 +127,15 @@ before testing, start with `EL3INFO`, and never blind-scan ISA space.
 
 Both `distr/sprinter-3c509b.zip` and the FAT12 floppy image ship flat 8.3
 names, so they unpack or copy straight onto the target FAT16 disk. Then create
-the configuration from the template beside `NETCFG.EXE`:
+the configuration interactively beside `NETCFG.EXE`:
+
+```
+NETCFG -W
+```
+
+On a missing file this asks before a bounded probe of slots 0 and 1 at the
+chosen ID port; discovery may briefly runtime-reset the adapter. It never scans
+other ID ports and never writes EEPROM. You can instead install the template:
 
 ```
 REN NETSMPL.CFG NET.CFG
@@ -131,7 +148,8 @@ volatile; `IP=DHCP` selects DHCP, otherwise `IP` is static and requires
 `NETMASK`. There is deliberately no IRQ key. The template documents each key
 inline, and `docs/NETCFG.md` explains what `NETCFG -i` publishes.
 
-Run `NETCFG -i -v`, then `IFUP`, then `PING` to confirm connectivity.
+`NETCFG -W` only saves the file and does not publish `NET_*`. Run
+`NETCFG -i -v`, then `IFUP`, then `PING` to confirm connectivity.
 `CONNECT.BAT` runs the non-verbose two-command sequence once the configuration
 has been reviewed. `EL3INFO` stays available for hardware troubleshooting;
 `EL3EEP` (developer image) dumps all 64 EEPROM words read-only, so a
@@ -200,6 +218,7 @@ distr/              generated zip and floppy image (ignored)
 
 ## License
 
-BSD-3-Clause. The minimal DSS include/macro scaffolding retains attribution to
-Roman Boykov. The host-only Z80 core is MIT licensed by Molly Howell; see
-`LICENSE`, `THIRD_PARTY.md`, and the source headers.
+BSD-3-Clause; see `LICENSE`. The host-only Z80 core used by the test harness
+is MIT licensed by Molly Howell, and `src/lib/libman13.asm` is a vendored copy
+of the Sprinter SDK's libman 1.3 loader; both are described in
+`THIRD_PARTY.md`.
