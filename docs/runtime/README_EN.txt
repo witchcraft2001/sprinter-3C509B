@@ -1,5 +1,5 @@
 ============================================================
-  Sprinter 3C509B Network Kit 0.1.2
+  Sprinter 3C509B Network Kit 0.1.3
   Network utilities for Sprinter DSS and a 3Com EtherLink
   III 3C509B (TPO or TP) Ethernet card in an ISA slot
 ============================================================

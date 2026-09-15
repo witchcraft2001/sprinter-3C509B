@@ -104,6 +104,14 @@ TCP_RECV_WINDOW		EQU TCP_RECV_SEGMENTS * TCP_MSS
 ; PROCESS_FRAME's own call chain; this one sends from .WAIT_LOOP instead.
 TCP_ACK_EVERY		EQU 2
 
+; UNET_DLL active close, identical to UNETRTL's (sprinter-rtl8019a
+; src/lib/tcp_lib.asm; tools/check-stage7.pl compares the two). A FIN that
+; reached the NIC proves nothing about the peer, so CLOSE waits for the
+; acknowledgement and retransmits the FIN while it does not come. The
+; standalone applications keep TCPX's single FIN_TIMEOUT_MS wait.
+CLOSE_ATTEMPTS		EQU 3
+CLOSE_ACK_TIMEOUT_MS	EQU 500
+
 TCP_FLAG_FIN		EQU 0x01
 TCP_FLAG_SYN		EQU 0x02
 TCP_FLAG_RST		EQU 0x04

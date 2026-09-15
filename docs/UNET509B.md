@@ -155,6 +155,21 @@ same sequence number, up to three attempts with a doubling wait (1s,
 then 2s, then 4s -- 7 seconds total). Exhaustion returns `NERR_SEND`;
 `DE` still reports the bytes confirmed before the failing chunk.
 
+A failed `SEND` does not close the channel, exactly as in `UNETRTL.DLL`.
+After `NERR_SEND` or `NERR_CANCEL` the connection stays established with
+the unacknowledged segment still counted as sent, so the `CLOSE` that
+follows aborts it (see "Closing a channel"). After `NERR_HW` on the first
+attempt -- the segment never left the card -- nothing is in flight, and
+`CLOSE` ends the connection with an ordinary FIN. `NERR_HW` on a
+retransmission is different: the earlier attempt did go out and only its
+acknowledgement is missing, so the bytes stay counted as in flight and
+`CLOSE` aborts. (This is the one deliberate difference from `UNETRTL.DLL`
+0.3.10, which rewinds after a failed retransmission too and then closes
+with a FIN the peer may take for an old duplicate.) Only a peer RST ends the
+channel inside `SEND`: the
+call returns `NERR_CLOSED`, and the channel is already free (or an accepted
+LISTEN channel re-armed), with any unread bytes discarded.
+
 A payload-bearing frame that arrives for the channel while `SEND`
 waits is not discarded: it is queued in that channel's 536-byte
 receive buffer and returned by the next `RECV`.
@@ -164,9 +179,10 @@ An orderly peer FIN before the current chunk is fully acknowledged returns
 of that chunk. The channel and its pending response remain connected until
 `RECV` has returned every byte; the following `RECV` returns
 `NERR_CLOSED`/`DE=0` and releases the channel (or re-arms an accepted LISTEN
-channel). `CLOSE` is idempotent afterward. RST keeps the destructive close
-path. If FIN carries the full ACK, the current `SEND` succeeds; the close is
-reported by `RECV` instead. This is the same public behavior as UNETRTL 0.3.8.
+channel). `CLOSE` is idempotent afterward. A peer RST instead releases the
+channel at once, as described above. If FIN carries the full ACK, the
+current `SEND` succeeds; the close is reported by `RECV` instead. This is the
+same public behavior as UNETRTL 0.3.8.
 
 To discover that queued data without blocking, call `STATUS` on the
 channel: bit 2 (`UNET_ST_RXPEND`) is set while the channel holds bytes
@@ -210,6 +226,76 @@ UNETTEST -a 192.168.7.44 8080
 ~1200-byte payload against the stalling peer above; it prints how many
 `NERR_AGAIN` resumes were needed before the transfer settled. See
 `docs/STAGE14_TESTING_RU.md` for the MAME walkthrough.
+
+## Closing a channel
+
+`CLOSE` tells the peer the connection is over in a way it can actually act
+on, and reports whether it managed to. This is the contract `UNETRTL.DLL`
+0.3.10 introduced, and `UNET509B.DLL` follows it step for step, with the
+single exception noted under "Bounded TCP retransmission".
+
+When the send stream is fully acknowledged, `CLOSE` sends `FIN+ACK` and waits
+for the peer to acknowledge it, retransmitting the FIN with the same sequence
+number up to three times with a 500 ms wait each. On a healthy link the
+acknowledgement arrives at once and the close costs nothing measurable; a
+peer that has gone away caps the call at 1.5 s. The wait runs through the
+normal receive path, so a segment for the OTHER channel arriving mid-close is
+queued for that channel, not discarded -- FTP's `226 Transfer complete` on the
+control connection while the data connection is closing, for example. A FIN
+or RST from the peer ends the wait as an answer; its data, or an ACK that
+does not yet cover the FIN, does not.
+
+When a `SEND` ended with bytes transmitted but unacknowledged -- it was
+cancelled, or it exhausted its retries -- whether the peer took those bytes is
+unknowable from this side, and a FIN is wrong either way: at the low sequence
+number it is an old duplicate the peer ignores, at the high one it is an
+out-of-order segment that never reaches end-of-stream. Both leave the peer
+waiting for the rest of a request body that is never coming, holding whatever
+that request locked -- which is how a cancelled WebDAV `PUT` produces
+`HTTP 423 Locked` on an immediate retry. `CLOSE` therefore **aborts** such a
+connection per RFC 1122 4.2.2.13, sending `RST+ACK` at both candidate
+sequence numbers (first `SND.NXT`, then `SND.UNA`), since an RFC 5961 peer
+honours a reset only at exactly its `RCV.NXT`. No FIN is sent.
+
+`CLOSE` reports what the peer can be known to have learned:
+
+| Return | Meaning |
+| --- | --- |
+| `NERR_OK` | the peer acknowledged the FIN, answered it, or reset us; or both RSTs of an abort went out; or there was nothing to tell it |
+| `NERR_TIMEOUT` | the FIN went out (up to three times) and was met with silence |
+| `NERR_CANCEL` | the user ended the wait before any answer arrived |
+| `NERR_HW` | a FIN or RST never reached the wire at all |
+
+No RST follows an unanswered FIN. A receive-side card error during the FIN
+wait -- the only way this backend's wait can end that `UNETRTL` has no
+counterpart for -- is reported as `NERR_TIMEOUT`: nothing the peer said was
+seen.
+
+`NERR_CANCEL` is worth handling separately from `NERR_TIMEOUT` by a consumer
+that armed `UNET_OPT_CANCELKEYS`: the Esc that cancelled a transfer may still
+be in the DSS keyboard buffer when the `CLOSE` that follows runs, so the first
+tick of the FIN wait consumes it and the close returns immediately. Nothing
+was confirmed in that case either -- clear the key, or accept that the peer
+may not have been told.
+
+Both RST transmissions of an abort are accounted for, not just the last:
+only one of the two sequence numbers is the peer's `RCV.NXT`, and which one
+cannot be known here, so a reset that never left the NIC may well have been
+the one that would have been honoured.
+
+A channel that is listening (or has a handshake in progress) is closed with
+nothing on the wire, and its listener is unarmed. A channel with no TCP
+connection -- idle, UDP, or already closed by the peer -- returns `NERR_OK`
+without transmitting.
+
+`NETDONE` closes both channels the same way, without re-arming a listener,
+and reports the channel that did not close cleanly: channel 1's status when
+it is not `NERR_OK`, otherwise channel 0's. The channel is released locally
+in every case -- there is no state left to retry from -- but a consumer that
+must know the peer was told can see that it was not, and `LASTERR`
+(`st=05`) carries the underlying TCP reason. `CLOSE` stays idempotent, and a
+close against an unreachable peer costs the full 1.5 s before reporting
+`NERR_TIMEOUT`. While a `SEND` is suspended, both return `NERR_BUSY`.
 
 ## Passive open (LISTEN)
 
@@ -273,4 +359,4 @@ outcome is unknown.
 floppy image, so a consumer can take the ready-built file without
 installing the assembler or libman. Its L1 header records the ABI
 line in the numeric version field and the full package revision in
-the 15-byte text tag, for example `UNET509B v0.1.2`.
+the 15-byte text tag, for example `UNET509B v0.1.3`.

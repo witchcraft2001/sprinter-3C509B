@@ -827,8 +827,8 @@ RX_PENDING_STUB
 ; READ_FRAME_STUB stands in for NETDRV.READ_FRAME: In HL=buffer, BC=capacity.
 ; Out BC=length, CF=0. Delivers the queued frame and promotes the one behind
 ; it, so a case can stage a peer's FIN and the ACK of our answering FIN in
-; one go -- without the second frame CLOSE would sit out its full
-; FIN_TIMEOUT_MS, which is five seconds of emulated time.
+; one go -- without the second frame CLOSE would sit out every FIN
+; retransmission (CLOSE_ATTEMPTS x CLOSE_ACK_TIMEOUT_MS of emulated time).
 ; ------------------------------------------------------
 READ_FRAME_STUB
 	EX	DE,HL			; DE = caller's buffer

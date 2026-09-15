@@ -275,6 +275,88 @@ if [ "$listen_complete" != 165 ] || [ "$listen_result" != 0 ]; then
   exit 1
 fi
 
+# 6. Run the CLOSE/NETDONE vectors against the same whole machine, with the
+#    image in WIN1 and then in WIN2. What a close tells the peer is only
+#    visible on the wire, so the capture stub logs every segment and plays the
+#    peer; cases 1-8 are UNETRTL 0.3.10's close-semantics vectors.
+close_defines=(
+  -DSYM_SEND_FRAME="$(sym NETDRV.SEND_FRAME)"
+  -DSYM_SECONDS="$(sym S9APP.SECONDS)"
+  -DSYM_COLD_READY="$(sym COLD.READY)"
+  -DSYM_FILL_COLD_CTX="$(sym UNET.FILL_COLD_CTX)"
+  -DSYM_LOCAL_IP="$(sym NET_LOCAL_IP)"
+  -DSYM_STATION_MAC="$(sym NETDRV_STATION_MAC)"
+  -DSYM_CTX0="$(sym S11_CONTEXT0)"
+  -DSYM_CTX1="$(sym S11_CONTEXT1)"
+  -DSYM_INITED="$(sym UNET_INITED)"
+  -DSYM_RX_PENDING="$(sym NETDRV.RX_PENDING)"
+  -DSYM_READ_FRAME="$(sym NETDRV.READ_FRAME)"
+  -DSYM_RX_BEGIN="$(sym EL3IO.RX_BEGIN)"
+  -DSYM_RX_PAYLOAD="$(sym EL3IO.RX_PAYLOAD)"
+  -DSYM_CH_STATE="$(sym UNET_CH_STATE)"
+  -DSYM_LISTEN_CHANNEL="$(sym UNET_LISTEN_CHANNEL)"
+  -DSYM_LISTEN_PORT="$(sym UNET_LISTEN_PORT)"
+  -DSYM_LISTEN_ACCEPTED="$(sym UNET_LISTEN_ACCEPTED)"
+  -DSYM_CANCEL_MODE="$(sym UNET_CANCEL_MODE)"
+  -DSYM_APEND_ACTIVE="$(sym UNET_APEND_ACTIVE)"
+  -DSYM_TCP_LAST="$(sym UNET_TCP_LAST)"
+  -DSYM_READ_WALL="$(sym NETTIME.READ_WALL)"
+  -DSYM_WAIT_TICK="$(sym S7APP.WAIT_TICK)"
+  -DSYM_CHECK_CANCEL="$(sym TCPX.CHECK_CANCEL)"
+  -DCTX_STATE="$(sym TCPX.CTX_STATE)"
+  -DCTX_LOCAL_PORT="$(sym TCPX.CTX_LOCAL_PORT)"
+  -DCTX_REMOTE_IP="$(sym TCPX.CTX_REMOTE_IP)"
+  -DCTX_REMOTE_MAC="$(sym TCPX.CTX_REMOTE_MAC)"
+  -DCTX_REMOTE_PORT="$(sym TCPX.CTX_REMOTE_PORT)"
+  -DCTX_SND_UNA="$(sym TCPX.CTX_SND_UNA)"
+  -DCTX_SND_NXT="$(sym TCPX.CTX_SND_NXT)"
+  -DCTX_RCV_NXT="$(sym TCPX.CTX_RCV_NXT)"
+  -DCTX_PEER_MSS="$(sym TCPX.CTX_PEER_MSS)"
+  -DCTX_REMOTE_WINDOW="$(sym TCPX.CTX_REMOTE_WINDOW)"
+  -DCTX_LAST_STATUS="$(sym TCPX.CTX_LAST_STATUS)"
+)
+run_close() {
+  local name="$1" dll_base="$2" vec_base="$3"
+  cp "$tmp_dir/dll_$dll_base.bin" "$tmp_dir/dll_image.bin"
+  (
+    cd "$tmp_dir"
+    sjasmplus --nologo --fullpath -I "$repo_root/src/include" -I "$tmp_dir" \
+      -DDLL_BASE="0x$dll_base" -DVEC_BASE="0x$vec_base" "${close_defines[@]}" \
+      --sym="$tmp_dir/vec_close_$name.sym" \
+      "$script_dir/stage14_close_vectors.asm" >"$tmp_dir/vec_close_$name.log" 2>&1
+  )
+  if grep -Eq 'Errors: [1-9]|error:' "$tmp_dir/vec_close_$name.log"; then
+    cat "$tmp_dir/vec_close_$name.log" >&2
+    exit 1
+  fi
+  local close_end close_pid close_result close_complete close_channel
+  close_end="$(awk '/^TEST_DONE:/ {sub(/^0x0*/, "", $3); print $3}' "$tmp_dir/vec_close_$name.sym")"
+  z88dk-ticks -l 0 -pc "0x$vec_base" -end "$close_end" -counter 100000000 \
+    -output "$tmp_dir/vec_close_$name.ram" "$tmp_dir/close_vectors.bin" \
+    >"$tmp_dir/vec_close_$name.run.log" 2>&1 &
+  close_pid=$!
+  for _ in $(seq 1 60); do
+    kill -0 "$close_pid" 2>/dev/null || break
+    sleep 1
+  done
+  if kill -0 "$close_pid" 2>/dev/null; then
+    kill -9 "$close_pid" 2>/dev/null || true
+    echo "Error: Stage 14 close vector ($name) never reached TEST_DONE (runaway loop)" >&2
+    exit 1
+  fi
+  wait "$close_pid" || true
+  close_result="$(od -An -tu1 -j 16128 -N 1 "$tmp_dir/vec_close_$name.ram" | tr -d ' ')"
+  close_complete="$(od -An -tu1 -j 16129 -N 1 "$tmp_dir/vec_close_$name.ram" | tr -d ' ')"
+  close_channel="$(od -An -tu1 -j 16131 -N 1 "$tmp_dir/vec_close_$name.ram" | tr -d ' ')"
+  if [ "$close_complete" != 165 ] || [ "$close_result" != 0 ]; then
+    cat "$tmp_dir/vec_close_$name.run.log" >&2
+    echo "Error: Stage 14 close vector ($name) failed at case $close_result on channel $close_channel (complete=$close_complete)" >&2
+    exit 1
+  fi
+}
+run_close win1 4000 8000
+run_close win2 8000 4000
+
 image_size="$(wc -c < "$tmp_dir/image_0020.bin" | tr -d ' ')"
 cold_size="$(wc -c < "$tmp_dir/cold.bin" | tr -d ' ')"
-echo "Stage 14 ASM: shipped image == stand-alone build, libman relocation to WIN1/WIN2 == direct assembly, 43 entry-point vectors in WIN1 and WIN2, window-3 refusal, safe/fast cold-overlay suites, 24 passive-open/SEND-FIN vectors passed (response+FIN together/separate preserved after partial ACK; 20x1200-byte stream exact; full ACK+FIN succeeds; image $image_size bytes, cold $cold_size bytes, deepest cold stack $cold_depth of 128; boundary canary intact)"
+echo "Stage 14 ASM: shipped image == stand-alone build, libman relocation to WIN1/WIN2 == direct assembly, 43 entry-point vectors in WIN1 and WIN2, window-3 refusal, safe/fast cold-overlay suites, 24 passive-open/SEND-FIN vectors passed (response+FIN together/separate preserved after partial ACK; 20x1200-byte stream exact; full ACK+FIN succeeds), 36 CLOSE/NETDONE vectors in WIN1 and WIN2 passed (abort RSTs at SND.NXT and SND.UNA; FIN retransmitted 3x500 ms; NERR_TIMEOUT/CANCEL/HW; other channel's data kept; LISTEN re-armed once; NETDONE status choice; other channel's fault and a card RX error mid-wait; image $image_size bytes, cold $cold_size bytes, deepest cold stack $cold_depth of 128; boundary canary intact)"

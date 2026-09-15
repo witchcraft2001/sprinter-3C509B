@@ -359,7 +359,11 @@ SEND
 	LD	BC,(S11_ACTIVE_LENGTH)
 	CALL	SEND_SEGMENT
 	ENDIF
+	IFDEF	UNET_DLL
+	JP	C,.SEND_FAIL_XMIT
+	ELSE
 	JP	C,.SEND_FAIL
+	ENDIF
 	LD	A,(IX+CTX_RETRY_LEFT)
 	CALL	ATTEMPT_MS
 .DATA_ATTEMPT_MS
@@ -382,8 +386,16 @@ SEND
 .DATA_QUANTUM_READY
 	LD	B,H
 	LD	C,L
+	; The quantum is kept on the stack, not trusted to survive the wait in
+	; BC: the receive poll and the tick pacing both leave BC=0. Charged as
+	; zero, a silent attempt never ran out, and a blocking SEND (slice 0)
+	; suspended with TCP_ERR_AGAIN after its first quiet second -- leaving
+	; CLOSE/NETDONE answering NERR_BUSY to a caller that never asked for a
+	; resumable send.
+	PUSH	BC
 	LD	A,EVENT_ACK|EVENT_FIN|EVENT_RST
 	CALL	WAIT_FOR_EVENT
+	POP	BC
 	JP	NC,.DATA_EVENT
 	CP	TCP_ERR_TIMEOUT
 	JP	NZ,.SEND_FAIL
@@ -456,12 +468,48 @@ SEND
 	SCF
 	JP	.SEND_RETURN
 	ENDIF
+	IFDEF	UNET_DLL
+.SEND_FAIL_XMIT
+	; A segment that never left the card on the FIRST attempt leaves nothing
+	; past SND.UNA in flight, so a later CLOSE of this still-open connection
+	; is an orderly FIN. A retransmission that fails is different: the earlier
+	; attempt did go out and only its ACK is missing, so whether the peer took
+	; the bytes is unknowable and SND.NXT stays past them for CLOSE to abort.
+	; (UNETRTL 0.3.10 rewinds on every attempt; that is the one deliberate
+	; divergence from it, see docs/UNET509B.md.)
+	PUSH	AF
+	LD	A,(IX+CTX_RETRY_LEFT)
+	CP	DATA_ATTEMPTS
+	JR	NZ,.SEND_FAIL_POP
+	PUSH	IX
+	POP	HL
+	LD	DE,CTX_SND_UNA
+	ADD	HL,DE
+	LD	D,H
+	LD	E,L
+	INC	DE
+	INC	DE
+	INC	DE
+	INC	DE			; SND.NXT follows SND.UNA
+	CALL	COPY4
+.SEND_FAIL_POP
+	POP	AF
+	JR	.SEND_FAIL
+	ENDIF
 .SEND_RESET
 	LD	A,TCP_ERR_RESET
 .SEND_FAIL
+	IFNDEF	UNET_DLL
 	PUSH	AF
 	CALL	FAIL_CONTEXT
 	POP	AF
+	ELSE
+	; The DLL leaves the connection as the failure found it, as UNETRTL does.
+	; A peer RST already closed the context (HANDLE_SEGMENT .ACCEPT_RST); a
+	; timeout or a cancel leaves it established with SND.NXT past the
+	; unacknowledged segment, so the caller's CLOSE resets the peer instead of
+	; sending a FIN it cannot sequence, or finding nothing left to tell it.
+	ENDIF
 	LD	DE,(S11_SEND_CONFIRMED)
 	SCF
 	JP	.SEND_RETURN
@@ -765,6 +813,83 @@ RECV
 	POP	IY,IX
 	RET
 
+	IFDEF	UNET_DLL
+; CLOSE ends the channel's connection and reports whether the peer was told,
+; the way UNETRTL does: a FIN that merely reached the NIC proves nothing, and
+; an application retrying a transfer at once needs the old one really gone.
+; The cold planner (unet509b_cold.asm TCP_CLOSE_PLAN) picks the close:
+;   nothing on the wire for a closed or listening context;
+;   an orderly FIN when everything sent was acknowledged, retransmitted with
+;   the same sequence number before the 2nd and 3rd CLOSE_ACK_TIMEOUT_MS wait;
+;   an abort otherwise -- one RST|ACK at SND.NXT and one at SND.UNA, both
+;   always attempted, no FIN.
+; Only an ACK of exactly our FIN raises EVENT_ACK (HANDLE_SEGMENT), and a
+; peer FIN or RST is an answer too; data or an older ACK keeps waiting, and a
+; frame for the other channel is queued for it by PROCESS_FRAME.
+; In: A=channel. Out: CF=0/A=0 answered, or nothing needed sending.
+; CF=1: A=TCP_ERR_TIMEOUT when no attempt was answered (a receive-side card
+; error during the wait is reported the same way: the peer said nothing we
+; saw), NETDRV_ERR_CANCELLED when the user ended the wait, anything else a
+; FIN or RST that never left the card. No RST follows an unanswered FIN. The
+; context is released on every exit. Clobbers AF/BC/DE/HL; preserves IX/IY.
+CLOSE
+	PUSH	IX,IY
+	CALL	SELECT_CONTEXT
+	JR	C,.CLOSE_RETURN
+	LD	IY,S11_STATE_BASE
+	LD	A,CFN_TCP_CLOSE_PLAN
+	CALL	@COLD.RUN		; A=flags, BC=0
+	JR	C,.CLOSE_OK
+	CP	TCP_FLAG_FIN|TCP_FLAG_ACK
+	JR	NZ,.CLOSE_ABORT
+	CALL	SEND_SEGMENT
+	JR	C,.CLOSE_FAIL
+.CLOSE_WAIT
+	LD	A,EVENT_ACK|EVENT_FIN|EVENT_RST
+	LD	BC,CLOSE_ACK_TIMEOUT_MS
+	CALL	WAIT_FOR_EVENT
+	; An error exit of the wait can leave IX on whatever context the last
+	; frame matched -- the other channel's -- and everything below, the
+	; retry counter and CLEAR_CONTEXT included, addresses through IX.
+	LD	IX,(S11_SELECTED_CONTEXT)
+	JR	NC,.CLOSE_OK
+	CP	TCP_ERR_TIMEOUT
+	JR	NZ,.CLOSE_NOT_SILENT
+	DEC	(IX+CTX_RETRY_LEFT)	; CF and A=TIMEOUT survive
+	JR	Z,.CLOSE_FAIL
+	LD	A,TCP_FLAG_FIN|TCP_FLAG_ACK
+	LD	BC,0
+	CALL	SEND_SEGMENT		; a lost retransmission is just silence
+	JR	.CLOSE_WAIT
+.CLOSE_NOT_SILENT
+	CP	NETDRV_ERR_CANCELLED
+	JR	Z,.CLOSE_FAIL
+	LD	A,TCP_ERR_TIMEOUT
+	JR	.CLOSE_FAIL
+.CLOSE_ABORT
+	CALL	SEND_SEGMENT_COMMON	; RST at SND.NXT, staged in TARGET_ACK
+	PUSH	AF
+	LD	A,TCP_FLAG_RST|TCP_FLAG_ACK
+	LD	BC,0
+	CALL	SEND_SEGMENT		; RST at SND.UNA, rewound into SND.NXT
+	POP	BC			; B/C = the first RST's A/flags
+	JR	C,.CLOSE_FAIL
+	LD	A,B
+	BIT	0,C
+	JR	Z,.CLOSE_OK
+.CLOSE_FAIL
+	SCF
+	PUSH	AF
+	CALL	CLEAR_CONTEXT
+	POP	AF
+	JR	.CLOSE_RETURN
+.CLOSE_OK
+	CALL	CLEAR_CONTEXT
+	XOR	A
+.CLOSE_RETURN
+	POP	IY,IX
+	RET
+	ELSE
 ; CLOSE performs an active close with a finite five-second wait. It is
 ; idempotent for an already closed channel.
 ; In: A=channel. Out: CF/A status. Clobbers AF/BC/DE/HL; preserves IX/IY.
@@ -843,6 +968,7 @@ CLOSE
 .CLOSE_RETURN
 	POP	IY,IX
 	RET
+	ENDIF
 
 ; ABORT emits a best-effort RST for an active channel and always releases it.
 ; In: A=channel. Out: CF/A status. Clobbers AF/BC/DE/HL; preserves IX/IY.
@@ -1520,6 +1646,7 @@ SEND_SEGMENT_COMMON
 ; WAIT_FOR_EVENT polls and dispatches all frames, including the other channel.
 ; In: A=event mask, BC=timeout ms. Out: A=event bits or explicit timeout.
 WAIT_FOR_EVENT
+	IFNDEF	UNET_DLL		; the DLL's CLOSE waits for any one answer
 	PUSH	AF
 	XOR	A
 	LD	(S11_WAIT_ALL),A
@@ -1533,6 +1660,7 @@ WAIT_FOR_ALL_EVENTS
 	LD	A,1
 	LD	(S11_WAIT_ALL),A
 	POP	AF
+	ENDIF
 WAIT_START
 	LD	(S11_WAIT_MASK),A
 	IFDEF	TCPX_WAIT_PROGRESS
@@ -2050,6 +2178,7 @@ CHECK_WAIT_EVENTS
 	LD	A,(S11_WAIT_MASK)
 	AND	B
 	JP	Z,.NOT_READY
+	IFNDEF	UNET_DLL
 	LD	C,A
 	BIT	3,C
 	JP	NZ,.READY
@@ -2060,6 +2189,7 @@ CHECK_WAIT_EVENTS
 	AND	~EVENT_RST
 	CP	C
 	JP	NZ,.NOT_READY
+	ENDIF
 .READY
 	SCF
 	RET

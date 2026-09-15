@@ -285,13 +285,14 @@ INIT
 	RET
 
 ; ------------------------------------------------------
-; Function 1 - FINI (libman free hook). Graceful FIN on anything still
-; open, then the same forced teardown NETINIT starts with: card released,
-; the cold overlay's DSS page freed (l_free would otherwise leak it),
-; INITED cleared. TEARDOWN_LINK returns A=0, CF=0.
+; Function 1 - FINI (libman free hook). Closes anything still open the way
+; NETDONE does, then the same forced teardown NETINIT starts with: card
+; released, the cold overlay's DSS page freed (l_free would otherwise leak
+; it), INITED cleared. The close status has no one to go to: TEARDOWN_LINK
+; returns A=0, CF=0.
 ; ------------------------------------------------------
 FINI
-	CALL	CLOSE_ALL_CHANNELS
+	CALL	CLOSE_LINK
 	JP	TEARDOWN_LINK
 
 ; ------------------------------------------------------
@@ -341,16 +342,17 @@ F_NETINIT
 	JP	RET_A
 
 ; ------------------------------------------------------
-; Function 4 - NETDONE. Close every open channel; leave the env/card up
-; for a fresh CONNECT/UDPOPEN without another NETINIT. Idempotent.
+; Function 4 - NETDONE. Close every open channel as CLOSE does, without
+; re-arming a listener; leave the env/card up for a fresh CONNECT/UDPOPEN
+; without another NETINIT. Idempotent. A = the status of the channel that
+; did not close cleanly (CLOSE_LINK).
 ; ------------------------------------------------------
 F_NETDONE
 	IFDEF	TCPX_ASYNCSEND
 	CALL	CHECK_ASYNC_PEND
 	ENDIF
-	CALL	CLOSE_ALL_CHANNELS
-	XOR	A
-	RET
+	CALL	CLOSE_LINK
+	JP	RET_A
 
 ; ------------------------------------------------------
 ; Function 5 - CONNECT (TCP). A=channel, DE=host ASCIIZ, IX=port ASCIIZ.
@@ -476,6 +478,14 @@ F_SEND
 	JR	Z,.again
 	ENDIF
 	PUSH	DE
+	; A peer RST ends the channel here and now, as UNETRTL does: nothing is
+	; left to read or to close, and the pending bytes go with the context.
+	; An accepted LISTEN channel is re-armed. Every other failure leaves the
+	; channel open for RECV and for the caller's CLOSE.
+	PUSH	AF
+	CP	TCP_ERR_RESET
+	CALL	Z,CLEAR_AND_RELEASE
+	POP	AF
 	CALL	MAP_SEND_FAIL
 	POP	DE
 	JP	RET_A
@@ -598,10 +608,7 @@ F_RECV_TCP
 	; channel, matching UNETRTL. Payload is returned by earlier successful
 	; RECV calls, so no pending byte is discarded here. An accepted LISTEN
 	; channel is re-armed by RELEASE_OR_REARM instead of becoming idle.
-	LD	A,(UNET_ARG_A)
-	CALL	@TCPX.SELECT_CONTEXT
-	CALL	@TCPX.CLEAR_CONTEXT
-	CALL	RELEASE_OR_REARM
+	CALL	CLEAR_AND_RELEASE
 	LD	A,NERR_CLOSED
 	JR	.empty
 .idle
@@ -670,10 +677,12 @@ F_RECV_UDP
 	JP	RET_A
 
 ; ------------------------------------------------------
-; Function 8 - CLOSE. A=channel -> A. Idempotent; always reports success
-; (the context is closed/aborted either way once TCPX.CLOSE returns).
-; Closing the channel LISTEN's own accept produced re-arms LISTEN on the
-; same port instead of going idle (unet.inc's documented CLOSE contract).
+; Function 8 - CLOSE. A=channel -> A (unet.inc: NERR_OK when the peer
+; acknowledged or answered, NERR_TIMEOUT when it never did, NERR_CANCEL when
+; the user ended the wait, NERR_HW when a FIN or RST never left the card).
+; Idempotent. The channel is released whatever the status; closing the
+; channel LISTEN's own accept produced re-arms LISTEN on the same port
+; instead of going idle (unet.inc's documented CLOSE contract).
 ; ------------------------------------------------------
 F_CLOSE
 	IFDEF	TCPX_ASYNCSEND
@@ -684,16 +693,51 @@ F_CLOSE
 	LD	(UNET_ARG_A),A
 	LD	A,ST_CLOSE
 	LD	(UNET_STAGE),A
+	CALL	CLOSE_CHANNEL
+	JP	RET_A
+
+; CLOSE_CHANNEL: close UNET_ARG_A's channel, UNETRTL's per-state rules.
+; A listening channel (3) is dropped with nothing on the wire and its
+; listener unarmed; any other channel's TCPX context decides for itself
+; (TCPX.CLOSE: an idle or UDP channel's context is already closed).
+; Out: A=NERR_*, the channel released or re-armed. Trashes BC/DE/HL/IX.
+CLOSE_CHANNEL
+	LD	A,(UNET_ARG_A)
+	CALL	CH_STATE_PTR
+	LD	A,(HL)
+	CP	3
+	JR	Z,.listening
 	LD	A,(UNET_ARG_A)
 	CALL	@TCPX.CLOSE
-; RELEASE_OR_REARM: the tail of CLOSE -- it MUST stay immediately below the
-; call above, because that is how CLOSE reaches it. It is also called
-; outright by F_RECV when the peer closes the accepted connection on us.
-; In: UNET_ARG_A = channel, its TCPX context already closed. Out: A=0.
-; Anything placed between the two releases nothing and returns A=0 anyway,
-; so CLOSE still reports success while the channel stays marked open -- and
-; the NEXT CONNECT on it answers NERR_STATE. One transfer works, every one
-; after it fails to connect.
+	JR	NC,RELEASE_WITH_STATUS
+	CALL	CAPTURE_DIAG		; LASTERR: st=05 tcp=<raw>
+	LD	E,A
+	LD	A,CFN_MAP_CLOSE_FAIL
+	CALL	@COLD.RUN
+	JR	RELEASE_WITH_STATUS
+.listening
+	CALL	UNARM_LISTENER
+; CLEAR_AND_RELEASE: drop UNET_ARG_A's TCPX context without a word to the
+; peer and release the channel. Out: A=0.
+CLEAR_AND_RELEASE
+	LD	A,(UNET_ARG_A)
+	CALL	@TCPX.SELECT_CONTEXT
+	CALL	@TCPX.CLEAR_CONTEXT
+	XOR	A
+; RELEASE_WITH_STATUS: reached by fallthrough from CLEAR_AND_RELEASE above
+; (keep them adjacent) and by jump from CLOSE_CHANNEL. In: A=status to
+; report. Releases or re-arms the channel and returns that same A.
+RELEASE_WITH_STATUS
+	PUSH	AF
+	CALL	RELEASE_OR_REARM
+	POP	AF
+	RET
+
+; RELEASE_OR_REARM: mark UNET_ARG_A's channel free, or re-arm LISTEN when it
+; is the connection LISTEN accepted. Called by CLOSE_CHANNEL and by F_RECV
+; when the peer closes an ordinary or accepted connection on us.
+; In: UNET_ARG_A = channel, its TCPX context already closed. Out: A=0, so a
+; caller with a status to report saves it across the call.
 RELEASE_OR_REARM
 	CALL	IS_ACCEPTED_LISTEN
 	JR	NC,.plain_close
@@ -1419,17 +1463,24 @@ TEARDOWN_LINK
 	CALL	UNARM_LISTENER
 	RET
 
-; CLOSE_ALL_CHANNELS: graceful close of both channels for F_NETDONE, which
-; leaves the card/cold overlay up (unlike TEARDOWN_LINK above).
-CLOSE_ALL_CHANNELS
-	XOR	A
-	CALL	@TCPX.CLOSE
-	LD	A,1
-	CALL	@TCPX.CLOSE
-	XOR	A
-	LD	(UNET_CH_STATE),A
-	LD	(UNET_CH_STATE+1),A
+; CLOSE_LINK: close both channels for F_NETDONE/FINI, which leave the card
+; and cold overlay up (unlike TEARDOWN_LINK above). The listener is unarmed
+; first so neither channel is re-armed. Out: A = channel 1's NERR_* when it
+; is not NERR_OK, otherwise channel 0's -- statuses, not flags, so they are
+; chosen, never OR-ed (UNETRTL CLOSE_LINK). Trashes UNET_ARG_A.
+CLOSE_LINK
 	CALL	UNARM_LISTENER
+	XOR	A
+	LD	(UNET_ARG_A),A
+	CALL	CLOSE_CHANNEL
+	PUSH	AF
+	LD	A,1
+	LD	(UNET_ARG_A),A
+	CALL	CLOSE_CHANNEL
+	POP	BC
+	OR	A
+	RET	NZ
+	LD	A,B
 	RET
 
 ; UNARM_LISTENER: clear the "channel N is the listener"/"has accepted"

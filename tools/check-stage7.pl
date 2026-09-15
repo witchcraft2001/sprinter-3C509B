@@ -117,7 +117,7 @@ for my $name (qw(NETCFG IFUP ARP)) {
             && unpack('v', substr($image, 20, 2)) == ($name eq 'IFUP' ? 0xBEF0 : 0xBFF0);
     die "$name crosses 0xC000\n" if 0x8080 + length($image) > 0xC000;
     die "$name banner/version is missing\n"
-        unless index($image, "3C509B $name v0.1.2\0") >= 128;
+        unless index($image, "3C509B $name v0.1.3\0") >= 128;
 }
 
 my $local = slurp('src/include/unet.inc', 1);
@@ -127,6 +127,25 @@ my $rtl = do { local $/; <$rtl_fh> };
 close $rtl_fh;
 die "src/include/unet.inc diverges byte-for-byte from ../sprinter-rtl8019a/src/include/unet.inc\n"
     unless $rtl eq $local;
+
+# unet.inc states what CLOSE/NETDONE report; how long a close may take to
+# reach that verdict is the FIN retransmission budget, which lives in the
+# transports. Keep it equal to UNETRTL's, and keep the vectors that execute
+# the close state machine wired into the gate.
+open my $rtl_tcp_fh, '<:raw', "$root/../sprinter-rtl8019a/src/lib/tcp_lib.asm"
+    or die "cannot read peer transport ../sprinter-rtl8019a/src/lib/tcp_lib.asm: $!\n";
+my $rtl_tcp = do { local $/; <$rtl_tcp_fh> };
+close $rtl_tcp_fh;
+my $tcp_inc = slurp('src/include/tcp.inc', 0);
+for my $name (qw(CLOSE_ATTEMPTS CLOSE_ACK_TIMEOUT_MS)) {
+    my ($ours) = $tcp_inc =~ /^\Q$name\E\s+EQU\s+(\S+)/m;
+    my ($theirs) = $rtl_tcp =~ /^\Q$name\E\s+EQU\s+(\S+)/m;
+    die "$name is missing from src/include/tcp.inc or ../sprinter-rtl8019a/src/lib/tcp_lib.asm\n"
+        unless defined $ours && defined $theirs;
+    die "$name is $ours here but $theirs in UNETRTL\n" unless $ours eq $theirs;
+}
+die "tools/test-stage14-asm.sh no longer runs the CLOSE/NETDONE vectors\n"
+    unless slurp('tools/test-stage14-asm.sh', 0) =~ /stage14_close_vectors\.asm/;
 
 # The WiFi sibling may move ahead with deferred Stage 8 LISTEN/ACCEPT symbols
 # while this backend retains RESERVED18/19 at the same numeric slots.

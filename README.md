@@ -25,7 +25,7 @@ Licensing and third-party components are covered in `LICENSE` and
 
 ## Status
 
-Version 0.1.2. The release archive carries the end-user utilities:
+Version 0.1.3. The release archive carries the end-user utilities:
 
 - **Setup and diagnostics:** `EL3INFO` (read-only discovery), `NETCFG`
   (transactional `NET_*` environment), `IFUP` (static, DHCP acquire, renew and

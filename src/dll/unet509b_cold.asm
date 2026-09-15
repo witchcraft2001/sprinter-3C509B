@@ -149,6 +149,8 @@ JUMP_TABLE
 	DW	MAP_SEND_FAIL		; 35 CFN_MAP_SEND_FAIL
 	DW	MAP_DNS_FAIL		; 36 CFN_MAP_DNS_FAIL
 	DW	TCP_SEND_EVENT		; 37 CFN_TCP_SEND_EVENT
+	DW	TCP_CLOSE_PLAN		; 38 CFN_TCP_CLOSE_PLAN
+	DW	MAP_CLOSE_FAIL		; 39 CFN_MAP_CLOSE_FAIL
 	ASSERT	($ - JUMP_TABLE) / 2 == CFN_COUNT
 
 	INCLUDE "ethernet.asm"
@@ -230,6 +232,119 @@ TCP_SEND_EVENT
 	EX	DE,HL
 	LD	A,TCP_ERR_CLOSED
 	SCF
+	RET
+
+; ======================================================
+; Active-close planner for TCPX.CLOSE (UNET_DLL). The hot side keeps only the
+; transmissions and the wait; which close this is, and the sequence numbers
+; each segment needs, are settled here. IX is the selected TCP context and IY
+; is S11_STATE_BASE, as for TCP_SEND_EVENT.
+;
+; Out CF=1: nothing goes on the wire. The context is CLOSED already, or it is
+;   a listener (LISTEN, or SYN_RECEIVED mid-handshake) that is simply dropped.
+; Out CF=0, BC=0, A=FIN|ACK: every byte sent was acknowledged (SND.UNA ==
+;   SND.NXT), so this is an orderly close. SND.NXT already counts the FIN (the
+;   builder sequences a FIN from SND.UNA, so a retransmission reuses it), the
+;   state is FIN_WAIT, RETRY_LEFT is CLOSE_ATTEMPTS and the ACK/FIN/RST events
+;   are cleared so only an answer to this FIN ends the wait.
+; Out CF=0, BC=0, A=RST|ACK: bytes are still unacknowledged -- a SEND gave up
+;   or was cancelled with its segment in flight -- and FIN is the wrong tool:
+;   at SND.UNA it is an old duplicate if the peer took the segment, at SND.NXT
+;   an out-of-order segment it never reaches if it did not. An RST is honoured
+;   only at the peer's RCV.NXT, which is one of those two, so both are staged:
+;   S11_TARGET_ACK/SEQUENCE_OVERRIDE carry SND.NXT for the first RST (sent
+;   with SEND_SEGMENT_COMMON), and SND.NXT is rewound to SND.UNA for the second
+;   (a plain zero-length SEND_SEGMENT). The context is released afterwards.
+; ======================================================
+TCP_CLOSE_PLAN
+	LD	A,(IX+CTX_STATE)
+	OR	A
+	JR	Z,.nothing
+	CP	TCP_STATE_LISTEN
+	JR	Z,.nothing
+	CP	TCP_STATE_SYN_RECEIVED
+	JR	Z,.nothing
+	LD	(IY+S11_DIAG_STAGE-S11_STATE_BASE),TCP_STAGE_CLOSE
+	PUSH	IX
+	POP	HL
+	LD	DE,CTX_SND_UNA
+	ADD	HL,DE			; HL = SND.UNA
+	LD	D,H
+	LD	E,L
+	INC	DE
+	INC	DE
+	INC	DE
+	INC	DE			; DE = SND.NXT, the next context field
+	PUSH	HL
+	PUSH	DE
+	LD	B,4
+.compare
+	LD	A,(DE)
+	CP	(HL)
+	JR	NZ,.abort
+	INC	HL
+	INC	DE
+	DJNZ	.compare
+	POP	DE
+	POP	HL
+	LD	A,(IX+CTX_EVENT)
+	AND	~(EVENT_ACK|EVENT_FIN|EVENT_RST)
+	LD	(IX+CTX_EVENT),A
+	INC	(IX+CTX_SND_NXT+3)
+	JR	NZ,.fin_counted
+	INC	(IX+CTX_SND_NXT+2)
+	JR	NZ,.fin_counted
+	INC	(IX+CTX_SND_NXT+1)
+	JR	NZ,.fin_counted
+	INC	(IX+CTX_SND_NXT)
+.fin_counted
+	LD	(IX+CTX_STATE),TCP_STATE_FIN_WAIT
+	LD	(IX+CTX_RETRY_LEFT),CLOSE_ATTEMPTS
+	LD	A,TCP_FLAG_FIN|TCP_FLAG_ACK
+	JR	.planned
+.abort
+	POP	DE			; SND.NXT
+	POP	HL			; SND.UNA
+	PUSH	HL
+	PUSH	DE
+	EX	DE,HL
+	PUSH	IY
+	POP	DE
+	PUSH	HL
+	LD	HL,S11_TARGET_ACK-S11_STATE_BASE
+	ADD	HL,DE
+	EX	DE,HL			; DE = S11_TARGET_ACK
+	POP	HL			; HL = SND.NXT
+	LD	BC,4
+	LDIR
+	POP	DE			; SND.NXT
+	POP	HL			; SND.UNA
+	LD	C,4
+	LDIR
+	LD	(IY+S11_SEQUENCE_OVERRIDE-S11_STATE_BASE),1	; SEQUENCE_FROM_TARGET
+	LD	A,TCP_FLAG_RST|TCP_FLAG_ACK
+.planned
+	LD	BC,0
+	OR	A
+	RET
+.nothing
+	SCF
+	RET
+
+; MAP_CLOSE_FAIL: In: E=raw TCPX.CLOSE failure code. Out: A=NERR_*.
+; TCPX.CLOSE reports TCP_ERR_TIMEOUT for a FIN the peer never answered and
+; NETDRV_ERR_CANCELLED for a wait the user ended; anything else is a segment
+; that never left the card. UNETRTL's F_TIMEOUT/F_CANCEL/F_SEND, in order.
+MAP_CLOSE_FAIL
+	LD	A,E
+	CP	NETDRV_ERR_CANCELLED
+	LD	A,NERR_CANCEL
+	RET	Z
+	LD	A,E
+	CP	TCP_ERR_TIMEOUT
+	LD	A,NERR_TIMEOUT
+	RET	Z
+	LD	A,NERR_HW
 	RET
 
 ; ======================================================
