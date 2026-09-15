@@ -1542,8 +1542,10 @@ PRINT_RATE
 ; ------------------------------------------------------------------
 
 ; PRINT_ERR_HEX: HL=message text (no CRLF). Prints CRLF, the message,
-; F13_LAST_ERROR as hex, then CRLF. Shared by the *_FAIL handlers that
-; report a TCPX/NETDRV status code.
+; F13_LAST_ERROR as hex, the plain-language cause when there is one, then
+; CRLF. Shared by the *_FAIL handlers that report a TCPX/NETDRV status code.
+; The hex code is the verdict; the phrase after it is advice only, and an
+; unrecognized status prints no phrase rather than a wrong one.
 PRINT_ERR_HEX
 	PUSH	HL
 	LD	HL,@CONSOLE.CRLF
@@ -1552,6 +1554,8 @@ PRINT_ERR_HEX
 	CALL	@CONSOLE.STRING
 	LD	A,(F13_LAST_ERROR)
 	CALL	@CONSOLE.HEX8
+	LD	A,(F13_LAST_ERROR)
+	CALL	@NETERR.DESCRIBE_TCP
 	LD	HL,@CONSOLE.CRLF
 	JP	@CONSOLE.STRING
 
@@ -1829,6 +1833,7 @@ SAVED_EXIT_CODE EQU S10_COMMAND_BUFFER
 	INCLUDE "tcp_transport.asm"
 	INCLUDE "stage11_app.asm"
 	INCLUDE "stage12_dns.asm"
+	INCLUDE "neterr.asm"
 
 	; The image is code and rodata only and must end where the WIN2 data
 	; area starts. For FTP that is 2 KiB past PAGE_BASE (memory.inc).

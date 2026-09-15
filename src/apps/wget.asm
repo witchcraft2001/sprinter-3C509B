@@ -1552,10 +1552,15 @@ TCP_RECV_FAIL
 	LD	HL,@CONSOLE.CRLF
 	CALL	@CONSOLE.STRING
 	LD	HL,MSG_TCP_RECV
+; The hex status is the verdict; DESCRIBE_TCP adds the plain-language cause
+; after it when the status and TCPX's diagnostic stage name one, and prints
+; nothing rather than a guess when they do not.
 TCP_COMMON_FAIL
 	CALL	@CONSOLE.STRING
 	LD	A,(W12_LAST_ERROR)
 	CALL	@CONSOLE.HEX8
+	LD	A,(W12_LAST_ERROR)
+	CALL	@NETERR.DESCRIBE_TCP
 	LD	HL,@CONSOLE.CRLF
 	CALL	@CONSOLE.STRING
 	CALL	PRINT_REGS
@@ -1752,6 +1757,7 @@ SAVED_EXIT_CODE EQU S10_COMMAND_BUFFER
 	INCLUDE "tcp_transport.asm"
 	INCLUDE "stage11_app.asm"
 	INCLUDE "stage12_dns.asm"
+	INCLUDE "neterr.asm"
 
 
 

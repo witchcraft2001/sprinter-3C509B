@@ -369,6 +369,30 @@ result = run('http://192.168.7.44/a -y', scenario({mode: 'drop'}, {timeStepSecon
 assert.strictEqual(result.exitCode, 3); assert.match(result.output, /TCP connect failed, code 0x/);
 assert.match(normalized(result.output), /<REGS-HARDWARE>/); checked(result);
 
+// The status byte alone cannot separate these three: a refused connect and a
+// silent host both end an OPEN, and a gateway that never answers ARP reports
+// the same 0x1E as a host that never answers the SYN. NETERR.DESCRIBE_TCP
+// pairs the status with the stage TCPX published, so each prints its own
+// cause. The hex code stays in the line either way -- the phrase is advice.
+result = run('http://192.168.7.44/a -y',
+  scenario({resetOnSyn: true, resetAlways: true}, {timeStepSeconds: 1}));
+assert.strictEqual(result.exitCode, 3);
+assert.match(result.output,
+  /TCP connect failed, code 0x1F \(refused, no server on that port\)/);
+checked(result);
+
+result = run('http://192.168.7.44/a -y', scenario({mode: 'drop'}, {timeStepSeconds: 1}));
+assert.strictEqual(result.exitCode, 3);
+assert.match(result.output, /TCP connect failed, code 0x1E \(no answer from host\)/);
+checked(result);
+
+result = run('http://192.168.7.44/a -y',
+  scenario({}, {arp: {mode: 'drop'}, timeStepSeconds: 1}));
+assert.strictEqual(result.exitCode, 3);
+assert.match(result.output,
+  /TCP connect failed, code 0x1E \(no ARP reply, check gateway\)/);
+checked(result);
+
 result = run('http://192.168.7.44/PART.BIN -y', scenario({
   response: {raw: 'HTTP/1.0 200 OK\r\nContent-Length: 10000\r\n\r\npartial'}, keepOpen: true,
 }, {timeStepSeconds: 1}));

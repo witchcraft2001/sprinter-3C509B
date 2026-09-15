@@ -566,6 +566,29 @@ result = run('192.168.7.44 SMALL.BIN', scenario({}, {cardPresent: false}));
 assert.strictEqual(result.exitCode, 2, result.output);
 checked(result);
 
+// The control connection never opens. 0x1E alone cannot say whether the
+// gateway ignored ARP or the host ignored the SYN, so NETERR.DESCRIBE_TCP
+// reads the stage TCPX published alongside the status. The hex code stays
+// the verdict; the bracketed phrase is advice added after it.
+result = run('192.168.7.44 SMALL.BIN', scenario({}, {arp: {mode: 'drop'}, timeStepSeconds: 1}));
+assert.strictEqual(result.exitCode, 3, result.output);
+assert.match(result.output, /TCP open fail 0x1E \(no ARP reply, check gateway\)/);
+checked(result);
+
+// The reported case: a host that is up with nothing listening on port 21 --
+// several mirrors now serve their tree over HTTP only. No `ftp` fixture here,
+// deliberately: a bare TCP responder that RSTs the control SYN is what such a
+// host does, and buildFtpControlOptions() would not forward resetOnSyn.
+result = run('192.168.7.44 pub/mirrors/modland -l', {
+  strictPc: true, environment: staticEnv(), arp: {mac: [2, 0, 0, 0, 0, 44]},
+  tcp: {port: 21, mac: [2, 0, 0, 0, 0, 44], resetOnSyn: true, resetAlways: true},
+  clockFreezeAfterReads: 0, stepLimit: 900_000_000, timeStepSeconds: 1,
+});
+assert.strictEqual(result.exitCode, 3, result.output);
+assert.match(result.output,
+  /TCP open fail 0x1F \(refused, no server on that port\)/);
+checked(result);
+
 // ------------------------------------------------------------------
 // Regression test for a fixed bug: a GET needing a second fill of the deep
 // (STAGE12_LAYOUT) receive window on TCP context 1 (the FTP data channel)

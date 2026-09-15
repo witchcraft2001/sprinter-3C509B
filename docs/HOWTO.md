@@ -51,6 +51,34 @@ Product ID, manufacturer, or MAC rejection. After that failed publication,
 `IFUP`/`PING` print `code=22` and return `ERRORLEVEL 4` until `NETCFG -i`
 succeeds.
 
+## Why a TCP connection failed
+
+`WGET`, `FTP` and `TELNET` print the transport status as a stable hex byte,
+and add the cause in brackets after it when the status names one. The wording
+around the byte differs per utility -- `WGET` and `TELNET` say `TCP connect
+failed, code 0x..`, `FTP` says `TCP open fail 0x..` -- but the byte and the
+bracketed phrase are the same everywhere:
+
+```
+TCP connect failed, code 0x1F (refused, no server on that port)
+```
+
+The hex byte is the verdict and is what a bug report should quote; the phrase
+is advice, and an unrecognised status prints no phrase rather than a guess.
+One status can have more than one cause, so the phrase also takes account of
+how far the connection got:
+
+| Line                                    | What to do                       |
+|-----------------------------------------|----------------------------------|
+| `0x1F (refused, no server on that port)` | The host is up and answered, but nothing is listening. Check the port -- many HTTP mirrors no longer run FTP. |
+| `0x1E (no answer from host)`             | The host never answered the SYN: down, firewalled, or the wrong address. |
+| `0x1E (no ARP reply, check gateway)`     | Nothing answered on the local segment. Check `NET_GW`, `NET_MASK` and the cable. |
+| `0x1E (no reply from server)`            | The peer went silent mid-transfer. |
+| `0x1F (reset by server)`                 | The peer reset an established connection. |
+| `0x20 (server closed the connection)`    | The peer hung up; for FTP, often an idle timeout or a login limit. |
+| `0x14 (no link, check the cable)`        | The card sees no carrier. |
+| `0x19 (bad reply from server)`           | The handshake completed into an unexpected state. |
+
 ## Cancelling a wait
 
 Utilities that wait for the network respond to **Esc** and **Ctrl+C** while

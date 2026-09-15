@@ -298,10 +298,15 @@ NET_ERROR_OPEN
 	LD	B,3
 	JP	EXIT_FAIL
 
+; The hex status is the verdict; DESCRIBE_TCP adds the plain-language cause
+; after it when the status and TCPX's diagnostic stage name one, and prints
+; nothing rather than a guess when they do not.
 TCP_OPEN_ERROR
 	PRINT	MSG_TCP_ERROR
 	LD	A,(TCP_LAST_FAIL)
 	CALL	@CONSOLE.HEX8
+	LD	A,(TCP_LAST_FAIL)
+	CALL	@NETERR.DESCRIBE_TCP
 	PRINTLN	LINE_END
 	LD	B,3
 	JP	EXIT_FAIL
@@ -2147,6 +2152,7 @@ TRANSFER_BSS_END EQU TELMODEM_BSS_END
 	INCLUDE "tcp_transport.asm"
 	INCLUDE "stage11_app.asm"
 	INCLUDE "stage12_dns.asm"
+	INCLUDE "neterr.asm"
 	INCLUDE "telmodem_loader.asm"
 
 	; The direct-development image calls SETWIN2 before it switches stacks.  The
