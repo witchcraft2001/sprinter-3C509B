@@ -54,24 +54,32 @@ step of every code change.
 The driver is written against the 3C509B EEPROM layout, not one single board.
 Discovery reads the EEPROM through the ID port and requires **all** of: a
 recognized product ID, the 3Com manufacturer ID `0x6D50`, a valid unicast MAC,
-and both EEPROM checksums. Two boards have answered that end to end:
+and both EEPROM checksums. Three boards have answered that end to end:
 
 | Card | Product ID | Media | `NET.CFG` |
 |------|-----------|-------|-----------|
-| 3Com EtherLink III 3C509B-TPO | `0x9550` | RJ-45, 10BASE-T half duplex | none (`HW=AUTO`) |
+| 3Com EtherLink III 3C509B-TPO (assy `03-0020-002` rev 3) | `0x9550` | RJ-45, 10BASE-T half duplex | none (`HW=AUTO`) |
+| 3Com EtherLink III 3C509B-TPO (assy `03-0020-010` rev A) | `0x9550` | RJ-45, 10BASE-T half duplex | none (`HW=AUTO`) |
 | 3Com EtherLink III 3C509B-TP  | `0x9050` | RJ-45, 10BASE-T half duplex (also populates a 15-pin AUI connector, unused) | none (`HW=AUTO`) |
 
-The two boards' EEPROM images are otherwise built the same way and their
-media/config words (`08`/`09`/`0D`) agree: both ship configured for the TP
+The three boards' EEPROM images are otherwise built the same way and their
+media/config words (`08`/`09`/`0D`) agree: all ship configured for the TP
 transceiver, which is the only media path this driver implements (see below),
 so accepting the second product ID needed no change to `el3_regs.asm`.
 
 3C509B-TPO, 10 Mbps signalling rate, RJ-45 only, FCC ID `DF63C509B-TPO`, with
 the Parallel Tasking ASIC `40-0130-004` in the middle of the board — assembly
-`03-0020-002` rev 3, the one verified end to end on a real Sprinter, in
-physical slot 0 at ID port `#110`:
+`03-0020-002` rev 3, the first board verified end to end on a real Sprinter,
+in physical slot 0 at ID port `#110`:
 
 ![3Com EtherLink III 3C509B-TPO ISA network card](docs/img/card-3c509b-tpo.jpg)
+
+A second 3C509B-TPO, assembly `03-0020-010` rev A, same FCC ID
+`DF63C509B-TPO` and the same RJ-45-only media, but a different Parallel
+Tasking ASIC (`40-0411-001`) and a companion chip (`9843 PC FL1173`) beside
+the jack:
+
+![3Com EtherLink III 3C509B-TPO (assembly 03-0020-010) ISA network card](docs/img/card-3c509b-tpo-010.jpg)
 
 3C509B-TP, assembly `03-0021-201` rev A, FCC ID `DF63C509B`, with the same
 Parallel Tasking ASIC (`40-0130-002`), an RJ-45 jack and a populated 15-pin AUI
@@ -79,7 +87,7 @@ D-sub below it, no BNC:
 
 ![3Com EtherLink III 3C509B-TP ISA network card](docs/img/card-3c509b-tp.jpg)
 
-Note both boards carry a full 16-bit ISA edge connector while Sprinter's slot
+Note all three boards carry a full 16-bit ISA edge connector while Sprinter's slot
 drives only the first, 8-bit section. That is exactly how the kit is meant to
 run: every 16-bit card register is accessed as two adjacent byte cycles, low
 byte first, with no other card access allowed in between, and the FIFO is read
