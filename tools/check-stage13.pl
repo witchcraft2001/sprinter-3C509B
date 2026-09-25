@@ -69,18 +69,49 @@ die "direct benchmark lost its throughput feature set\n"
            $dldirect =~ /DEFINE\s+TCPX_DIRECT_RX/ &&
            $dldirect =~ /DEFINE\s+EL3_SESSION_RX/ &&
            $dldirect =~ /DEFINE\s+TCPX_WIDE_DIRECT_WINDOW/;
-die "DLDIRECT no longer keeps its FIFO-qualified window across RECV boundaries\n"
-    unless $transport =~ /TCPX_WIDE_DIRECT_WINDOW[\s\S]*?LD\s+HL,\(TCP_DIRECT_WINDOW_VAR\)/;
-die "DLDIRECT no longer advances its wide sliding window every two segments\n"
-    unless $transport =~ /TCPX_WIDE_DIRECT_WINDOW[\s\S]*?CP\s+TCP_ACK_EVERY[\s\S]*?CALL\s+SEND_OWED_ACK/;
+die "DLDIRECT no longer paces its receive right edge across RECV boundaries\n"
+    unless $transport =~ /TCPX_WIDE_DIRECT_WINDOW[\s\S]*?LD\s+HL,\(TCP_DIRECT_EDGE_VAR\)[\s\S]*?LD\s+BC,TCP_DIRECT_EDGE_STEP[\s\S]*?LD\s+BC,\(TCP_DIRECT_WINDOW_VAR\)[\s\S]*?LD\s+\(TCP_DIRECT_EDGE_VAR\),HL/ &&
+           $transport =~ /HANDLE_SYN_ACK[\s\S]*?TCP_STATE_ESTABLISHED\s*\n\s*IFDEF\s+TCPX_WIDE_DIRECT_WINDOW[\s\S]*?TCP_DIRECT_INITIAL_EDGE[\s\S]*?LD\s+\(TCP_DIRECT_EDGE_VAR\),HL[\s\S]*?JP\s+SEND_SEGMENT/ &&
+           $tcpinc =~ /^TCP_DIRECT_EDGE_STEP\s+EQU\s+2\s*\*\s*TCP_MSS\s*$/m;
+die "DLDIRECT no longer acknowledges each direct segment\n"
+    unless $transport =~ /TCPX_WIDE_DIRECT_WINDOW[^\n]*\n(?:\s*;[^\n]*\n)*(?:\s*IFDEF\s+TCPX_OOO_QUEUE\s*\n(?:[^\n]*\n)*?\s*CALL\s+OOO_DRAIN\s*\n\s*ENDIF\s*\n)?\s*LD\s+HL,S11_ACK_OWED\s*\n\s*INC\s+\(HL\)\s*\n\s*CALL\s+SEND_OWED_ACK/;
+# Р4: segments past a hole are kept in a DSS page over WIN3 and handed over as
+# soon as the hole fills, both on the direct path (before its ACK) and at the
+# top of every RECV; the page is released on the common exit.
+die "DLDIRECT no longer keeps segments that arrive past a hole\n"
+    unless $dldirect =~ /DEFINE\s+TCPX_OOO_QUEUE/ &&
+           $dldirect =~ /DEFINE\s+TCPX_SHARED_TX/ &&
+           $transport =~ /CALL\s+NZ,DTUNE_COUNT_OUT_OF_ORDER\s*\n\s*ENDIF\s*\n\s*IFDEF\s+TCPX_OOO_QUEUE\s*\n\s*CALL\s+NZ,OOO_STORE[^\n]*\n\s*ENDIF[^\n]*\n\s*JP\s+NZ,\.ACK_CURRENT/ &&
+           $transport =~ /JP\s+NZ,\.RECV_COPY\s*\n\s*IFDEF\s+TCPX_OOO_QUEUE\s*\n\s*CALL\s+OOO_DRAIN/ &&
+           $transport =~ /OOO_COPY\s*\n\s*PUSH\s+BC\s*\n\s*LD\s+BC,PAGE3\s*\n\s*IN\s+A,\(C\)[\s\S]*?LDIR\s*\n\s*LD\s+A,\(OOO_SAVED_WIN3\)\s*\n\s*LD\s+BC,PAGE3\s*\n\s*OUT\s+\(C\),A/ &&
+           $dldirect =~ /EXIT_NO_RESULT[\s\S]*?CALL\s+OOO_FREE[\s\S]*?LD\s+C,DSS_EXIT/ &&
+           $dldirect =~ /ASSERT\s+\$\s*<=\s*S12_IMAGE_LIMIT/;
+# After a filled hole the idle receive loop reopens the window one MSS per
+# window update instead of waiting for data to clock its growth.
+die "DLDIRECT no longer reopens its window from the idle loop after a hole\n"
+    unless $transport =~ /\.WAIT_IDLE[^\n]*\n(?:[^\n]*\n)*?\s*IFDEF\s+TCPX_OOO_QUEUE\s*\n\s*JR\s+NZ,\.WAIT_IDLE_RETURN\s*\n\s*CALL\s+IDLE_OPEN\s*\n\s*RET\s+C/ &&
+           $transport =~ /IDLE_OPEN\n[\s\S]*?LD\s+A,\(OOO_COUNT\)[\s\S]*?LD\s+\(TCP_DIRECT_WINDOW_VAR\),HL[\s\S]*?JP\s+SEND_OWED_ACK/ &&
+           $transport =~ /OOO_DRAIN\n[\s\S]*?LD\s+A,TCP_DIRECT_PACE_POLLS\s*\n\s*LD\s+\(TCP_DIRECT_PACE_VAR\),A/ &&
+           $tcpinc =~ /^TCP_DIRECT_PACE_POLLS\s+EQU\s+4\s*$/m;
+# A hole leaves the peer as many duplicate ACKs as there were segments behind
+# it, which under a paced window can be fewer than the three a fast retransmit
+# needs. The idle loop repeats the last one, unchanged, a bounded number of
+# times.
+die "DLDIRECT no longer repeats its duplicate ACK while a hole is open\n"
+    unless $transport =~ /IDLE_OPEN\n[\s\S]*?JR\s+NZ,\.IDLE_HOLE[\s\S]*?\.IDLE_HOLE\s*\n(?:\s*;[^\n]*\n)*\s*LD\s+HL,TCP_DIRECT_HOLE_VAR\s*\n\s*LD\s+A,\(HL\)\s*\n\s*OR\s+A\s*\n\s*JR\s+Z,\.IDLE_OFF\s*\n\s*DEC\s+\(HL\)\s*\n\s*JR\s+\.IDLE_ACK/ &&
+           $transport =~ /LD\s+A,TCP_DIRECT_HOLE_ACKS\s*\n\s*LD\s+\(TCP_DIRECT_HOLE_VAR\),A/ &&
+           $dldirect =~ /^TCP_DIRECT_HOLE_VAR\s+EQU\s+DTUNE_HOLE_ACKS\s*$/m &&
+           $tcpinc =~ /^TCP_DIRECT_HOLE_ACKS\s+EQU\s+8\s*$/m;
+die "DLDIRECT no longer grows its window one MSS per window of segments\n"
+    unless $transport =~ /LD\s+HL,TCP_DIRECT_GROW_VAR[\s\S]*?DEC\s+\(HL\)[\s\S]*?LD\s+A,\(TCP_DIRECT_TARGET_VAR\)[\s\S]*?LD\s+BC,TCP_MSS[\s\S]*?LD\s+\(TCP_DIRECT_WINDOW_VAR\),HL[\s\S]*?LD\s+HL,\(TCP_DIRECT_EDGE_VAR\)/ &&
+           $dldirect =~ /CONFIGURE_DIRECT_WINDOW[\s\S]*?TCP_DIRECT_INITIAL_SEGMENTS[\s\S]*?LD\s+\(DTUNE_WINDOW_GROW\),HL/ &&
+           $tcpinc =~ /^TCP_DIRECT_WINDOW_SEGMENTS\s+EQU\s+12\b/m &&
+           $tcpinc =~ /^TCP_DIRECT_INITIAL_SEGMENTS\s+EQU\s+3\s*$/m;
 die "DLDIRECT no longer batches eleven segments in its 6 KiB caller buffer\n"
     unless $dldirect =~ /LD\s+BC,STAGE9_FILE_CAPACITY[\s\S]*?CALL\s+\@TCPX\.RECV/;
-die "DLDIRECT no longer selects safe/wide windows from RX FIFO capacity\n"
-    unless $dldirect =~ /CONFIGURE_DIRECT_WINDOW[\s\S]*?EL3_W3_RX_FREE[\s\S]*?TCP_DIRECT_RECV_WIDE_FIFO_MIN[\s\S]*?TCP_DIRECT_RECV_WIDE_WINDOW/ &&
-           $el3inc =~ /^EL3_W3_RX_FREE\s+EQU\s+0x0A\s*$/m &&
-           $tcpinc =~ /^TCP_DIRECT_RECV_SAFE_SEGMENTS\s+EQU\s+8\s*$/m &&
-           $tcpinc =~ /^TCP_DIRECT_RECV_WIDE_SEGMENTS\s+EQU\s+11\s*$/m &&
-           $tcpinc =~ /^TCP_DIRECT_RECV_WIDE_FIFO_MIN\s+EQU\s+TCP_DIRECT_RECV_WIDE_SEGMENTS\s*\*\s*TCP_DIRECT_RECV_FIFO_FRAME\s*$/m;
+die "DLDIRECT no longer reports the idle RX FIFO it runs against\n"
+    unless $dldirect =~ /CONFIGURE_DIRECT_WINDOW[\s\S]*?EL3_W3_RX_FREE[\s\S]*?LD\s+\(DTUNE_FIFO_FREE\),HL/ &&
+           $el3inc =~ /^EL3_W3_RX_FREE\s+EQU\s+0x0A\s*$/m;
 
 die "FTP's two durable receive queues are the same size again\n"
     unless $ftp =~ /DEFINE\s+TCPX_SPLIT_PENDING/ &&
@@ -169,9 +200,10 @@ for my $exe_name (qw(FTP DLDIRECT)) {
                unpack('v', substr($exe, 16, 2)) == 0x4100 &&
                unpack('v', substr($exe, 20, 2)) == 0xBFF0;
     # FTP's data area starts at 0x8800 (memory.inc's S13_IMAGE_LIMIT), the
-    # direct benchmark's at PAGE_BASE.
+    # direct benchmark's at 0x8400 (S12_IMAGE_LIMIT: its TCP and DNS frames
+    # are built in the receive buffer).
     die "$exe_name.EXE runs into its runtime data area\n"
-        if 0x4080 + length($exe) > ($exe_name eq 'FTP' ? 0x8800 : 0x8000);
+        if 0x4080 + length($exe) > ($exe_name eq 'FTP' ? 0x8800 : 0x8400);
     my $payload = substr($exe, 128);
     die "$exe_name.EXE contains zero-filled runtime BSS\n" if $payload =~ /\x00{128}/;
 }

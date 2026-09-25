@@ -316,13 +316,21 @@ STAGE9_MAX_FRAME	EQU 14 + 20 + 20 + 1460
 S12_IMAGE_LIMIT		EQU STAGE9_TX_BUFFER
 	ASSERT STAGE9_FILE_CAPACITY >= 1460 + 512
 	ELSE
-STAGE9_TX_BUFFER	EQU PAGE_BASE + 0x0000
-STAGE9_TX_CAPACITY	EQU 0x0600
+; DLDIRECT builds its TCP segments and its DNS query in the receive buffer the
+; way UNET509B.DLL does (TCPX_SHARED_TX, tcp_transport.asm): every such frame
+; is built after the last received one was fully handled. Only an ARP reply
+; still needs its own buffer, because it is written while the request is read.
+; The 1 KiB this frees lets the image run into WIN2 (S12_IMAGE_LIMIT) and pays
+; for the out-of-order queue (TCPX_OOO_QUEUE) without shrinking the caller's
+; batching buffer.
+STAGE9_TX_BUFFER	EQU PAGE_BASE + 0x0400
+STAGE9_TX_CAPACITY	EQU 0x0200
 STAGE9_RX_BUFFER	EQU PAGE_BASE + 0x0600
 STAGE9_RX_CAPACITY	EQU 0x0600
 STAGE9_FILE_BUFFER	EQU PAGE_BASE + 0x0C00
 STAGE9_FILE_CAPACITY	EQU 0x1400
 STAGE9_MAX_FRAME	EQU 14 + 20 + 20 + 1460
+S12_IMAGE_LIMIT		EQU STAGE9_TX_BUFFER
 	ENDIF
 	ELSE
 ; WGET batches disk writes in 6 KiB and spends the two KiB that used to sit
@@ -445,7 +453,11 @@ S9_TFTP_LOCAL_NAME	EQU S9_STATE_BASE + 0x270 ; 96 bytes
 	ENDIF
 
 	ASSERT STAGE9_MAX_FRAME <= 1514
+	IFDEF TCPX_SHARED_TX
+	ASSERT STAGE9_MAX_FRAME <= STAGE9_RX_CAPACITY	; TCP and DNS build here
+	ELSE
 	ASSERT STAGE9_MAX_FRAME <= STAGE9_TX_CAPACITY
+	ENDIF
 	ASSERT STAGE9_TX_BUFFER + STAGE9_TX_CAPACITY <= STAGE9_RX_BUFFER
 	ASSERT STAGE9_RX_BUFFER + STAGE9_RX_CAPACITY <= STAGE9_FILE_BUFFER
 	ASSERT STAGE9_FILE_BUFFER + STAGE9_FILE_CAPACITY <= STAGE9_SCRATCH
@@ -854,7 +866,53 @@ W12_OUTPUT		EQU PAGE_BASE + 0x3940 ; 96 bytes
 W12_HEADER_LINE		EQU PAGE_BASE + 0x39A0 ; 256 bytes
 W12_OUTPUT_SNAPSHOT	EQU PAGE_BASE + 0x3AA0 ; 96 bytes, stable across redirects
 W12_URL			EQU S11_REMOTE_TEXT ; 256 bytes
+; DLDIRECT's receive-path experiment (TCPX_DIRECT_TUNING, tcp_transport.asm):
+; the -w target, the window growing towards it and the counters it reports
+; once the transfer ends. It takes the tail of the S11 reserve past the W12 block, which WGET
+; leaves unused.
+; The report prints every field as a word, so the -w byte keeps a zero high
+; byte beside it.
+DTUNE_STATE_BASE	EQU W12_STATE_BASE + 0x40
+DTUNE_WINDOW_SEGS	EQU DTUNE_STATE_BASE + 0x00 ; window target in whole MSS
+DTUNE_WINDOW_GROW	EQU DTUNE_STATE_BASE + 0x02 ; segments sent before the next MSS of window
+DTUNE_WINDOW_NOW	EQU DTUNE_STATE_BASE + 0x03 ; current window in whole MSS
+DTUNE_FIFO_FREE		EQU DTUNE_STATE_BASE + 0x04 ; word, idle Free Receive Bytes
+DTUNE_SYN_TICKS		EQU DTUNE_STATE_BASE + 0x06 ; word, NETTIME quanta SYN -> SYN|ACK
+DTUNE_OOO_AHEAD		EQU DTUNE_STATE_BASE + 0x08 ; word, data past RCV.NXT (a hole)
+DTUNE_OOO_DUP		EQU DTUNE_STATE_BASE + 0x0A ; word, data before RCV.NXT
+DTUNE_OVERRUNS		EQU DTUNE_STATE_BASE + 0x0C ; word, card RX Overruns (8-bit)
+DTUNE_ACTIVE		EQU DTUNE_STATE_BASE + 0x0E ; non-zero once the card is configured
+DTUNE_RWND_EDGE		EQU DTUNE_STATE_BASE + 0x10 ; word, low 16 bits of the advertised right edge
+DTUNE_OOO_KEPT		EQU DTUNE_STATE_BASE + 0x12 ; word, segments held in the out-of-order queue
+DTUNE_IDLE_PACE		EQU DTUNE_STATE_BASE + 0x14 ; idle polls before the next reopening MSS, 0 = off
+DTUNE_HOLE_ACKS		EQU DTUNE_STATE_BASE + 0x15 ; duplicate ACKs left to resend while a hole is open
+DTUNE_STATE_SIZE	EQU 0x16
 
+; DLDIRECT's out-of-order queue (TCPX_OOO_QUEUE, tcp_transport.asm). The
+; segment bytes live in a DSS page of their own that is mapped over WIN3 only
+; while one is copied in or out, so the ISA window is always closed then. Its
+; bookkeeping sits in the gap between the single-channel pending region and
+; context 0. Each entry is the low 16 bits of the segment's sequence number,
+; its length (0 = free) and the fixed address of its slot in the page.
+OOO_SLOTS		EQU 0x4000 / 1460 ; 11 whole segments
+OOO_SEQ			EQU 0
+OOO_LEN			EQU 2
+OOO_DATA		EQU 4
+OOO_ENTRY		EQU 6
+OOO_STATE_BASE		EQU PAGE_BASE + 0x2B68
+OOO_READY		EQU OOO_STATE_BASE + 0x00 ; non-zero while the page is held
+OOO_BLOCK		EQU OOO_STATE_BASE + 0x01 ; DSS_GETMEM block id
+OOO_PHYS		EQU OOO_STATE_BASE + 0x02 ; its physical page, for PAGE3
+OOO_SAVED_WIN3		EQU OOO_STATE_BASE + 0x03 ; PAGE3 during a copy
+OOO_COUNT		EQU OOO_STATE_BASE + 0x04 ; entries in use
+OOO_BLOCKED		EQU OOO_STATE_BASE + 0x05 ; non-zero: kept data waits for RECV room
+OOO_TABLE		EQU OOO_STATE_BASE + 0x06
+	IFDEF TCPX_OOO_QUEUE
+	ASSERT S11_PENDING0 + S11_PENDING_CAPACITY <= OOO_STATE_BASE
+	ASSERT OOO_TABLE + OOO_SLOTS * OOO_ENTRY <= S11_CONTEXT0
+	ENDIF
+
+	ASSERT DTUNE_STATE_BASE + DTUNE_STATE_SIZE <= S11_APP_BUFFER
 	ASSERT STAGE9_FILE_BUFFER + STAGE9_FILE_CAPACITY <= S11_PENDING0
 	ASSERT S11_STATE_BASE + 0x0100 <= S11_APP_BUFFER
 	ASSERT S11_APP_BUFFER + S11_APP_CAPACITY <= RUNTIME_BASE

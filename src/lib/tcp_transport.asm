@@ -41,8 +41,14 @@
 ; RESOLVE_ROUTE's own reply-to-a-request branch keep using the small,
 ; separate STAGE9_TX_BUFFER (60 bytes, exactly one ARP frame, see
 ; unet509b_bss.inc) instead of this alias; do not redirect those two call
-; sites to TCPX_TX_BUFFER.
+; sites to TCPX_TX_BUFFER. DLDIRECT opts into the same sharing with
+; TCPX_SHARED_TX to give its image room (memory.inc).
 	IFDEF	UNET_DLL
+	IFNDEF	TCPX_SHARED_TX
+	DEFINE	TCPX_SHARED_TX
+	ENDIF
+	ENDIF
+	IFDEF	TCPX_SHARED_TX
 TCPX_TX_BUFFER		EQU STAGE9_RX_BUFFER
 TCPX_TX_CAPACITY	EQU STAGE9_RX_CAPACITY
 	ELSE
@@ -225,6 +231,15 @@ OPEN_SAFE
 	LD	A,TCP_ERR_TIMEOUT
 	JP	.FAIL_OPEN
 .SYN_EVENT
+	IFDEF TCPX_DIRECT_TUNING
+	; Quanta this last SYN waited for its answer; a retried SYN restarts it.
+	; Nothing but the answer arrives meanwhile, so each one is a paced tick.
+	LD	HL,(NETTIME_QUANTA_TOTAL)
+	LD	DE,(NETTIME_QUANTA_LEFT)
+	OR	A
+	SBC	HL,DE
+	LD	(DTUNE_SYN_TICKS),HL
+	ENDIF
 	BIT	3,A
 	JP	NZ,.RESET_OPEN
 	LD	A,(IX+CTX_STATE)
@@ -595,6 +610,9 @@ RECV
 	LD	A,H
 	OR	L
 	JP	NZ,.RECV_COPY
+	IFDEF TCPX_OOO_QUEUE
+	CALL	OOO_DRAIN		; segments kept past a hole that has filled
+	ENDIF
 	LD	A,(IX+CTX_REMOTE_FIN)
 	OR	A
 	JP	NZ,.RECV_CLOSED
@@ -1569,7 +1587,71 @@ SEND_SEGMENT_COMMON
 	; it back to five MSS after every buffer caused the live responder to
 	; alternate large bursts with one/two-frame scheduling ticks.
 	; A genuinely full pending area still took .WINDOW_SHUT above.
+	;
+	; The right edge (RCV.NXT + window) moves at most TCP_DIRECT_EDGE_STEP per
+	; segment sent, so no single ACK lets the peer release more than two
+	; frames into the three-frame card FIFO (tcp.inc). Only the low sequence
+	; words take part: an honest peer never passes the edge, and one that
+	; does just gets the step or the target back. The edge never moves left.
+	;
+	; The window itself (TCP_DIRECT_WINDOW_VAR) starts at three MSS and grows
+	; one MSS each time as many segments were sent as it holds, up to the
+	; target: growth per ACK released a pair per ACK and overran the card.
+	IFDEF TCPX_OOO_QUEUE
+	; While segments wait past a hole every ACK is a duplicate, and one whose
+	; window moved no longer counts as one: growth 3 -> 4 MSS inside the first
+	; hole of a real run left the peer two duplicates and a 2.9 s timeout.
+	; The edge stays where it is until the hole fills.
+	LD	A,(OOO_COUNT)
+	OR	A
+	JR	Z,.WINDOW_GROW
+	LD	HL,(TCP_DIRECT_EDGE_VAR)
+	LD	D,(IX+CTX_RCV_NXT+2)
+	LD	E,(IX+CTX_RCV_NXT+3)
+	OR	A
+	SBC	HL,DE			; still promised past this ACK
+	JR	.WINDOW_PACED
+.WINDOW_GROW
+	ENDIF
+	LD	HL,TCP_DIRECT_GROW_VAR	; countdown byte, then the window in MSS
+	DEC	(HL)
+	JR	NZ,.WINDOW_HELD
+	INC	HL
+	LD	A,(TCP_DIRECT_TARGET_VAR)
+	DEC	A
+	CP	(HL)
+	JR	C,.WINDOW_FULL		; already at the target
+	INC	(HL)
+	PUSH	HL
 	LD	HL,(TCP_DIRECT_WINDOW_VAR)
+	LD	BC,TCP_MSS
+	ADD	HL,BC
+	LD	(TCP_DIRECT_WINDOW_VAR),HL
+	POP	HL
+.WINDOW_FULL
+	LD	A,(HL)
+	DEC	HL
+	LD	(HL),A			; next growth after one more window
+.WINDOW_HELD
+	LD	HL,(TCP_DIRECT_EDGE_VAR)
+	LD	D,(IX+CTX_RCV_NXT+2)
+	LD	E,(IX+CTX_RCV_NXT+3)
+	OR	A
+	SBC	HL,DE			; still promised past this ACK
+	LD	BC,TCP_DIRECT_EDGE_STEP
+	ADD	HL,BC
+	LD	BC,(TCP_DIRECT_WINDOW_VAR)
+	OR	A
+	SBC	HL,BC
+	ADD	HL,BC			; CF: the stepped edge is the smaller window
+	JR	C,.WINDOW_PACED
+	LD	H,B
+	LD	L,C
+.WINDOW_PACED
+	PUSH	HL
+	ADD	HL,DE
+	LD	(TCP_DIRECT_EDGE_VAR),HL
+	POP	HL
 	ENDIF
 	RES	0,(IX+CTX_WINDOW_CLOSED)
 	JP	.WINDOW_READY
@@ -1777,16 +1859,26 @@ WAIT_START
 	OR	A
 	JP	Z,.SESSION_HANDLED	; landed in pending: unchanged behaviour
 	IFDEF TCPX_WIDE_DIRECT_WINDOW
-	; Keep the selected window sliding: acknowledge each pair while several
-	; frames can still be draining from the card. Waiting until the whole window
-	; was consumed turned the live transfer into one burst per host-network tick.
-	; Slow-path/loss traffic still requests an immediate ACK, and RECV_RETURN
-	; sends any partial debt when a drain ends early.
+	; Keep the selected window sliding: waiting until the whole window was
+	; consumed turned the live transfer into one burst per host-network tick.
+	; Every direct segment is acknowledged at once: with the paced right edge
+	; (SEND_SEGMENT_COMMON) each ACK releases one frame, and a batched ACK of
+	; two segments released four and overflowed the card (tcp.inc).
+	IFDEF TCPX_OOO_QUEUE
+	; Data clocks the window: restart the idle count. The first data segment
+	; also starts IDLE_OPEN, so the window leaves the three-MSS start within a
+	; round trip instead of about ten: until it holds four, a loss leaves the
+	; peer too few duplicate ACKs for a fast retransmit.
+	LD	A,TCP_DIRECT_PACE_POLLS
+	LD	(TCP_DIRECT_PACE_VAR),A
+	LD	A,TCP_DIRECT_HOLE_ACKS
+	LD	(TCP_DIRECT_HOLE_VAR),A	; and a fresh budget of hole repeats
+	; A segment that fills a hole is followed straight away by what was kept
+	; behind it, so this one ACK already covers all of it.
+	CALL	OOO_DRAIN
+	ENDIF
 	LD	HL,S11_ACK_OWED
 	INC	(HL)
-	LD	A,(HL)
-	CP	TCP_ACK_EVERY
-	JR	C,.SESSION_FAST_ROOM
 	CALL	SEND_OWED_ACK
 	RET	C
 	ELSE
@@ -1824,7 +1916,15 @@ WAIT_START
 	LD	HL,(S11_RX_DELIVERED)
 	LD	A,H
 	OR	L
+	IFDEF TCPX_OOO_QUEUE
+	JR	NZ,.WAIT_IDLE_RETURN
+	CALL	IDLE_OPEN
+	RET	C
+	JP	.WAIT_TICK
+.WAIT_IDLE_RETURN
+	ELSE
 	JP	Z,.WAIT_TICK
+	ENDIF
 	XOR	A
 	RET
 	ENDIF
@@ -1881,6 +1981,11 @@ WAIT_START
 ; .WAIT_TICK span check-stage11.pl anchors on stays short.
 ; Out: CF set on send failure, propagated to WAIT_LOOP's caller.
 SEND_OWED_ACK
+	IFDEF	TCPX_OOO_QUEUE
+	LD	A,(OOO_BLOCKED)
+	OR	A
+	RET	NZ			; CF=0: owed until the kept data is taken
+	ENDIF
 	LD	A,(S11_ACK_NOW)
 	IFDEF	EL3_SESSION_RX
 	LD	HL,S11_ACK_OWED		; either flag is reason enough to send,
@@ -2018,7 +2123,11 @@ FAST_RECEIVE
 	ADD	HL,BC
 	EX	DE,HL
 	CALL	CMP4
+	IFDEF TCPX_OOO_QUEUE
+	JP	NZ,.FAST_AHEAD
+	ELSE
 	JP	NZ,.SLOW		; duplicate or out of order
+	ENDIF
 	; Where does it go? Straight into the caller's buffer while a RECV is
 	; waiting with room left there, otherwise into the pending slot if it
 	; fits. Neither -- slow path, which re-ACKs and lets the peer retry.
@@ -2067,6 +2176,35 @@ FAST_RECEIVE
 	LD	(S11_FAST_DEST),HL
 	XOR	A
 	LD	(S11_FAST_DIRECT),A
+	IFDEF TCPX_OOO_QUEUE
+; A segment past RCV.NXT, within the queue's reach, is read with its checksum
+; in the same single pass into the receive buffer behind its header and only
+; then copied into its queue slot (.FAST_COMMIT_AHEAD). The slow path's
+; separate checksum and parse took 13-14 ms a segment on the real Sprinter
+; while the server kept sending one every 8 ms, so a train of eleven behind a
+; hole overran the card before it ended. Retransmissions of taken data still
+; go the slow way and count as dup.
+.FAST_AHEAD
+	LD	A,(OOO_READY)
+	OR	A
+	JP	Z,.SLOW
+	LD	A,(STAGE9_RX_BUFFER+40)
+	LD	H,A
+	LD	A,(STAGE9_RX_BUFFER+41)
+	LD	L,A
+	LD	D,(IX+CTX_RCV_NXT+2)
+	LD	E,(IX+CTX_RCV_NXT+3)
+	OR	A
+	SBC	HL,DE
+	JP	Z,.SLOW			; differs above bit 15 only: not ours
+	LD	A,H
+	CP	0x40
+	JP	NC,.SLOW		; behind RCV.NXT or past 16 KiB
+	LD	HL,STAGE9_RX_BUFFER+TCPX_RX_PREFIX
+	LD	(S11_FAST_DEST),HL
+	LD	A,2
+	LD	(S11_FAST_DIRECT),A
+	ENDIF
 .FAST_DEST_READY
 	; Accepted. Seed the checksum with the pseudo-header and the TCP header,
 	; both of which start at an even offset, so the payload continues the
@@ -2104,12 +2242,30 @@ FAST_RECEIVE
 .FAST_COMMIT
 	LD	DE,(S11_FAST_LENGTH)
 	LD	A,(S11_FAST_DIRECT)
+	IFDEF TCPX_OOO_QUEUE
+	CP	2
+	JR	Z,.FAST_COMMIT_AHEAD
+	ENDIF
 	OR	A
 	JR	Z,.FAST_COMMIT_PENDING
 	LD	HL,(S11_RX_DELIVERED)
 	ADD	HL,DE
 	LD	(S11_RX_DELIVERED),HL
 	JR	.FAST_COMMIT_SEQUENCE
+	IFDEF TCPX_OOO_QUEUE
+.FAST_COMMIT_AHEAD
+	LD	(S11_SEGMENT_LENGTH),DE	; OOO_STORE reads what HANDLE_SEGMENT would
+	LD	HL,STAGE9_RX_BUFFER+TCPX_RX_PREFIX
+	LD	(S11_TCP_PARSE_DESC+TCPP_PAYLOAD),HL
+	LD	HL,STAGE9_RX_BUFFER+38
+	LD	DE,S11_PARSE_SEQUENCE
+	CALL	COPY4
+	IFDEF TCPX_DIRECT_TUNING
+	CALL	DTUNE_COUNT_OUT_OF_ORDER
+	ENDIF
+	CALL	OOO_STORE
+	JR	.FAST_NO_EVENT		; its duplicate ACK goes out from .SESSION_FAST
+	ENDIF
 .FAST_COMMIT_PENDING
 	LD	L,(IX+CTX_PENDING_LEN)
 	LD	H,(IX+CTX_PENDING_LEN+1)
@@ -2490,6 +2646,12 @@ HANDLE_SEGMENT
 	ADD	HL,BC
 	EX	DE,HL
 	CALL	CMP4
+	IFDEF TCPX_DIRECT_TUNING
+	CALL	NZ,DTUNE_COUNT_OUT_OF_ORDER
+	ENDIF
+	IFDEF TCPX_OOO_QUEUE
+	CALL	NZ,OOO_STORE		; still re-ACKs RCV.NXT: the duplicate
+	ENDIF				; ACKs are what start fast retransmit
 	JP	NZ,.ACK_CURRENT
 	IFDEF	STAGE12_LAYOUT
 	; Append after the unread tail (PENDING_OFF+PENDING_LEN) instead of
@@ -2818,6 +2980,15 @@ HANDLE_SYN_ACK
 	LD	(IX+CTX_PEER_MSS),L
 	LD	(IX+CTX_PEER_MSS+1),H
 	LD	(IX+CTX_STATE),TCP_STATE_ESTABLISHED
+	IFDEF TCPX_WIDE_DIRECT_WINDOW
+	; Seed the paced right edge (SEND_SEGMENT_COMMON) from RCV.NXT before the
+	; handshake ACK is built from it.
+	LD	H,(IX+CTX_RCV_NXT+2)
+	LD	L,(IX+CTX_RCV_NXT+3)
+	LD	DE,TCP_DIRECT_INITIAL_EDGE
+	ADD	HL,DE
+	LD	(TCP_DIRECT_EDGE_VAR),HL
+	ENDIF
 	LD	A,EVENT_SYN_ACK|EVENT_ACK
 	CALL	SET_EVENT
 	LD	A,TCP_FLAG_ACK
@@ -2826,6 +2997,331 @@ HANDLE_SYN_ACK
 .SYN_IGNORE
 	XOR	A
 	RET
+
+	IFDEF TCPX_DIRECT_TUNING
+; DTUNE_COUNT_OUT_OF_ORDER classifies a data segment that is not at RCV.NXT.
+; SEQ - RCV.NXT below 2^31 is data past a hole (a segment was lost on the path
+; or overflowed the card); otherwise it is a retransmission of data already
+; taken. Called with NZ and returns with NZ, so the caller's JP NZ still holds.
+; In: IX=context, S11_PARSE_SEQUENCE. Clobbers AF, B, DE, HL.
+DTUNE_COUNT_OUT_OF_ORDER
+	PUSH	IX
+	POP	HL
+	LD	DE,CTX_RCV_NXT+3
+	ADD	HL,DE			; both are big-endian: start at the low byte
+	LD	DE,S11_PARSE_SEQUENCE+3
+	LD	B,4
+	OR	A
+.OOO_SUBTRACT
+	LD	A,(DE)
+	SBC	A,(HL)
+	DEC	DE
+	DEC	HL
+	DJNZ	.OOO_SUBTRACT
+	LD	HL,DTUNE_OOO_AHEAD
+	RLA				; CF = sign of the difference
+	JR	NC,.OOO_COUNT
+	LD	HL,DTUNE_OOO_DUP
+.OOO_COUNT
+	LD	E,(HL)
+	INC	HL
+	LD	D,(HL)
+	INC	DE			; wraps after 65,535: far past any run
+	LD	(HL),D
+	DEC	HL
+	LD	(HL),E
+	OR	1			; NZ for the caller
+	RET
+	ENDIF
+
+	IFDEF TCPX_OOO_QUEUE
+; Out-of-order queue (DLDIRECT). Without it every segment behind a lost one is
+; discarded, and a peer without SACK resends them one per round trip after its
+; fast retransmit: about two seconds per loss on the real 100 ms path
+; (specs.md, Р4). The segments are kept instead in a DSS page mapped over WIN3
+; for each copy (memory.inc OOO_*), so a filled hole moves RCV.NXT past all of
+; them at once. Sequence numbers are compared on their low 16 bits: a kept
+; segment lies less than 16 KiB past RCV.NXT, well inside that range.
+
+; OOO_STORE keeps a data segment that arrived past RCV.NXT. A retransmission of
+; taken data, one more than 16 KiB ahead, a copy of a kept one, or a full queue
+; are left alone. Called with NZ from HANDLE_SEGMENT and returns NZ.
+; In: IX=context, S11_PARSE_SEQUENCE, S11_SEGMENT_LENGTH (1..MSS), payload at
+; S11_TCP_PARSE_DESC+TCPP_PAYLOAD. Clobbers AF, BC, DE, HL; preserves IX, IY.
+OOO_STORE
+	LD	A,(OOO_READY)
+	OR	A
+	JR	Z,.STORE_NZ
+	PUSH	IY
+	LD	A,(S11_PARSE_SEQUENCE+2)
+	LD	H,A
+	LD	A,(S11_PARSE_SEQUENCE+3)
+	LD	L,A
+	LD	D,(IX+CTX_RCV_NXT+2)
+	LD	E,(IX+CTX_RCV_NXT+3)
+	PUSH	HL
+	OR	A
+	SBC	HL,DE			; distance past RCV.NXT
+	POP	DE			; DE = sequence, low 16 bits
+	LD	A,H
+	OR	L
+	JR	Z,.STORE_DONE		; differs above bit 15 only: not ours
+	LD	A,H
+	CP	0x40
+	JR	NC,.STORE_DONE		; behind RCV.NXT or past 16 KiB
+	LD	IY,OOO_TABLE
+	LD	B,OOO_SLOTS
+	LD	HL,0			; first free entry
+.STORE_SCAN
+	LD	A,(IY+OOO_LEN)
+	OR	(IY+OOO_LEN+1)
+	JR	NZ,.STORE_USED
+	LD	A,H
+	OR	L
+	JR	NZ,.STORE_NEXT
+	PUSH	IY
+	POP	HL
+	JR	.STORE_NEXT
+.STORE_USED
+	LD	A,(IY+OOO_SEQ)
+	CP	E
+	JR	NZ,.STORE_NEXT
+	LD	A,(IY+OOO_SEQ+1)
+	CP	D
+	JR	Z,.STORE_DONE		; already kept
+.STORE_NEXT
+	PUSH	BC
+	LD	BC,OOO_ENTRY
+	ADD	IY,BC
+	POP	BC
+	DJNZ	.STORE_SCAN
+	LD	A,H
+	OR	L
+	JR	Z,.STORE_DONE		; every slot is taken
+	PUSH	HL
+	POP	IY
+	LD	(IY+OOO_SEQ),E
+	LD	(IY+OOO_SEQ+1),D
+	LD	BC,(S11_SEGMENT_LENGTH)
+	LD	(IY+OOO_LEN),C
+	LD	(IY+OOO_LEN+1),B
+	LD	E,(IY+OOO_DATA)
+	LD	D,(IY+OOO_DATA+1)
+	LD	HL,(S11_TCP_PARSE_DESC+TCPP_PAYLOAD)
+	CALL	OOO_COPY
+	LD	HL,OOO_COUNT
+	INC	(HL)
+	IFDEF TCPX_DIRECT_TUNING
+	LD	HL,(DTUNE_OOO_KEPT)
+	INC	HL
+	LD	(DTUNE_OOO_KEPT),HL
+	ENDIF
+.STORE_DONE
+	POP	IY
+.STORE_NZ
+	OR	1
+	RET
+
+; OOO_DRAIN appends every kept segment that now starts at RCV.NXT to the
+; caller's RECV buffer, advancing RCV.NXT and owing an ACK for it, and forgets
+; kept segments RCV.NXT has passed. It does nothing while pending bytes wait,
+; since those come first, and stops at the first segment the buffer cannot
+; take whole: the next RECV continues from there.
+;
+; Either way OOO_BLOCKED holds the ACK back (SEND_OWED_ACK) until a drain gets
+; through. One RECV buffer takes only three segments, and an ACK for part of a
+; filled hole is a partial ACK: a NewReno peer answers each one by resending a
+; segment that is already kept here, one round trip apart -- the very cost the
+; queue exists to remove. The owed ACK goes out with the next RECV instead.
+; In: IX=context; RECV scope (S11_RX_DEST/S11_RX_FREE/S11_RX_DELIVERED), whose
+; buffer must not be in WIN3. Clobbers AF, BC, DE, HL; preserves IX, IY.
+OOO_DRAIN
+	XOR	A
+	LD	(OOO_BLOCKED),A
+	LD	A,(OOO_COUNT)
+	OR	A
+	RET	Z
+	LD	A,(IX+CTX_PENDING_LEN)
+	OR	(IX+CTX_PENDING_LEN+1)
+	JR	NZ,.DRAIN_BLOCKED
+	PUSH	IY
+.DRAIN_RESTART
+	LD	D,(IX+CTX_RCV_NXT+2)
+	LD	E,(IX+CTX_RCV_NXT+3)
+	LD	IY,OOO_TABLE
+	LD	B,OOO_SLOTS
+.DRAIN_SCAN
+	LD	A,(IY+OOO_LEN)
+	OR	(IY+OOO_LEN+1)
+	JR	Z,.DRAIN_NEXT
+	LD	L,(IY+OOO_SEQ)
+	LD	H,(IY+OOO_SEQ+1)
+	OR	A
+	SBC	HL,DE
+	JR	Z,.DRAIN_TAKE
+	BIT	7,H
+	CALL	NZ,.DRAIN_FORGET	; RCV.NXT is past it
+.DRAIN_NEXT
+	PUSH	BC
+	LD	BC,OOO_ENTRY
+	ADD	IY,BC
+	POP	BC
+	DJNZ	.DRAIN_SCAN
+.DRAIN_RETURN
+	POP	IY
+	RET
+.DRAIN_FULL
+	POP	IY
+.DRAIN_BLOCKED
+	LD	(OOO_BLOCKED),A		; non-zero on both paths
+	RET
+.DRAIN_TAKE
+	LD	C,(IY+OOO_LEN)
+	LD	B,(IY+OOO_LEN+1)
+	LD	HL,(S11_RX_FREE)
+	LD	DE,(S11_RX_DELIVERED)
+	OR	A
+	SBC	HL,DE
+	SBC	HL,BC
+	JR	C,.DRAIN_FULL		; the buffer cannot take it whole
+	LD	HL,(S11_RX_DEST)
+	ADD	HL,DE
+	EX	DE,HL
+	LD	L,(IY+OOO_DATA)
+	LD	H,(IY+OOO_DATA+1)
+	PUSH	BC
+	CALL	OOO_COPY
+	POP	DE
+	LD	HL,(S11_RX_DELIVERED)
+	ADD	HL,DE
+	LD	(S11_RX_DELIVERED),HL
+	PUSH	IX
+	POP	HL
+	LD	BC,CTX_RCV_NXT
+	ADD	HL,BC
+	CALL	ADD16_TO32
+	CALL	.DRAIN_FORGET
+	IFDEF TCPX_WIDE_DIRECT_WINDOW
+	; Restart the window at what the last ACK still promises past the new
+	; RCV.NXT, rounded up to whole MSS, and grow it from there one MSS per
+	; window as at the start (tcp.inc). The edge neither moves left nor opens
+	; in pairs.
+	LD	HL,(TCP_DIRECT_EDGE_VAR)
+	LD	D,(IX+CTX_RCV_NXT+2)
+	LD	E,(IX+CTX_RCV_NXT+3)
+	OR	A
+	SBC	HL,DE
+	EX	DE,HL			; DE = still promised
+	BIT	7,D
+	JR	Z,.DRAIN_PROMISED
+	LD	DE,0			; a peer past the edge: nothing promised
+.DRAIN_PROMISED
+	LD	HL,0
+	LD	BC,TCP_MSS
+	XOR	A
+.DRAIN_ROUND_UP
+	INC	A
+	ADD	HL,BC			; at most 23 KiB: CF clear
+	PUSH	HL
+	SBC	HL,DE
+	POP	HL
+	JR	C,.DRAIN_ROUND_UP
+	LD	(TCP_DIRECT_WINDOW_VAR),HL
+	LD	H,A
+	INC	A			; this ACK itself does not count
+	LD	L,A
+	LD	(TCP_DIRECT_GROW_VAR),HL	; countdown, then the window in MSS
+	LD	A,TCP_DIRECT_PACE_POLLS
+	LD	(TCP_DIRECT_PACE_VAR),A	; and let the idle loop open it (IDLE_OPEN)
+	ENDIF
+	LD	HL,S11_ACK_OWED
+	INC	(HL)
+	LD	(S11_MATCH_CONTEXT),IX
+	JP	.DRAIN_RESTART
+.DRAIN_FORGET
+	XOR	A
+	LD	(IY+OOO_LEN),A
+	LD	(IY+OOO_LEN+1),A
+	LD	HL,OOO_COUNT
+	DEC	(HL)
+	RET
+
+; IDLE_OPEN keeps the receive path moving while nothing arrives to clock ACKs,
+; every TCP_DIRECT_PACE_POLLS calls (tcp.inc). With no hole open it grows the
+; window one MSS and sends a window update, whose paced edge therefore moves
+; one MSS, until the target -- from the first data segment and again after a
+; filled hole, where the window restarts at what was still promised. With a
+; hole open it instead resends the same duplicate ACK, unchanged: the peer
+; needs three of them to retransmit without waiting for its own timeout, and
+; what arrived behind the hole may be one or two. The repeats are bounded
+; (TCP_DIRECT_HOLE_ACKS), and any frame received refills that budget.
+; Called from WAIT_FOR_EVENT's idle poll. In: IX=selected context.
+; Out: CF on a send failure. Clobbers AF, BC, DE, HL.
+IDLE_OPEN
+	LD	HL,TCP_DIRECT_PACE_VAR
+	LD	A,(HL)
+	OR	A
+	RET	Z
+	DEC	(HL)
+	RET	NZ
+	LD	(HL),TCP_DIRECT_PACE_POLLS
+	LD	A,(OOO_COUNT)
+	OR	A
+	JR	NZ,.IDLE_HOLE
+	LD	HL,TCP_DIRECT_GROW_VAR+1	; the window in MSS
+	LD	A,(TCP_DIRECT_TARGET_VAR)
+	CP	(HL)
+	JR	C,.IDLE_OFF
+	JR	Z,.IDLE_OFF
+	INC	(HL)
+	LD	A,(HL)
+	INC	A			; this update does not count towards the
+	DEC	HL			; data-clocked growth
+	LD	(HL),A
+	LD	HL,(TCP_DIRECT_WINDOW_VAR)
+	LD	BC,TCP_MSS
+	ADD	HL,BC
+	LD	(TCP_DIRECT_WINDOW_VAR),HL
+.IDLE_ACK
+	LD	HL,S11_ACK_OWED
+	INC	(HL)
+	LD	(S11_MATCH_CONTEXT),IX
+	JP	SEND_OWED_ACK
+.IDLE_HOLE
+	; Nothing arrives to make a duplicate ACK of its own, so repeat the last
+	; one. The window is frozen while the hole is open (SEND_SEGMENT_COMMON),
+	; so the repeat is byte for byte the ACK the peer already has and still
+	; counts as a duplicate for it.
+	LD	HL,TCP_DIRECT_HOLE_VAR
+	LD	A,(HL)
+	OR	A
+	JR	Z,.IDLE_OFF
+	DEC	(HL)
+	JR	.IDLE_ACK
+.IDLE_OFF
+	XOR	A
+	LD	(TCP_DIRECT_PACE_VAR),A
+	RET
+
+; OOO_COPY moves BC bytes from HL to DE with the queue page mapped over WIN3,
+; then puts back what PAGE3 held. The ISA window is closed on every path that
+; gets here, and DSS itself keeps running with a program page in WIN3
+; (libman13.asm and win0cold.asm load into one the same way).
+; In: HL=source, DE=destination, BC=length (1..MSS). Clobbers AF, BC, DE, HL.
+OOO_COPY
+	PUSH	BC
+	LD	BC,PAGE3
+	IN	A,(C)
+	LD	(OOO_SAVED_WIN3),A
+	LD	A,(OOO_PHYS)
+	OUT	(C),A
+	POP	BC
+	LDIR
+	LD	A,(OOO_SAVED_WIN3)
+	LD	BC,PAGE3
+	OUT	(C),A
+	RET
+	ENDIF
 
 SET_EVENT
 	OR	(IX+CTX_EVENT)

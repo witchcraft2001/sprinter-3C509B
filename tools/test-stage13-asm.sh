@@ -18,13 +18,19 @@ sjasmplus --nologo --fullpath -I "$repo_root/src/include" -I "$repo_root/src/lib
 
 # Both load at 4080h and, in the standard layout, own WIN1+WIN2 outright. The
 # image is code and rodata; the runtime data area bounds it -- crossing it
-# overwrites buffers silently. For DLDIRECT that is PAGE_BASE (8000h); FTP's
-# data area starts 2 KiB higher (memory.inc's S13_IMAGE_LIMIT, 8800h), which
-# is what pays for its session receive path.
+# overwrites buffers silently. FTP's data area starts 2 KiB above PAGE_BASE
+# (memory.inc's S13_IMAGE_LIMIT, 8800h), which pays for its session receive
+# path. DLDIRECT's starts 1 KiB above it (S12_IMAGE_LIMIT, 8400h): it builds TCP
+# and DNS frames in the receive buffer, which pays for its out-of-order queue.
 ftp_size="$(wc -c < "$tmp_dir/FTP.EXE" | tr -d ' ')"
 [ "$ftp_size" -le $((0x8800 - 0x4080)) ]
 dldirect_size="$(wc -c < "$tmp_dir/DLDIRECT.EXE" | tr -d ' ')"
-[ "$dldirect_size" -le $((0x8000 - 0x4080)) ]
+[ "$dldirect_size" -le $((0x8400 - 0x4080)) ]
+grep -Fq 'S12_IMAGE_LIMIT: EQU 0x00008400' "$tmp_dir/dldirect.sym"
+grep -Fq 'STAGE9_TX_BUFFER: EQU 0x00008400' "$tmp_dir/dldirect.sym"
+grep -Fq 'TCPX_TX_BUFFER: EQU 0x00008600' "$tmp_dir/dldirect.sym"
+grep -Fq 'DNSX_TX_BUFFER: EQU 0x00008600' "$tmp_dir/dldirect.sym"
+grep -Fq 'OOO_TABLE: EQU 0x0000AB6E' "$tmp_dir/dldirect.sym"
 dlspeed_size="$(wc -c < "$tmp_dir/DLSPEED.EXE" | tr -d ' ')"
 [ "$dlspeed_size" -le $((0x9EF0 - 0x8080)) ]
 

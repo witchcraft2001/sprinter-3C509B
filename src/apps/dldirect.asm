@@ -35,14 +35,27 @@ EXE_VERSION	EQU 1
 	; fewer of them. Only a direct client with its own receive page may do
 	; this; UNET509B.DLL, WGET and FTP stay at 536.
 	DEFINE TCPX_LARGE_MSS
-	; Select a three- or eight-MSS streaming window from the card's idle RX
-	; capacity. Genuine pending-space backpressure still closes the window.
+	; Stream into a paced window: ACK every direct segment and move the right
+	; edge at most two MSS per ACK (tcp.inc). Genuine pending-space
+	; backpressure still closes the window.
 	DEFINE TCPX_WIDE_DIRECT_WINDOW
 	; One ISA-window session per receive step (el3_io.asm's RX_BEGIN/
 	; RX_PAYLOAD/RX_DROP) instead of the several RX_PENDING/READ_FRAME used
 	; apart. Additive only: RX_PENDING/READ_FRAME themselves are untouched,
 	; so ARP/DNS/other non-TCP traffic on this same EXE is unaffected.
 	DEFINE EL3_SESSION_RX
+	; Receive-path experiment on real internet paths: -w sets the window
+	; target in whole MSS, and the run reports the
+	; idle card FIFO, the SYN round trip and the loss/overflow counters
+	; (DTUNE_*, memory.inc). Without options the tcp.inc defaults apply.
+	DEFINE TCPX_DIRECT_TUNING
+	; Keep segments that arrive past a hole in a DSS page of their own, so a
+	; single loss costs one fast retransmit instead of a resend of every
+	; segment behind it (specs.md, Р4). TCP segments and the DNS query are
+	; built in the receive buffer, which is what makes room for the code
+	; (memory.inc, S12_IMAGE_LIMIT).
+	DEFINE TCPX_OOO_QUEUE
+	DEFINE TCPX_SHARED_TX
 
 	DEVICE NOSLOT64K
 	INCLUDE "version.inc"
@@ -71,11 +84,19 @@ HTTP_HEADER_LINE_VAR	EQU W12_HEADER_LINE
 ; DLDIRECT does not implement redirects, so these two cleared WGET fields can
 ; hold the receive window selected once after NETDRV.INIT.
 TCP_DIRECT_WINDOW_VAR	EQU W12_FLAGS
+TCP_DIRECT_EDGE_VAR	EQU DTUNE_RWND_EDGE
+TCP_DIRECT_TARGET_VAR	EQU DTUNE_WINDOW_SEGS
+TCP_DIRECT_GROW_VAR	EQU DTUNE_WINDOW_GROW
+TCP_DIRECT_PACE_VAR	EQU DTUNE_IDLE_PACE
+TCP_DIRECT_HOLE_VAR	EQU DTUNE_HOLE_ACKS
 
 	MODULE MAIN
 
 HTTP_IDLE_MS	EQU 15000
 RTC_ALIGN_TIMEOUT_MS EQU 2500
+; 44 * 1460 = 64,240 is the largest whole-MSS window an unscaled TCP header
+; can carry.
+DLDIRECT_WINDOW_SEGS_MAX EQU 65535 / TCP_MSS
 
 	ORG 0x4080
 	DB "EXE",EXE_VERSION
@@ -94,6 +115,7 @@ START
 	LD	HL,MSG_BANNER
 	CALL	@CONSOLE.LINE
 	CALL	CLEAR_STATE
+	CALL	OOO_ALLOCATE
 	CALL	@ARP.CLEAR_CACHE
 	CALL	PARSE_DLDIRECT_CLI
 	JR	NC,.ARGS_OK
@@ -124,10 +146,6 @@ START
 	CALL	@CONSOLE.STRING
 	LD	HL,NET_TARGET_IP
 	CALL	PRINT_IPV4
-	LD	HL,MSG_PORT
-	CALL	@CONSOLE.STRING
-	LD	HL,(W12_PORT)
-	CALL	@CONSOLE.DEC16
 	LD	HL,@CONSOLE.CRLF
 	CALL	@CONSOLE.STRING
 
@@ -142,6 +160,8 @@ START
 	JP	C,TCP_OPEN_FAIL
 	LD	HL,MSG_CONNECTED
 	CALL	@CONSOLE.LINE
+	LD	HL,TUNING_FIELDS
+	CALL	PRINT_FIELDS
 
 	LD	HL,MSG_WAIT_EDGE
 	CALL	@CONSOLE.LINE
@@ -233,26 +253,93 @@ START
 
 CLEAR_STATE
 	LD	HL,W12_STATE_BASE
-	LD	B,0x40
+	LD	B,0x40 + DTUNE_STATE_SIZE	; W12 block and the DTUNE block after it
 	XOR	A
 .CLEAR
 	LD	(HL),A
 	INC	HL
 	DJNZ	.CLEAR
+	LD	A,TCP_DIRECT_WINDOW_SEGMENTS
+	LD	(DTUNE_WINDOW_SEGS),A
+	RET
+
+; OOO_ALLOCATE takes the DSS page the out-of-order queue keeps segments in
+; (tcp_transport.asm OOO_*) and gives each table entry its slot in it. Without
+; a page the download still runs and simply discards those segments.
+; Clobbers AF, BC, DE and HL.
+OOO_ALLOCATE
+	LD	B,1
+	LD	C,DSS_GETMEM
+	RST	DSS
+	RET	C
+	LD	(OOO_BLOCK),A
+	LD	B,0
+	LD	C,BIOS_EMM_FN4
+	RST	BIOS
+	JR	C,OOO_FREE_BLOCK
+	LD	(OOO_PHYS),A
+	LD	HL,OOO_TABLE+OOO_DATA
+	LD	DE,PAGE3_ADDR
+	LD	B,OOO_SLOTS
+.SLOT
+	LD	(HL),E
+	INC	HL
+	LD	(HL),D
+	PUSH	BC
+	LD	BC,OOO_ENTRY-1
+	ADD	HL,BC
+	EX	DE,HL
+	LD	BC,TCP_MSS
+	ADD	HL,BC
+	EX	DE,HL
+	POP	BC
+	DJNZ	.SLOT
+	LD	A,1
+	LD	(OOO_READY),A
+	RET
+
+; OOO_FREE returns the queue page, if one is held. Clobbers AF and C.
+OOO_FREE
+	LD	A,(OOO_READY)
+	OR	A
+	RET	Z
+	XOR	A
+	LD	(OOO_READY),A
+OOO_FREE_BLOCK
+	LD	A,(OOO_BLOCK)
+	LD	C,DSS_FREEMEM
+	RST	DSS
 	RET
 
 RESET_HTTP_STATE
 	JP	@HTTPSTREAM.RESET
 
 ; CONFIGURE_DIRECT_WINDOW
-; Reads the empty card FIFO once before DNS/TCP traffic. Eight MSS is the safe
-; fallback; eleven is selected only if Window 3 reports room for eleven full
-; DWORD-padded Ethernet frames. Window 1 and the closed ISA mapping are
-; restored on every successful return.
+; Starts the paced window at TCP_DIRECT_INITIAL_SEGMENTS, or at the target in
+; DTUNE_WINDOW_SEGS (TCP_DIRECT_WINDOW_SEGMENTS or -w) when that is smaller,
+; with its first growth due after the connection setup, and reads the empty card FIFO once before DNS/TCP traffic, for the
+; report only: pacing (tcp.inc) keeps bursts inside three frames whatever the
+; window. The RX Overruns counter is then cleared and statistics collection
+; enabled, so PRINT_RX_STATS reports this run's overruns alone. Window 1 and
+; the closed ISA mapping are restored on every successful return.
 ; Out: A=EL3_OK/CF=0 or explicit EL3 status/CF=1.
-; Clobbers AF, DE and HL; preserves BC, IX and IY.
+; Clobbers AF, BC, DE and HL; preserves IX and IY.
 CONFIGURE_DIRECT_WINDOW
-	LD	HL,TCP_DIRECT_RECV_SAFE_WINDOW
+	LD	A,(DTUNE_WINDOW_SEGS)
+	CP	TCP_DIRECT_INITIAL_SEGMENTS
+	JR	C,.START
+	LD	A,TCP_DIRECT_INITIAL_SEGMENTS
+.START
+	LD	B,A
+	LD	H,A			; DTUNE_WINDOW_NOW
+	ADD	A,TCP_DIRECT_SETUP_SEGMENTS
+	LD	L,A			; DTUNE_WINDOW_GROW
+	LD	(DTUNE_WINDOW_GROW),HL
+	LD	HL,0
+	LD	DE,TCP_MSS
+.MULTIPLY
+	ADD	HL,DE
+	DJNZ	.MULTIPLY
 	LD	(TCP_DIRECT_WINDOW_VAR),HL
 	LD	A,3
 	CALL	@EL3.SELECT_WINDOW
@@ -260,12 +347,18 @@ CONFIGURE_DIRECT_WINDOW
 	LD	E,EL3_W3_RX_FREE
 	CALL	@EL3IO.READ16
 	JR	C,.READ_FAILED
-	LD	DE,TCP_DIRECT_RECV_WIDE_FIFO_MIN
-	OR	A
-	SBC	HL,DE
-	JR	C,.RESTORE_WINDOW
-	LD	HL,TCP_DIRECT_RECV_WIDE_WINDOW
-	LD	(TCP_DIRECT_WINDOW_VAR),HL
+	LD	(DTUNE_FIFO_FREE),HL
+	LD	A,6
+	CALL	@EL3.SELECT_WINDOW
+	JR	C,.READ_FAILED
+	LD	E,EL3_W6_RX_OVERRUNS
+	CALL	@EL3IO.READ8		; clears the counter
+	JR	C,.READ_FAILED
+	LD	HL,EL3_CMD_STATS_ENABLE
+	CALL	@EL3.CMD
+	JR	C,.READ_FAILED
+	LD	A,1
+	LD	(DTUNE_ACTIVE),A
 .RESTORE_WINDOW
 	LD	A,1
 	JP	@EL3.SELECT_WINDOW
@@ -280,11 +373,15 @@ CONFIGURE_DIRECT_WINDOW
 	POP	HL			; discard saved AF without changing new A/CF
 	RET
 
-; PARSE_DLDIRECT_CLI: exactly one positional (the URL), or -h/-?/--help.
+; PARSE_DLDIRECT_CLI: exactly one positional (the URL), optionally with
+; -w N (window target in whole MSS, 1..DLDIRECT_WINDOW_SEGS_MAX) before or
+; after it; or -h/-?.
+; W12_REDIRECTS (unused: DLDIRECT follows no redirects) marks the URL as seen.
+; Out: CF=0 parsed; CF=1 with A=EL3_CLI_HELP or NETDRV_ERR_PARAMETER.
 PARSE_DLDIRECT_CLI
 	CALL	@S9CLI.READER_INIT
-	CALL	@S9CLI.NEXT_TOKEN
-	JR	C,.BAD
+	JR	.NEXT
+.LOOP
 	LD	A,(CLI_TOKEN_LEN)
 	CP	2
 	JR	NZ,.URL
@@ -301,14 +398,41 @@ PARSE_DLDIRECT_CLI
 	JR	Z,.HELP
 	CP	'?'
 	JR	Z,.HELP
-	JR	.BAD
+	CP	'W'
+	JR	NZ,.BAD
+	CALL	@S9CLI.NEXT_TOKEN
+	JR	C,.BAD
+	CALL	PARSE_DEC16
+	JR	C,.BAD
+	LD	A,(CLI_TOKEN_LEN)
+	CP	C
+	JR	NZ,.BAD			; trailing non-digits
+	LD	A,D
+	OR	A
+	JR	NZ,.BAD
+	LD	A,E
+	DEC	A
+	CP	DLDIRECT_WINDOW_SEGS_MAX
+	JR	NC,.BAD			; zero wraps to FFh: rejected with the rest
+	INC	A
+	LD	(DTUNE_WINDOW_SEGS),A
+	JR	.NEXT
 .URL
+	LD	A,(W12_REDIRECTS)
+	OR	A
+	JR	NZ,.BAD			; exactly one URL
 	LD	DE,W12_URL
 	LD	C,255
 	CALL	@S9CLI.COPY_TOKEN
 	JR	C,.BAD
+	LD	A,1
+	LD	(W12_REDIRECTS),A
+.NEXT
 	CALL	@S9CLI.NEXT_TOKEN
-	JR	NC,.BAD			; exactly one token
+	JR	NC,.LOOP
+	LD	A,(W12_REDIRECTS)
+	OR	A
+	JR	Z,.BAD
 	XOR	A
 	RET
 .HELP
@@ -319,6 +443,87 @@ PARSE_DLDIRECT_CLI
 	LD	A,NETDRV_ERR_PARAMETER
 	SCF
 	RET
+
+; PRINT_FIELDS prints a table of labelled words and ends the line.
+; In: HL=table of entries, each a non-empty NUL-terminated label followed by DW
+; address of the word to print in decimal; a NUL after an entry ends the
+; table. Clobbers AF, DE and HL; preserves BC, IX and IY.
+PRINT_FIELDS
+	LD	A,(HL)
+	INC	HL
+	OR	A
+	JR	Z,.VALUE
+	CALL	@CONSOLE.CHAR
+	JR	PRINT_FIELDS
+.VALUE
+	LD	E,(HL)
+	INC	HL
+	LD	D,(HL)
+	INC	HL
+	EX	DE,HL
+	LD	A,(HL)
+	INC	HL
+	LD	H,(HL)
+	LD	L,A
+	CALL	@CONSOLE.DEC16
+	EX	DE,HL
+	LD	A,(HL)
+	OR	A
+	JR	NZ,PRINT_FIELDS
+	PUSH	BC
+	LD	HL,@CONSOLE.CRLF
+	CALL	@CONSOLE.STRING
+	POP	BC
+	RET
+
+; PRINT_RX_STATS: the receive-path counters, once the card has been
+; configured. RX Overruns is the card's own 8-bit counter of frames it could
+; not store because the FIFO was full; reading it here clears it, and an
+; unreadable counter is shown as 65535. The ISA window is closed again before
+; any console output. Preserves BC (FAIL_EXIT's exit code).
+PRINT_RX_STATS
+	LD	A,(DTUNE_ACTIVE)
+	OR	A
+	RET	Z
+	LD	HL,0xFFFF
+	LD	(DTUNE_OVERRUNS),HL
+	PUSH	BC
+	LD	A,6
+	CALL	@EL3.SELECT_WINDOW
+	JR	C,.WINDOW1
+	LD	E,EL3_W6_RX_OVERRUNS
+	CALL	@EL3IO.READ8
+	JR	C,.WINDOW1
+	LD	L,A
+	LD	H,0
+	LD	(DTUNE_OVERRUNS),HL
+.WINDOW1
+	LD	A,1
+	CALL	@EL3.SELECT_WINDOW
+	POP	BC
+	LD	HL,STATS_FIELDS
+	JR	PRINT_FIELDS
+
+TUNING_FIELDS
+	DB "win ",0
+	DW DTUNE_WINDOW_SEGS
+	DB " fifo ",0
+	DW DTUNE_FIFO_FREE
+	DB " syn ",0
+	DW DTUNE_SYN_TICKS
+	DB 0
+STATS_FIELDS
+	DB "ahead ",0
+	DW DTUNE_OOO_AHEAD
+	DB " kept ",0
+	DW DTUNE_OOO_KEPT
+	DB " dup ",0
+	DW DTUNE_OOO_DUP
+	DB " badsum ",0
+	DW S11_FAST_BADSUM
+	DB " overruns ",0
+	DW DTUNE_OVERRUNS
+	DB 0
 
 ; WAIT_RTC_EDGE blocks until DSS_SYSTIME's second field changes, bounded so a
 ; stopped or unavailable RTC cannot hang the measurement. The countdown is
@@ -447,43 +652,8 @@ PARSE_URL
 	CP	':'
 	JR	NZ,.BAD
 	INC	HL
-	LD	DE,0
-	LD	B,0
-.PORT
-	LD	A,(HL)
-	SUB	'0'
-	JR	C,.PORT_END
-	CP	10
-	JR	NC,.PORT_END
-	INC	B
-	LD	C,A
-	PUSH	HL
-	EX	DE,HL
-	ADD	HL,HL
-	JR	C,.PORT_OVERFLOW
-	LD	D,H
-	LD	E,L
-	ADD	HL,HL
-	JR	C,.PORT_OVERFLOW
-	ADD	HL,HL
-	JR	C,.PORT_OVERFLOW
-	ADD	HL,DE
-	JR	C,.PORT_OVERFLOW
-	LD	D,0
-	LD	E,C
-	ADD	HL,DE
-	JR	C,.PORT_OVERFLOW
-	EX	DE,HL
-	POP	HL
-	INC	HL
-	JR	.PORT
-.PORT_OVERFLOW
-	POP	HL
-	JR	.BAD
-.PORT_END
-	LD	A,B
-	OR	A
-	JR	Z,.BAD
+	CALL	PARSE_DEC16
+	JR	C,.BAD
 	LD	(W12_PORT),DE
 	LD	A,D
 	OR	E
@@ -508,6 +678,46 @@ PARSE_URL
 	RET
 .BAD
 	SCF
+	RET
+
+; PARSE_DEC16
+; In: HL -> decimal digits. Out: CF=0, DE=value, C=digits read (1..), HL at
+; the first non-digit; CF=1 when there is no digit or the value passes 65535.
+; Clobbers AF.
+PARSE_DEC16
+	LD	DE,0
+	LD	C,E
+.DIGIT
+	LD	A,(HL)
+	SUB	'0'
+	CP	10
+	JR	NC,.END			; below '0' wraps above 9 as well
+	PUSH	HL
+	LD	H,D
+	LD	L,E
+	ADD	HL,HL
+	JR	C,.OVERFLOW
+	ADD	HL,HL
+	JR	C,.OVERFLOW
+	ADD	HL,DE			; x5
+	JR	C,.OVERFLOW
+	ADD	HL,HL			; x10
+	JR	C,.OVERFLOW
+	LD	E,A
+	LD	D,0
+	ADD	HL,DE
+	JR	C,.OVERFLOW
+	EX	DE,HL
+	POP	HL
+	INC	HL
+	INC	C
+	JR	.DIGIT
+.OVERFLOW
+	POP	HL
+	RET
+.END
+	LD	A,C
+	CP	1			; CF=1: no digit at all
 	RET
 
 TOLOWER
@@ -557,8 +767,10 @@ FORMAT_DEC32
 	LD	B,0
 .DIVIDE
 	PUSH	BC
-	CALL	DIV32_10
+	LD	DE,10
+	CALL	DIV32_BY_DE
 	POP	BC
+	LD	A,L			; remainder
 	ADD	A,'0'
 	PUSH	AF
 	INC	B
@@ -574,35 +786,6 @@ FORMAT_DEC32
 	LD	(IX+0),A
 	INC	IX
 	DJNZ	.WRITE
-	RET
-
-DIV32_10
-	LD	HL,0
-	LD	B,32
-.BIT
-	PUSH	HL
-	LD	HL,W12_WORK32
-	SLA	(HL)
-	INC	HL
-	RL	(HL)
-	INC	HL
-	RL	(HL)
-	INC	HL
-	RL	(HL)
-	POP	HL
-	ADC	HL,HL
-	LD	A,L
-	CP	10
-	JR	C,.NEXT
-	SUB	10
-	LD	L,A
-	PUSH	HL
-	LD	HL,W12_WORK32
-	SET	0,(HL)
-	POP	HL
-.NEXT
-	DJNZ	.BIT
-	LD	A,L
 	RET
 
 ; TIME_START/TIME_NOW read DSS_SYSTIME into a seconds-since-midnight value;
@@ -913,28 +1096,24 @@ USAGE_FAIL
 	JP	FAIL_EXIT
 
 SUCCESS
+	CALL	PRINT_RX_STATS
 	LD	HL,MSG_OK
 	CALL	@CONSOLE.STRING
 	LD	B,DSS_EXIT_OK
 	JR	EXIT_NO_RESULT
 FAIL_EXIT
+	CALL	PRINT_RX_STATS
 	PUSH	BC
 	LD	HL,MSG_FAIL
 	CALL	@CONSOLE.STRING
 	POP	BC
+; DLDIRECT never opens a file, so only the driver and the queue page need
+; releasing.
 EXIT_NO_RESULT
-	LD	A,B
-	LD	(SAVED_EXIT_CODE),A
-	LD	A,(S9_TFTP_FILE_OPEN)
-	OR	A
-	JR	Z,.DRIVER
-	LD	A,(S9_TFTP_FILE_HANDLE)
-	LD	C,DSS_CLOSE_FILE
-	RST	DSS
-.DRIVER
+	PUSH	BC
 	CALL	@NETDRV.DONE
-	LD	A,(SAVED_EXIT_CODE)
-	LD	B,A
+	CALL	OOO_FREE
+	POP	BC
 	LD	C,DSS_EXIT
 	RST	DSS
 
@@ -952,9 +1131,8 @@ DEFAULT_PATH	DB "/",0
 MSG_BANNER	DB "3C509B DLDIRECT v",PACKAGE_VERSION,0
 MSG_RESOLVED	DB "Resolved ",0
 MSG_TO		DB " -> ",0
-MSG_PORT	DB " port ",0
 MSG_CONNECTED	DB "ESTABLISHED.",0
-MSG_WAIT_EDGE	DB "Waiting for RTC edge; transfer is silent until done...",0
+MSG_WAIT_EDGE	DB "Waiting for RTC edge...",0
 MSG_RECEIVED	DB "Received: ",0
 MSG_BYTES	DB " bytes",0
 MSG_SUMMARY_PREFIX DB "  ",0
@@ -966,24 +1144,20 @@ MSG_BPS		DB " B/s",0
 MSG_REGS	DB "REGS slot=",0
 MSG_BASE	DB " base=",0
 MSG_STATUS	DB " status=",0
-MSG_HTTP_ERROR	DB "[E] invalid or unsupported HTTP response.",0
-MSG_TCP_OPEN	DB "TCP connect failed, code 0x",0
-MSG_TCP_SEND	DB "TCP send failed, code 0x",0
+MSG_HTTP_ERROR	DB "[E] bad HTTP response",0
+MSG_TCP_OPEN	DB "TCP connect 0x",0
+MSG_TCP_SEND	DB "TCP send 0x",0
 MSG_TCP_RECV	DB "TCP recv failed, code 0x",0
-MSG_RESOLVE	DB "[E] could not resolve host.",0
-MSG_RTC_ERROR	DB "[E] RTC second did not advance.",0
-MSG_SAMPLE_SHORT DB "[E] sample too short (under one RTC second); use a larger file.",0
-MSG_ABORT	DB "Aborted by user (Esc/Ctrl+C).",0
+MSG_RESOLVE	DB "[E] DNS failed",0
+MSG_RTC_ERROR	DB "[E] RTC stopped",0
+MSG_SAMPLE_SHORT DB "[E] sample under 1 s",0
+MSG_ABORT	DB "Aborted",0
 MSG_USAGE_ERROR DB "[E] usage: missing or invalid URL",0
 MSG_HELP
-	DB "Usage:",13,10
-	DB "  DLDIRECT http://host[:port]/path",13,10
-	DB "  DLDIRECT /?",13,10
-	DB "  Discards data; use a multi-megabyte file for a stable rate.",13,10,0
+	DB "Usage: DLDIRECT http://host[:port]/path [-w 1-44]",13,10,0
 MSG_OK		DB "RESULT OK",13,10,0
 MSG_FAIL	DB "RESULT FAIL",13,10,0
 
-SAVED_EXIT_CODE EQU S10_COMMAND_BUFFER
 
 	ENDMODULE
 
@@ -1007,4 +1181,4 @@ SAVED_EXIT_CODE EQU S10_COMMAND_BUFFER
 	INCLUDE "stage12_dns.asm"
 	INCLUDE "http_stream.asm"
 
-	ASSERT $ <= PAGE_BASE
+	ASSERT $ <= S12_IMAGE_LIMIT

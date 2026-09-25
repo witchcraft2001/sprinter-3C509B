@@ -1020,7 +1020,7 @@ result = runExe(speedExe, 'http://192.168.7.44/BIG.BIN', speedScenario({
   response: {status: '200 OK', body: SPEED_BODY, headers: {}, closeDelimited: false},
 }, {clockFreezeAfterReads: 6}));
 assert.strictEqual(result.exitCode, 6, result.output);
-assert.match(result.output, /sample too short \(under one RTC second\)/);
+assert.match(result.output, /\[E\] sample under 1 s/);
 assert.match(result.output, /RESULT FAIL/);
 speedChecked(result);
 
@@ -1030,7 +1030,7 @@ result = runExe(speedExe, 'http://192.168.7.44/BIG.BIN', speedScenario({
   response: {status: '200 OK', body: SPEED_BODY, headers: {}, closeDelimited: false},
 }, {clockFreezeAfterReads: 0}));
 assert.strictEqual(result.exitCode, 2, result.output);
-assert.match(result.output, /RTC second did not advance/);
+assert.match(result.output, /\[E\] RTC stopped/);
 speedChecked(result);
 
 for (const key of ['escape', 'ctrl-c']) {
@@ -1038,7 +1038,7 @@ for (const key of ['escape', 'ctrl-c']) {
     response: {status: '200 OK', body: Buffer.alloc(40000, 0x5a), headers: {}, closeDelimited: false},
   }, {key, keyAfterHttpBytes: 2000}));
   assert.strictEqual(result.exitCode, 7, `${key}: ${result.output}`);
-  assert.match(result.output, /Aborted by user/);
+  assert.match(result.output, /\nAborted\r\n/);
   speedChecked(result);
 }
 
@@ -1063,10 +1063,55 @@ assert.ok(result.isaSessions > 0, 'harness did not report isaSessions');
 // therefore announces MSS 1460 and the peer must actually use it: a responder
 // that ignored the advertised MSS would keep this test green while the real
 // network path got none of the benefit, so assert the segment size directly.
-// The harness models MAME's 16 KiB RX partition, so DLDIRECT selects eight MSS
-// from the idle Window 3 Free Receive Bytes value and keeps it across short
-// RECV boundaries. It acknowledges each pair before the window empties.
+// DLDIRECT paces its window (tcp.inc): it acknowledges every direct segment
+// and moves the advertised right edge at most two MSS per segment it sends, so
+// no ACK lets the peer release more than two frames into the card. The window
+// starts at three MSS and grows one MSS per window's worth of segments sent, up
+// to a twelve-MSS target that survives short RECV boundaries.
 const DIRECT_MSS = 1460;
+const DIRECT_WINDOW_SEGMENTS = 12;	// tcp.inc TCP_DIRECT_WINDOW_SEGMENTS
+// Right edges of consecutive client segments that carry a window: none may
+// step more than two MSS, and the edge never moves left.
+// Windows of the pure ACKs after the request, in whole MSS: each one either repeats the last or
+// adds one, and every level below the target is held for at least as many ACKs
+// as it has segments, less the growth ACK itself and one setup segment.
+function assertLinearGrowth(value, target, label) {
+  const segments = clientTcpSegments(value);
+  const request = segments.findIndex((segment) => segment.payloadLength);
+  const levels = segments.slice(request + 1)
+    .filter((segment) => segment.flags === 0x10 && !segment.payloadLength && segment.window)
+    .map((segment) => segment.window / DIRECT_MSS);
+  const start = Math.min(3, target);
+  assert.ok(levels.length > 1 && levels[0] <= start + 1,
+    `${label}: window did not start at ${start} MSS: ${levels.join(',')}`);
+  assert.ok(levels.every((level, index) => !index ||
+    level === levels[index - 1] || level === levels[index - 1] + 1),
+    `${label}: window did not grow one MSS at a time: ${levels.join(',')}`);
+  assert.strictEqual(Math.max(...levels), target,
+    `${label}: window never reached its target: ${levels.join(',')}`);
+  for (let level = start + 1; level < target; level++) {
+    const held = levels.filter((value) => value === level).length;
+    assert.ok(held >= level - 2,
+      `${label}: window left ${level} MSS after ${held} ACKs: ${levels.join(',')}`);
+  }
+}
+function directEdgeSteps(value) {
+  const segments = clientTcpSegments(value)
+    .filter((segment) => (segment.flags & 0x10) && !(segment.flags & 0x05) && segment.window);
+  return segments.slice(1).map((segment, index) =>
+    ((segment.acknowledgement + segment.window) -
+      (segments[index].acknowledgement + segments[index].window)) | 0);
+}
+function assertPacedEdge(value, label) {
+  const steps = directEdgeSteps(value);
+  assert.ok(steps.length > 1, `${label}: no paced segments`);
+  assert.ok(steps.every((step) => step >= 0 && step <= 2 * DIRECT_MSS),
+    `${label}: right edge stepped outside 0..2 MSS: ${steps.join(',')}`);
+  // A two-MSS step releases a pair; two in a row queue a train of pairs.
+  assert.ok(steps.every((step, index) => !index || step < 2 * DIRECT_MSS ||
+    steps[index - 1] < 2 * DIRECT_MSS),
+    `${label}: right edge opened two MSS on consecutive segments: ${steps.join(',')}`);
+}
 const directData = serverTcpSegments(result).filter((segment) => segment.payloadLength);
 assert.ok(directData.length > 8, 'DLDIRECT received too few data segments to judge');
 assert.ok(directData.filter((segment) => segment.payloadLength === DIRECT_MSS).length >
@@ -1080,33 +1125,232 @@ const directAcks = clientTcpSegments(result)
 const directWindows = directAcks.map((segment) => segment.window);
 assert.ok(result.maxInFlight >= 8 * DIRECT_MSS,
   `DLDIRECT reached only ${result.maxInFlight} bytes in flight`);
-assert.ok(directWindows.every((window) => window === 8 * DIRECT_MSS),
-  `DLDIRECT did not select its eight-MSS window: ${directWindows.join(',')}`);
+assert.ok(directWindows.every((window) => window <= 12 * DIRECT_MSS),
+  `DLDIRECT advertised past its twelve-MSS target: ${directWindows.join(',')}`);
+assertLinearGrowth(result, 12, 'default');
 const directAdvances = directAcks.slice(1).map((segment, index) =>
   (segment.acknowledgement - directAcks[index].acknowledgement) >>> 0);
-assert.ok(directAdvances.some((advance) => advance === 2 * DIRECT_MSS),
-  `DLDIRECT never advanced its sliding window by two MSS: ${directAdvances.join(',')}`);
-assert.ok(directAdvances.every((advance) => advance <= 2 * DIRECT_MSS),
-  `DLDIRECT let its sliding-window ACK debt grow too far: ${directAdvances.join(',')}`);
+assert.ok(directAdvances.some((advance) => advance === DIRECT_MSS),
+  `DLDIRECT never acknowledged a single segment: ${directAdvances.join(',')}`);
+assert.ok(directAdvances.every((advance) => advance <= DIRECT_MSS),
+  `DLDIRECT let its ACK debt pass one segment: ${directAdvances.join(',')}`);
+assertPacedEdge(result, 'default');
+assert.ok(result.maxDataBurst <= 3,
+  `DLDIRECT let one segment release ${result.maxDataBurst} frames`);
+// The request is the first segment after the handshake to carry the seeded
+// edge, so the peer may start with at most three segments.
+const directRequest = clientTcpSegments(result).find((segment) => segment.payloadLength);
+assert.strictEqual(directRequest.window, 3 * DIRECT_MSS,
+  `DLDIRECT request did not offer the three-MSS initial edge: ${directRequest.window}`);
+// Without options the experiment report describes exactly that default, and a
+// clean path counts nothing out of order.
+assert.match(result.output, /^win 12 fifo 16384 syn \d+\r?$/m, result.output);
+assert.match(result.output, /^ahead 0 kept 0 dup 0 badsum 0 overruns 0\r?$/m, result.output);
 speedChecked(result);
 
-// A physical 8 KiB card may expose only a 5 KiB RX partition. Eight 1460-byte
-// frames need 12,128 FIFO bytes and would not fit there, so the same
-// executable must fall back to three MSS -- the same window the sibling
-// RTL8019A kit's direct client uses -- without a separate hardware build.
+// Р4: a segment lost on the path. The responder recovers like a SACK-less real
+// server (harness loseDataSegments: fast retransmit, then one resend per
+// partial ACK), so a client that discarded what arrived behind the hole would
+// need a resend for every one of those segments. DLDIRECT keeps them in its
+// WIN3 queue page, so each loss costs exactly one retransmission and the ACK
+// that follows it jumps past everything kept. Segments 140 and 141 are lost
+// together: the second is genuinely missing and needs its own resend. The
+// window then restarts at what is still promised and grows one MSS per window:
+// on the real path an edge reopening two MSS on consecutive ACKs sent trains
+// of pairs that overran the card. Losses must have three segments behind them:
+// the model has no retransmission timer.
+const LOSS_BODY = Buffer.alloc(262144);
+for (let i = 0; i < LOSS_BODY.length; i++) LOSS_BODY[i] = (i * 7 + (i >> 11)) & 0xff;
+result = runExe(speedExe, 'http://192.168.7.44/BIG.BIN', speedScenario({
+  response: {status: '200 OK', body: LOSS_BODY, headers: {}, closeDelimited: false},
+  loseDataSegments: [100, 140, 141],
+}, {stepLimit: 4_000_000_000}));
+assert.strictEqual(result.exitCode, 0, result.output);
+assert.match(result.output, new RegExp(`Received: ${LOSS_BODY.length} bytes`));
+assert.strictEqual(result.lostDataSegments, 3, 'loss model did not drop three segments');
+assert.strictEqual(result.retransmittedSegments, 3,
+  `DLDIRECT needed ${result.retransmittedSegments} retransmissions for three losses`);
+assert.strictEqual(result.holeWindowChanges, 0, 'DLDIRECT moved its window inside a hole');
+{
+  const match = /^ahead (\d+) kept (\d+) dup 0 badsum 0 overruns 0\r?$/m.exec(result.output);
+  assert.ok(match && Number(match[1]) > 0 && match[2] === match[1],
+    `DLDIRECT did not keep every segment past the holes: ${result.output}`);
+  const acks = clientTcpSegments(result)
+    .filter((segment) => segment.flags === 0x10 && !segment.payloadLength);
+  const jumps = acks.map((segment, index) => index &&
+    ((segment.acknowledgement - acks[index - 1].acknowledgement) >>> 0) > 2 * DIRECT_MSS ? index : 0)
+    .filter(Boolean);
+  assert.ok(jumps.length >= 2, 'no ACK jumped past kept segments');
+  for (const index of jumps)
+    assert.ok(acks[index].window <= 2 * DIRECT_MSS,
+      `window after a filled hole was not restarted: ${acks[index].window}`);
+}
+assertPacedEdge(result, 'loss');
+assert.ok(result.maxDataBurst <= 3, `loss recovery released ${result.maxDataBurst} frames at once`);
+speedChecked(result);
+
+// On a real path nothing arrives for a round trip after the jump, so no ACK
+// would clock the window back open: growing it one MSS per window cost ~0.6 s
+// per loss there. The idle receive loop sends the window updates itself, one
+// MSS each, and the peer answers each with one frame. dataDelayPolls gives the
+// card those empty polls.
+result = runExe(speedExe, 'http://192.168.7.44/BIG.BIN', speedScenario({
+  response: {status: '200 OK', body: LOSS_BODY, headers: {}, closeDelimited: false},
+  loseDataSegments: [100, 140, 141], dataDelayPolls: 30,
+}, {stepLimit: 4_000_000_000}));
+assert.strictEqual(result.exitCode, 0, result.output);
+assert.match(result.output, new RegExp(`Received: ${LOSS_BODY.length} bytes`));
+assert.strictEqual(result.lostDataSegments, 3, 'delayed loss model did not drop three segments');
+assert.strictEqual(result.retransmittedSegments, 3,
+  `window updates broke fast retransmit: ${result.retransmittedSegments} retransmissions`);
+assert.strictEqual(result.holeWindowChanges, 0, 'window updates moved the window inside a hole');
+{
+  const acks = clientTcpSegments(result)
+    .filter((segment) => segment.flags === 0x10 && !segment.payloadLength);
+  const reopened = [];
+  for (let index = 1; index < acks.length; index++) {
+    if (((acks[index].acknowledgement - acks[index - 1].acknowledgement) >>> 0) <= 2 * DIRECT_MSS)
+      continue;
+    let updates = 0;
+    for (let next = index + 1; next < acks.length &&
+      acks[next].acknowledgement === acks[index].acknowledgement; next++) {
+      const step = acks[next].window - acks[next - 1].window;
+      // One MSS is a window update; nothing at all is the duplicate ACK the
+      // idle loop repeats while the next hole is still open.
+      assert.ok(step === DIRECT_MSS || step === 0,
+        `idle reopening did not step one MSS: ${acks.slice(index, next + 1).map((s) => s.window)}`);
+      assert.ok(acks[next].window <= DIRECT_WINDOW_SEGMENTS * DIRECT_MSS,
+        `idle reopening passed the target: ${acks.slice(index, next + 1).map((s) => s.window)}`);
+      if (step) updates++;
+    }
+    reopened.push(updates);
+  }
+  assert.ok(reopened.filter((updates) => updates >= 3).length >= 2,
+    `window was not reopened from the idle loop after each jump: ${reopened.join(',')}`);
+  // The start opens the same way from the first data segment, so the window
+  // leaves the three-MSS start within the first dozen ACKs.
+  const firstData = acks.findIndex((segment, index) => index &&
+    segment.acknowledgement !== acks[index - 1].acknowledgement);
+  assert.ok(acks.slice(firstData, firstData + 12).some((segment) => segment.window >= 6 * DIRECT_MSS),
+    `start did not open from the idle loop: ${acks.slice(0, 16).map((segment) => segment.window)}`);
+  // A hole under way must also produce repeats of one ACK, since that is what
+  // earns a fast retransmit when little arrived behind the hole.
+  let repeats = 0;
+  let longest = 0;
+  for (let index = 1; index < acks.length; index++) {
+    if (acks[index].acknowledgement === acks[index - 1].acknowledgement &&
+      acks[index].window === acks[index - 1].window) repeats++;
+    else repeats = 0;
+    longest = Math.max(longest, repeats);
+  }
+  assert.ok(longest >= 3,
+    `the idle loop did not repeat a duplicate ACK while a hole was open: ${longest}`);
+}
+assertPacedEdge(result, 'delayed loss');
+assert.ok(result.maxDataBurst <= 3, `idle reopening released ${result.maxDataBurst} frames at once`);
+speedChecked(result);
+
+// While a segment waits past a hole every ACK must be a duplicate to the peer,
+// and one whose window moved is not: growth 3 -> 4 MSS inside an early hole on
+// the real path left two duplicates and a 2.9 s retransmission timeout.
+// Segment 12 is lost while the window still grows.
+result = runExe(speedExe, 'http://192.168.7.44/BIG.BIN', speedScenario({
+  response: {status: '200 OK', body: LOSS_BODY, headers: {}, closeDelimited: false},
+  loseDataSegments: [12],
+}, {stepLimit: 4_000_000_000}));
+assert.strictEqual(result.exitCode, 0, result.output);
+assert.strictEqual(result.retransmittedSegments, 1, `early loss: ${result.retransmittedSegments} retransmissions`);
+assert.strictEqual(result.holeWindowChanges, 0, 'DLDIRECT grew its window inside an early hole');
+assertPacedEdge(result, 'early loss');
+speedChecked(result);
+
+// A loss under a narrow window is what the repeats are for. With a two-MSS
+// target exactly one segment can arrive behind the hole, so the peer gets one
+// duplicate ACK and, having no retransmission timer here, would never resend:
+// this run only completes because the idle loop repeats that ACK until the
+// peer has counted three. On the real path the same shape cost the peer's own
+// timeouts, backing off to 7.8 s until the receive watchdog gave up (0x1E).
+const NARROW_BODY = Buffer.alloc(65536, 0xa5);
+result = runExe(speedExe, 'http://192.168.7.44/BIG.BIN -w 2', speedScenario({
+  response: {status: '200 OK', body: NARROW_BODY, headers: {}, closeDelimited: false},
+  loseDataSegments: [20], dataDelayPolls: 30,
+}, {stepLimit: 4_000_000_000}));
+assert.strictEqual(result.exitCode, 0, result.output);
+assert.match(result.output, new RegExp(`Received: ${NARROW_BODY.length} bytes`));
+assert.strictEqual(result.retransmittedSegments, 1,
+  `narrow window: ${result.retransmittedSegments} retransmissions for one loss`);
+assert.strictEqual(result.holeWindowChanges, 0, 'repeated ACKs moved the window inside a hole');
+{
+  const match = /^ahead (\d+) kept (\d+) dup \d+ badsum 0 overruns 0\r?$/m.exec(result.output);
+  assert.ok(match && match[1] === '1' && match[2] === '1',
+    `narrow window kept more than the one segment behind the hole: ${result.output}`);
+}
+assertPacedEdge(result, 'narrow window');
+speedChecked(result);
+
+// -w is the internet-path experiment knob: it replaces the window target in
+// whole MSS (pacing and growth still apply), before or after the URL. A target
+// under three MSS is also where the window starts.
+function directAckTrace(value) {
+  const acks = clientTcpSegments(value)
+    .filter((segment) => segment.flags === 0x10 && !segment.payloadLength);
+  return {
+    windows: acks.map((segment) => segment.window),
+    advances: acks.slice(1).map((segment, index) =>
+      (segment.acknowledgement - acks[index].acknowledgement) >>> 0),
+  };
+}
+const TUNED_BODY = Buffer.alloc(65536, 0x5a);
+for (const {args, segments} of [
+  {args: 'http://192.168.7.44/BIG.BIN -w 6', segments: 6},
+  {args: '-w 2 http://192.168.7.44/BIG.BIN', segments: 2},
+]) {
+  result = runExe(speedExe, args, speedScenario({
+    response: {status: '200 OK', body: TUNED_BODY, headers: {}, closeDelimited: false},
+  }, {stepLimit: 4_000_000_000}));
+  assert.strictEqual(result.exitCode, 0, `${args}: ${result.output}`);
+  assert.match(result.output, new RegExp(`Received: ${TUNED_BODY.length} bytes`));
+  assert.match(result.output, new RegExp(
+    `^win ${segments} fifo 16384 syn \\d+\\r?$`, 'm'), result.output);
+  const trace = directAckTrace(result);
+  assert.ok(trace.windows.length > 1, `${args}: no data ACKs`);
+  assert.ok(trace.windows.every((window) => window <= segments * DIRECT_MSS) &&
+    trace.windows.some((window) => window === segments * DIRECT_MSS),
+    `${args}: window target not forced: ${trace.windows.join(',')}`);
+  assertPacedEdge(result, args);
+  assertLinearGrowth(result, segments, args);
+  assert.ok(trace.advances.every((advance) => advance <= DIRECT_MSS) &&
+    trace.advances.some((advance) => advance === DIRECT_MSS),
+    `${args}: did not acknowledge each segment: ${trace.advances.join(',')}`);
+  speedChecked(result);
+}
+for (const args of ['http://192.168.7.44/BIG.BIN -w 0', 'http://192.168.7.44/BIG.BIN -w 45',
+  'http://192.168.7.44/BIG.BIN -a 1', 'http://192.168.7.44/BIG.BIN -w 1x',
+  'http://192.168.7.44/BIG.BIN -w', 'http://192.168.7.44/A.BIN http://192.168.7.44/B.BIN',
+  '-w 4']) {
+  result = runExe(speedExe, args, speedScenario());
+  assert.strictEqual(result.exitCode, 1, `${args}: ${result.output}`);
+  assert.match(result.output, /missing or invalid URL/, args);
+  assert.doesNotMatch(result.output, /^ahead /m, `${args}: stats before the card was configured`);
+  speedChecked(result);
+}
+
+// A physical 8 KiB card may expose only a 5 KiB RX partition, which stores
+// three 1460-byte frames. The real-Sprinter matrix (specs.md, Р2) showed that
+// the window size is not what overflows it: a back-to-back burst of four is.
+// So the same executable keeps its twelve-MSS target there and relies on pacing:
+// no client segment may release more than the three frames the FIFO holds
+// (the three-MSS request, then at most two per ACK).
 const SMALL_FIFO_BODY = Buffer.alloc(32768, 0x6b);
 result = runExe(speedExe, 'http://192.168.7.44/BIG.BIN', speedScenario({
   response: {status: '200 OK', body: SMALL_FIFO_BODY, headers: {}, closeDelimited: false},
 }, {rxFifoBytes: 5 * 1024}));
 assert.strictEqual(result.exitCode, 0, result.output);
 assert.match(result.output, new RegExp(`Received: ${SMALL_FIFO_BODY.length} bytes`));
-const smallFifoAcks = clientTcpSegments(result)
-  .filter((segment) => segment.flags === 0x10 && !segment.payloadLength);
-assert.ok(smallFifoAcks.length > 1, 'small-FIFO DLDIRECT emitted no data ACKs');
-assert.ok(smallFifoAcks.every((segment) => segment.window === 3 * DIRECT_MSS),
-  `small-FIFO DLDIRECT exceeded three MSS: ${smallFifoAcks.map((segment) => segment.window).join(',')}`);
-assert.ok(result.maxInFlight >= 3 * DIRECT_MSS && result.maxInFlight < 8 * DIRECT_MSS,
-  `small-FIFO DLDIRECT reached unsafe in-flight size ${result.maxInFlight}`);
+assert.match(result.output, /^win 12 fifo 5120 syn \d+\r?$/m, result.output);
+assertPacedEdge(result, 'small FIFO');
+assert.ok(result.maxDataBurst >= 2 && result.maxDataBurst <= 3,
+  `small-FIFO DLDIRECT let one segment release ${result.maxDataBurst} frames`);
 speedChecked(result);
 
 // Round-2's two-phase receive (see the throughput plan) only fast-paths a
@@ -1142,6 +1386,12 @@ for (const tcp of [{duplicateData: true}, {outOfOrderBeforeData: true},
     assert.match(result.output, new RegExp(`Received: ${FAULT_BODY.length} bytes`),
       `${JSON.stringify(tcp)}: ${result.output}`);
   }
+  // A segment past RCV.NXT counts as "ahead" (a hole), a retransmission of
+  // data already taken as "dup"; each fault must land in its own counter.
+  if (tcp.outOfOrderBeforeData)
+    assert.match(result.output, /^ahead [1-9]\d* kept [1-9]\d* dup \d+ /m, result.output);
+  if (tcp.duplicateData)
+    assert.match(result.output, /^ahead 0 kept 0 dup [1-9]\d* /m, result.output);
   speedChecked(result);
 }
 
@@ -1225,7 +1475,7 @@ for (const response of [
 ]) {
   result = runExe(speedExe, 'http://192.168.7.44/REJECT.BIN', speedScenario({response}));
   assert.strictEqual(result.exitCode, 6, result.output);
-  assert.match(result.output, /invalid or unsupported HTTP response/);
+  assert.match(result.output, /\[E\] bad HTTP response/);
   assert.match(result.output, /RESULT FAIL/);
   speedChecked(result);
 }

@@ -43,6 +43,9 @@ EL3_W5_RX_EARLY		EQU 0x06
 EL3_W5_RX_FILTER	EQU 0x08
 EL3_W5_INTR_MASK	EQU 0x0A
 EL3_W5_READ_ZERO_MASK	EQU 0x0C
+; Window 6 statistics are 8-bit counters that clear when read and count only
+; after Statistics Enable.
+EL3_W6_RX_OVERRUNS	EQU 0x05
 
 EL3_CMD_GLOBAL_RESET	EQU 0x0000
 EL3_CMD_SELECT_WINDOW	EQU 0x0800

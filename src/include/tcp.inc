@@ -30,28 +30,64 @@ TCP_MSS			EQU 536
 TCP_RECV_MAX_SEGMENTS	EQU 5
 TCP_RECV_MAX_WINDOW	EQU TCP_RECV_MAX_SEGMENTS * TCP_MSS
 	IFDEF TCPX_WIDE_DIRECT_WINDOW
-; DLDIRECT reads Window 3 Free Receive Bytes once while the initialized FIFO
-; is empty, and promises only what that FIFO can really hold: the window is the
-; backstop for frames that arrive while the application is between RECV calls,
-; and a promise the card cannot store becomes a drop and a retransmit.
-	IFDEF TCPX_LARGE_MSS
-; At 1460 a stored frame costs 1,516 FIFO bytes. Three need 4,548 and still fit
-; the smallest legal 5 KiB RX share of an 8 KiB card -- which is also exactly
-; the three-segment window the sibling kit's direct client settled on. Eight
-; need 12,128 and are enabled only when the card reports at least that much.
-TCP_DIRECT_RECV_SAFE_SEGMENTS EQU 3
-TCP_DIRECT_RECV_WIDE_SEGMENTS EQU 8
-	ELSE
-; Eight maximum frames need 4,736 FIFO bytes and fit a 5 KiB RX partition;
-; eleven need 6,512 and are enabled only when the card reports at least that
-; much room (MAME reports its full 16 KiB RX partition).
-TCP_DIRECT_RECV_SAFE_SEGMENTS EQU 8
-TCP_DIRECT_RECV_WIDE_SEGMENTS EQU 11
-	ENDIF
-TCP_DIRECT_RECV_SAFE_WINDOW EQU TCP_DIRECT_RECV_SAFE_SEGMENTS * TCP_MSS
-TCP_DIRECT_RECV_WIDE_WINDOW EQU TCP_DIRECT_RECV_WIDE_SEGMENTS * TCP_MSS
-TCP_DIRECT_RECV_FIFO_FRAME EQU (14 + 20 + TCP_HEADER_LENGTH + TCP_MSS + 3) & 0xFFFC
-TCP_DIRECT_RECV_WIDE_FIFO_MIN EQU TCP_DIRECT_RECV_WIDE_SEGMENTS * TCP_DIRECT_RECV_FIFO_FRAME
+; DLDIRECT's receive window is paced, not sized to the card. The real-Sprinter
+; matrix (specs.md, Р2) lost nothing on the internet path itself: every
+; retransmission was a card RX overrun or a segment dropped behind one. The
+; 3C509B keeps three full frames, the server sends its frames back to back
+; 0.06 ms apart, so any burst of four overflows however fast the Z80 drains.
+; Bursts come from the peer's right edge jumping -- its initial window clipped
+; by ours, an ACK of two MSS releasing four frames while cwnd grows, and the
+; cumulative ACK that fills a hole. Acknowledging every direct segment and
+; moving the advertised right edge at most two MSS per ACK caps each release
+; at two frames, so the window itself can be wider than the FIFO.
+;
+; The paced rerun (Р3) still lost frames while the window grew: one MSS of
+; growth per ACK lets every ACK release a pair, twice what the Z80 drains, and
+; the queue reaches the fourth frame. The window now starts at three MSS and
+; grows one MSS per window's worth of segments sent, so pairs are rare, then
+; holds at the target. Target 12 beat 9 on the same path (144 vs 104 KB/s
+; without stalls): at 100 ms RTT nine MSS cap the flow near 130 KB/s.
+TCP_DIRECT_WINDOW_SEGMENTS EQU 12	; target
+TCP_DIRECT_INITIAL_SEGMENTS EQU 3
+; The SYN, the handshake ACK and the request precede the first data ACK.
+TCP_DIRECT_SETUP_SEGMENTS EQU 3
+TCP_DIRECT_EDGE_STEP	EQU 2 * TCP_MSS
+; A filled hole (the out-of-order queue, Р4) moves RCV.NXT past everything kept
+; at once. Reopening the right edge two MSS per ACK from there sent pairs that
+; overran the card on the real path within three ACKs, so the window restarts
+; at what is still promised (tcp_transport.asm OOO_DRAIN).
+; Growing it back one MSS per window then cost ~0.6 s per loss on the real
+; path (1 -> 9 MSS in a second; 83 KB/s with 36 losses). Nothing arrives to
+; clock ACKs right after the jump, so the idle wait loop opens the window
+; itself: one MSS and a window update every TCP_DIRECT_PACE_POLLS polls that
+; find the card empty (NETTIME quanta, ~1.9 ms each on a real Sprinter) until
+; the target. The peer, holding a backlog, answers each update with one frame,
+; so they arrive one round trip later spaced like updates, near the ~8 ms the
+; Z80 takes per segment. A frame received restarts the count: on a short path
+; data clocks the growth as before (tcp_transport.asm IDLE_OPEN). The start
+; uses it too, from the first data segment: the linear start spent ~1 s under
+; four MSS, where a loss has too few segments behind it for three duplicate
+; ACKs and costs a retransmission timeout (2.9 s on the real path). While a
+; hole is open the window does not move at all, or the ACKs stop counting as
+; duplicates.
+; Capping the idle reopening at half the target to keep the peer paced was a
+; regression and is gone: at 100 ms RTT six MSS cap the flow near 83 KB/s
+; (measured 75-77 KB/s), and a hole opening under such a window leaves the peer
+; two segments behind it -- one below the three duplicate ACKs a fast
+; retransmit needs. The two runs that lost anything then spent 15 s and 22 s in
+; the peer's retransmission timeouts, backing off 0.3 -> 1.8 -> 7.8 s until the
+; receive watchdog gave up (0x1E). At the full target eleven segments follow a
+; hole and the peer retransmits within a round trip.
+; That leaves the bunching this cap was aimed at: while nothing arrives the
+; idle loop resends the same duplicate ACK, so three of them reach the peer
+; from the segments that did arrive plus repeats, whatever its congestion
+; window holds. The repeats are bounded, since after them the peer's own
+; timeout is the only thing left to wait for.
+TCP_DIRECT_PACE_POLLS	EQU 4
+TCP_DIRECT_HOLE_ACKS	EQU 8
+; SYN|ACK seeds the edge one MSS behind RCV.NXT: the handshake ACK offers one
+; MSS and the request after it three, before the peer has any data to send.
+TCP_DIRECT_INITIAL_EDGE	EQU (0 - TCP_MSS) & 0xFFFF
 	ENDIF
 
 ; Receive window advertised while a channel is not backpressured: a whole

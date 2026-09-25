@@ -483,6 +483,27 @@ class EtherLinkIII {
     // the depth of the receive pipe, and the one number that says whether an
     // advertised window is actually keeping segments in flight.
     this.maxInFlight = 0;
+    // Most data frames one client segment released at once: the burst a
+    // three-frame card FIFO has to absorb before the client drains any.
+    this.maxDataBurst = 0;
+    // Loss model for the receive path (tcp.loseDataSegments): the listed data
+    // segments, counted from 1 in send order, never reach the card. The
+    // responder then recovers the way a SACK-less real server does -- a fast
+    // retransmit on the third duplicate ACK and NewReno's one resend per
+    // partial ACK -- so a client that discards what arrives behind a hole
+    // needs one retransmission per discarded segment, and one that keeps them
+    // needs exactly one per loss. There is no retransmission timer: a loss
+    // needs three segments behind it.
+    this.dataSegmentsSent = 0;
+    this.lostDataSegments = 0;
+    // Pure ACKs whose window changed while the client had already read a
+    // segment past a lost one: a real peer stops counting those as duplicates,
+    // so a hole with few segments behind it waits for a retransmission timer.
+    this.holeWindowChanges = 0;
+    this.retransmittedSegments = 0;
+    // tcp.trace: one line per client segment and per server data segment, in
+    // wire order, sequence numbers relative to the connection's ISNs.
+    this.tcpTrace = [];
     // The mirror of the above for the other direction: peak bytes the client
     // put on the wire before it had read an acknowledgement for them. One MSS
     // means the send path is strict stop-and-wait; a deeper number means its
@@ -505,6 +526,14 @@ class EtherLinkIII {
     if (!connection) return;
     const left = (connection.clientNext - segment.acknowledgement) >>> 0;
     connection.clientInFlight = left > 0x7fffffff ? 0 : left;
+    if (connection.lostSequences && segment.payload.length) {
+      connection.lostSequences.delete(segment.sequence);
+      const offset = (value) => (value - connection.serverIsn) >>> 0;
+      const holes = [...connection.lostSequences]
+        .filter((sequence) => offset(sequence) < offset(segment.sequence));
+      connection.holeAck = holes.length ?
+        holes.reduce((a, b) => (offset(a) < offset(b) ? a : b)) : undefined;
+    }
   }
 
   resetRuntime() {
@@ -869,11 +898,19 @@ class EtherLinkIII {
     // later trigger as if the RST had never happened.
     if (connection.aborted) return;
     connection.lastSegment = segment;
+    if (options.trace) this.tcpTrace.push(`C ack ${(segment.acknowledgement - connection.serverIsn - 1) >>> 0} ` +
+      `win ${segment.window} len ${segment.payload.length} flags ${segment.flags.toString(16)}`);
+    const previousWindow = connection.clientWindow;
     connection.clientWindow = segment.window;
+    if (connection.holeAck !== undefined && segment.acknowledgement === connection.holeAck &&
+        !segment.payload.length && segment.window !== previousWindow) this.holeWindowChanges++;
     if (segment.flags & 0x10) {
+      const previousAck = connection.serverAcked;
       const acknowledged = (segment.acknowledgement - connection.serverAcked) >>> 0;
       const outstanding = (connection.serverNext - connection.serverAcked) >>> 0;
       if (acknowledged <= outstanding) connection.serverAcked = segment.acknowledgement;
+      if (connection.sentSegments)
+        this.recoverLoss(connection, segment, previousAck, previousWindow, options);
     }
     if (!connection.established && !segment.payload.length && !(segment.flags & 1) &&
         segment.acknowledgement === connection.serverNext) {
@@ -1009,9 +1046,10 @@ class EtherLinkIII {
   drainConnectionSendQueue(connection, template, options) {
     const queue = (reply) => {
       this.generated.push(reply);
-      if (this.accepts(reply)) this.rxQueue.push({frame: reply, cursor: 0});
+      if (this.accepts(reply)) this.deliverData(reply, options);
     };
     let sentAny = false;
+    let burst = 0;
     for (;;) {
       const inFlight = (connection.serverNext - connection.serverAcked) >>> 0;
       const available = Math.max(0, connection.clientWindow - inFlight);
@@ -1055,7 +1093,23 @@ class EtherLinkIII {
         damaged[54 + (options.corruptDataOnce === true ? 0 : options.corruptDataOnce)] ^= 0xff;
         queue(damaged);
       }
-      queue(reply);
+      if (options.loseDataSegments) {
+        if (!connection.sentSegments) connection.sentSegments = [];
+        connection.sentSegments.push({sequence: connection.serverNext, payload: Buffer.from(payload),
+          fin: remoteFin});
+      }
+      if (options.trace) this.tcpTrace.push(`S seq ${(connection.serverNext - connection.serverIsn - 1) >>> 0}` +
+        ` len ${size}${options.loseDataSegments && options.loseDataSegments.includes(this.dataSegmentsSent + 1) ?
+          ' LOST' : ''}`);
+      if (options.loseDataSegments && options.loseDataSegments.includes(++this.dataSegmentsSent)) {
+        if (!connection.lostSequences) connection.lostSequences = new Set();
+        connection.lostSequences.add(connection.serverNext);
+        this.generated.push(reply);
+        this.lostDataSegments++;
+      } else {
+        queue(reply);
+      }
+      this.maxDataBurst = Math.max(this.maxDataBurst, ++burst);
       if (options.mode === 'http') this.httpBytesSent += size;
       if (options.duplicateData) queue(reply.slice());
       if (options.outOfOrderFinAfterData && !connection.badFinSent) {
@@ -1093,6 +1147,52 @@ class EtherLinkIII {
       }
     }
     return sentAny;
+  }
+
+  // A duplicate ACK is a pure ACK that neither advances nor changes the window
+  // while data is outstanding, as a real stack counts it.
+  recoverLoss(connection, segment, previousAck, previousWindow, options) {
+    const offset = (value) => (value - connection.serverIsn) >>> 0;
+    const sent = connection.sentSegments;
+    while (sent.length && offset(sent[0].sequence) + sent[0].payload.length <=
+        offset(connection.serverAcked)) sent.shift();
+    if (connection.serverAcked !== previousAck) {
+      connection.duplicateAcks = 0;
+      if (connection.recover !== undefined) {
+        if (offset(connection.serverAcked) < offset(connection.recover))
+          this.retransmitAt(connection, segment, options);
+        else connection.recover = undefined;
+      }
+      return;
+    }
+    if (connection.serverNext === connection.serverAcked || segment.payload.length ||
+        (segment.flags & 0x07) || segment.window !== previousWindow) return;
+    connection.duplicateAcks = (connection.duplicateAcks || 0) + 1;
+    if (connection.duplicateAcks === 3 && connection.recover === undefined) {
+      connection.recover = connection.serverNext;
+      this.retransmitAt(connection, segment, options);
+    }
+  }
+
+  retransmitAt(connection, template, options) {
+    const entry = connection.sentSegments.find((item) => item.sequence === connection.serverAcked);
+    if (!entry) return;
+    this.retransmittedSegments++;
+    if (options.trace) this.tcpTrace.push(`R seq ${(entry.sequence - connection.serverIsn - 1) >>> 0}`);
+    const reply = buildTcpReply(template, {sequence: entry.sequence,
+      acknowledgement: connection.clientNext, flags: entry.fin ? 0x19 : 0x18, payload: entry.payload,
+      window: connection.advertisedWindow, mac: options.mac, ip: options.ip});
+    this.generated.push(reply);
+    if (this.accepts(reply)) this.deliverData(reply, options);
+  }
+
+  // tcp.dataDelayPolls: server data reaches the card that many RX status polls
+  // after the client segment that released it, in order. It stands in for a
+  // path round trip: the client's receive loop sees an empty card between
+  // trains, which is what its idle-time window reopening (DLDIRECT) needs.
+  deliverData(reply, options) {
+    if (options.dataDelayPolls) this.delayed.push({polls: options.dataDelayPolls, frame: reply});
+    else this.rxQueue.push({frame: reply, cursor: 0});
   }
 
   // ------------------------------------------------------------------
@@ -2224,6 +2324,11 @@ function runExe(exePath, args = '', inputScenario = {}) {
       tcp: card.tcpRequestCount,
     },
     maxInFlight: card.maxInFlight,
+    maxDataBurst: card.maxDataBurst,
+    lostDataSegments: card.lostDataSegments,
+    holeWindowChanges: card.holeWindowChanges,
+    retransmittedSegments: card.retransmittedSegments,
+    tcpTrace: card.tcpTrace,
     maxClientInFlight: card.maxClientInFlight,
     probedSlots: [...probedSlots].sort(),
     probedIdPorts: [...probedIdPorts].sort((a, b) => a - b),

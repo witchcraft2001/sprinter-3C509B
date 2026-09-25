@@ -8,14 +8,16 @@ the FAT12 diagnostic IMG.
 ## Usage
 
 ```text
-DLDIRECT http://host[:port]/path
+DLDIRECT http://host[:port]/path [-w 1-44]
 DLSPEED  http://host[:port]/path
 DLDIRECT /?
 DLSPEED /?
 ```
 
-Both take a single plain-HTTP URL and no options. Run `NETCFG -i` and `IFUP`
-first.
+Both take a single plain-HTTP URL. `DLSPEED` has no options; `DLDIRECT`'s one
+option is a receive-path experiment knob, described in
+[Receive-window experiments](#receive-window-experiments). Run `NETCFG -i` and
+`IFUP` first.
 
 ## The two paths
 
@@ -38,18 +40,21 @@ degenerates into a zero-window stop/start cycle. The sibling RTL8019A kit draws
 the line in the same place, and its direct client has run 1,460 against a
 536-byte DLL throughout.
 
-It keeps a FIFO-qualified receive window across its short `RECV` boundaries.
-Before any network traffic it reads the documented Window 3 Free Receive Bytes
-register: at least 12,128 free bytes selects eight MSS (the MAME model exposes
-a 16 KiB RX partition), otherwise it uses three MSS. Three maximum-size stored
-frames occupy 4,548 bytes and fit the smallest legal 5 KiB RX share of an
-8 KiB 3C509B configuration; a genuinely full software pending area still
-closes the window. The 5 KiB caller buffer remains a separate three-segment
-batching boundary, and the durable software pending region holds two whole
-segments. Every outgoing frame retains the checked, finitely bounded
-transmit-completion path. Clean in-order data is acknowledged every two
-segments so the selected window slides while the peer refills it; slow-path,
-loss, FIN and an early/partial return still force a cumulative ACK.
+It paces a nine-MSS receive window across its short `RECV` boundaries. The
+card stores only three maximum-size frames (4,548 bytes of the smallest legal
+5 KiB RX share of an 8 KiB 3C509B), and a server sends its frames back to back,
+so what overflows the FIFO is a burst of four, not the window size (see
+[Receive-window experiments](#receive-window-experiments)). `DLDIRECT`
+therefore acknowledges every in-order segment and moves the advertised right
+edge (acknowledgement plus window) at most two MSS per segment it sends: the
+handshake ACK offers one MSS, the request three, and every later ACK can
+release at most two frames while the window grows to its target. A genuinely
+full software pending area still closes the window. The Window 3 Free Receive
+Bytes value is read once for the report only. The 5 KiB caller buffer remains a
+separate three-segment batching boundary, and the durable software pending
+region holds two whole segments. Every outgoing frame retains the checked,
+finitely bounded transmit-completion path. Slow-path, loss, FIN and an
+early/partial return still force a cumulative ACK.
 
 Because the advertised MSS only matters if the peer honours it, both test peers
 do: the raw MAME responder (`tools/host/stage13_responder.py`) and the
@@ -86,6 +91,105 @@ used as a release build.
 The difference `DLDIRECT - DLSPEED` is intentionally the full price of the
 public DLL path: libman dispatch, UNET API handling and the DLL's receive path.
 There is no `DLDIRCP` midpoint in this design.
+
+## Receive-window experiments
+
+A real internet download is limited by the receive window, not by the Z80: a
+capture of `DLDIRECT` fetching a 5.76 MB file over a 100 ms round trip showed
+the server sending exactly three segments per acknowledgement cycle (35.9 KB/s),
+while the Sprinter needed only about 8 ms per 1,460-byte segment. A single lost
+segment also cost two retransmission timeouts, because a three-segment window
+cannot produce the three duplicate ACKs fast retransmit needs and the segments
+behind the hole are discarded. `DLDIRECT` therefore takes one option and
+reports what the run saw, so the window can be measured on the real path:
+
+- `-w N` sets the window target to N whole 1,460-byte segments (1-44; 44 is
+  the largest window an unscaled TCP header carries) instead of twelve.
+
+Every in-order segment is acknowledged at once. The window starts at three
+segments (or at N when that is smaller) and grows by one segment each time
+as many segments were sent as it holds, until it reaches the target; the
+advertised right edge never moves more than two segments per ACK.
+
+The option may precede or follow the URL. Two extra lines are printed, neither
+inside the timed region:
+
+```text
+ESTABLISHED.
+win 12 fifo 5119 syn 81
+...
+ahead 0 kept 0 dup 0 badsum 0 overruns 0
+RESULT OK
+```
+
+| Field | Meaning |
+|-------|---------|
+| `win` | Receive window target in whole 1,460-byte segments (`-w`) |
+| `fifo` | Window 3 Free Receive Bytes read once on the idle card: the RX share of the FIFO |
+| `syn` | Poll ticks between the SYN and its SYN\|ACK; about 1.3 ms per tick on the real Sprinter measured against a pcap |
+| `ahead` | Data segments that arrived past a hole: a segment before them was lost on the path or dropped by a full card |
+| `kept` | Of those, segments stored in the out-of-order queue and delivered once the hole filled; the rest were discarded |
+| `dup` | Data segments retransmitted after they were already taken |
+| `badsum` | Direct-path segments whose TCP checksum failed |
+| `overruns` | The card's own Window 6 RX Overruns counter (8-bit, cleared at start): frames lost because the FIFO was full |
+
+The counter line appears on every exit after the card was configured, including
+failures and Esc, so a stalled experiment still reports what it saw.
+
+Collect results against one multi-megabyte internet URL, the same one for every
+run, preferably a server at least 50 ms away:
+
+1. Run `DLDIRECT url` without options three times. Note the three KB/s results
+   and both extra lines.
+2. Run `DLDIRECT url -w N` for N = 9, 12, 15 and 20, twice each.
+3. For every run record the summary line, the `win`, `syn`, `ahead`, `dup` and
+   `overruns` values, and whether the run ended with `RESULT OK`.
+4. Capture a pcap of at least one run per window value. On a Keenetic router
+   disable flow offload for the capture (`no ppe hardware`, `no ppe software`)
+   and re-enable it afterwards; with offload on, server frames stop appearing
+   after a few seconds.
+
+Reading the results: a rate that keeps rising with `-w` while `overruns` stays 0
+means the window is the limit and the card still keeps up. Non-zero `overruns`
+means some burst still reached four frames. `ahead` counts the segments
+discarded behind each such hole; `ahead` without `overruns` is loss on the
+internet path.
+
+The first matrix (2026-09-17, 5.76 MB over a 90-110 ms round trip, before
+pacing) is recorded in `specs.md`: every server retransmission was a card
+overrun or a segment discarded behind one, a three-MSS window gave 38 KB/s,
+nine MSS 71 KB/s, twelve MSS collapsed to 22 KB/s, and nine MSS acknowledged
+per segment reached 108 KB/s with a few overruns left from the server's
+initial burst. Pacing is the fix for that remainder.
+
+An evening rerun with slow growth reached 144 KB/s with no loss at all; every
+hole left in the other runs was a loss before the router, and each cost about
+two seconds because the segments behind it were discarded and resent one per
+round trip. `DLDIRECT` therefore keeps up to eleven such segments in a DSS page
+of its own (mapped over WIN3 only while one is copied), so the retransmission
+that fills a hole is acknowledged together with everything kept behind it. The
+window then restarts at what the previous ACK still promised, and segments
+behind a hole take the single-pass checksummed read like in-order ones.
+Growing that window back one MSS per window cost about 0.6 s per loss on the
+real path, so while the card stays empty the receive loop reopens it itself:
+one MSS and a window update every four idle polls (about 8 ms, the Z80's cost
+per segment) up to the target. The peer answers each update with one frame.
+The start opens the same way from the first data segment, and while a hole is
+open no ACK moves the window: a moved window stops the peer counting the ACK
+as a duplicate, which on the real path turned an early loss into a 2.9 s
+retransmission timeout. Capping that reopening at half the target to keep the
+peer paced was tried and reverted: six MSS cap the flow near 83 KB/s at a
+100 ms round trip, and a hole opening under such a window leaves the peer too
+few duplicate ACKs to retransmit without its own timeout, which on the real
+path backed off to 7.8 s and hit the receive watchdog. While a hole is open and
+nothing arrives, the idle loop instead repeats the same duplicate ACK, up to
+eight times, so three of them reach the peer whatever its congestion window
+holds.
+
+The paced rerun (same day) kept the steady flow clean, 87 KB/s at nine MSS
+and 137 KB/s at twelve, but still overran while the window grew one MSS per
+ACK: each ACK then released a pair, twice the drain rate. Twelve MSS became
+the default and the window now grows one MSS per window of segments.
 
 ## Timing and response rules
 
@@ -144,9 +248,14 @@ The mandatory MAME gates are:
   `DLSPEED >= 76 KB/s`.
 
 For the `DLDIRECT` trace, record that its SYN advertises MSS 1460, that the
-body segments really are 1460 bytes, that the advertised window is 11,680
-(eight MSS) on the 16 KiB MAME partition or 4,380 (three MSS) on a 5 KiB one,
-and that cumulative ACKs normally advance by 2,920. A run that still shows
+body segments really are 1460 bytes, that the request advertises 4,380 (three
+MSS), that no advertised right edge moves more than 2,920 past the previous
+one, that after a lost segment the server resends only that segment and the
+next ACK jumps past everything received behind it with a window of at most
+2,920 that then grows one MSS per window, that the window grows one MSS at a time (each value held for about
+as many ACKs as it has segments) and stays at 17,520 (twelve MSS) on either
+FIFO size, and
+that cumulative ACKs normally advance by 1,460. A run that still shows
 536-byte segments means the responder ignored the MSS option, not that the
 client failed to ask.
 

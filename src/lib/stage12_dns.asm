@@ -12,8 +12,14 @@ DNS_TIMEOUT_MS	EQU 5000
 
 ; The query frame is built before anything has been received this attempt
 ; (RX is idle at that point, same reasoning as UDPX_TX_BUFFER/TCPX_TX_BUFFER),
-; so for UNET_DLL it reuses the RX buffer instead of a dedicated reservation.
+; so for UNET_DLL and DLDIRECT (TCPX_SHARED_TX) it reuses the RX buffer instead
+; of a dedicated reservation.
 	IFDEF	UNET_DLL
+	IFNDEF	TCPX_SHARED_TX
+	DEFINE	TCPX_SHARED_TX
+	ENDIF
+	ENDIF
+	IFDEF	TCPX_SHARED_TX
 DNSX_TX_BUFFER		EQU STAGE9_RX_BUFFER
 DNSX_TX_CAPACITY	EQU STAGE9_RX_CAPACITY
 	ELSE
