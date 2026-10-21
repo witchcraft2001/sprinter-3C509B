@@ -232,9 +232,9 @@ CANCELKEYS всегда. Ожидается `Send failed.`, `lasterr: ... st=03 
 `RESULT FAIL code=3`.
 
 Если Esc не успел, будет `gave up after too many NERR_AGAIN resumes`. Тогда
-CLOSE внутри `UNETTEST` получает `NERR_BUSY`, а соединение закрывает выгрузка
-DLL (FINI). В проводе результат тот же, но это не тот путь, повторите
-попытку.
+CLOSE владельца внутри `UNETTEST` отменяет SEND и отправляет RST.
+Это другой путь, не CANCELKEYS; для проверки клавиши
+повторите попытку.
 
 - **Если в pcap после последнего сегмента данных Sprinter есть
   неподтверждённые байты:** сразу за Esc идут два `Flags [R.]` от Sprinter.

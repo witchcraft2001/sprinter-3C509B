@@ -117,7 +117,7 @@ for my $name (qw(NETCFG IFUP ARP)) {
             && unpack('v', substr($image, 20, 2)) == ($name eq 'IFUP' ? 0xBEF0 : 0xBFF0);
     die "$name crosses 0xC000\n" if 0x8080 + length($image) > 0xC000;
     die "$name banner/version is missing\n"
-        unless index($image, "3C509B $name v0.1.3\0") >= 128;
+        unless index($image, "3C509B $name v0.1.4\0") >= 128;
 }
 
 my $local = slurp('src/include/unet.inc', 1);
@@ -125,8 +125,15 @@ open my $rtl_fh, '<:raw', "$root/../sprinter-rtl8019a/src/include/unet.inc"
     or die "cannot read peer UNET ABI ../sprinter-rtl8019a/src/include/unet.inc: $!\n";
 my $rtl = do { local $/; <$rtl_fh> };
 close $rtl_fh;
-die "src/include/unet.inc diverges byte-for-byte from ../sprinter-rtl8019a/src/include/unet.inc\n"
-    unless $rtl eq $local;
+# Comments may document backend policies; executable declarations stay frozen.
+sub abi_code {
+    my ($text) = @_;
+    $text =~ s/;[^\n]*//g;
+    $text =~ s/\s+//g;
+    return $text;
+}
+die "src/include/unet.inc executable ABI diverges from ../sprinter-rtl8019a/src/include/unet.inc\n"
+    unless abi_code($rtl) eq abi_code($local);
 
 # unet.inc states what CLOSE/NETDONE report; how long a close may take to
 # reach that verdict is the FIN retransmission budget, which lives in the
@@ -150,7 +157,7 @@ die "tools/test-stage14-asm.sh no longer runs the CLOSE/NETDONE vectors\n"
 # The WiFi sibling may move ahead with deferred Stage 8 LISTEN/ACCEPT symbols
 # while this backend retains RESERVED18/19 at the same numeric slots.
 # Compare the shared numeric declarations, while keeping the Stage 7 copy
-# byte-identical to the RTL sibling used by this backend.
+# numerically identical to the RTL sibling used by this backend.
 open my $wifi_fh, '<:raw', "$root/../sprinter_wifi/network/src/include/unet.inc"
     or die "cannot read peer UNET ABI ../sprinter_wifi/network/src/include/unet.inc: $!\n";
 my $wifi = do { local $/; <$wifi_fh> };

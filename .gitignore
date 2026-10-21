@@ -9,4 +9,7 @@ __pycache__/
 .mame-cfg/
 /cfg/
 /nvram/
-evidence/stage13*/*.pcap
+# Raw test output is kept locally; acceptance summaries belong in specs.md.
+/evidence/**/*.log
+/evidence/**/*.pcap
+/evidence/**/*_LOG.txt

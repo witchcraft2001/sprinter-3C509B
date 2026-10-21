@@ -151,7 +151,16 @@ JUMP_TABLE
 	DW	TCP_SEND_EVENT		; 37 CFN_TCP_SEND_EVENT
 	DW	TCP_CLOSE_PLAN		; 38 CFN_TCP_CLOSE_PLAN
 	DW	MAP_CLOSE_FAIL		; 39 CFN_MAP_CLOSE_FAIL
+
+	DW	SEND_BEGIN
+	DW	SEND_STEP
+	DW	SEND_CHARGE
+	DW	SEND_RESULT
+	DW	RECV_BUFFERED
+	DW	TCP_ACK_SEQUENCE
 	ASSERT	($ - JUMP_TABLE) / 2 == CFN_COUNT
+
+	INCLUDE "tcp_send_cold.asm"
 
 	INCLUDE "ethernet.asm"
 	INCLUDE "ipv4.asm"
@@ -186,8 +195,7 @@ TCP_SEND_EVENT
 	XOR	A
 	RET
 .NOT_FULL
-	LD	A,(IX+CTX_REMOTE_FIN)
-	OR	A
+	BIT	2,E			; EVENT_FIN from this wait, not an earlier half-close
 	JR	NZ,.PEER_FIN
 	LD	A,TCP_ERR_SEQUENCE
 	OR	A
@@ -522,6 +530,10 @@ TCP_FAST_RECEIVE
 	ADD	HL,BC
 	EX	DE,HL
 	CALL	FAST_CMP4
+	JP	NZ,.POP_SLOW
+	; A zero-window segment may still carry our ACK. Use the slow parser
+	; to process it without committing payload outside the advertised window.
+	BIT	0,(IY+CTX_WINDOW_CLOSED)
 	JP	NZ,.POP_SLOW
 	POP	HL			; discard saved RX base
 
@@ -2868,6 +2880,8 @@ MAP_SEND_FAIL
 	CP	TCP_ERR_RESET
 	JR	Z,.closed
 	CP	TCP_ERR_CLOSED
+	JR	Z,.closed
+	CP	TCP_ERR_SEND_FAILED
 	JR	Z,.closed
 	CP	TCP_ERR_TIMEOUT
 	JR	Z,.send

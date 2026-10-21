@@ -60,7 +60,7 @@ python3 -c 'import ast,sys; [ast.parse(open(p, encoding="utf-8").read(), filenam
   "$script_dir/host/stage13_http_server.py"
 python3 -c 'import ast,sys; [ast.parse(open(p, encoding="utf-8").read(), filename=p) for p in sys.argv[1:]]' \
   "$script_dir/host/stage14_responder.py" "$script_dir/host/test_stage14_responder.py" \
-  "$script_dir/host/unettest_fin_during_send.py"
+  "$script_dir/host/unettest_fin_during_send.py" "$script_dir/test-send-mame.py"
 sh -n "$script_dir/3com.sh"
 input_profile="$repo_root/config/mame/sprinter.cfg"
 ui_profile="$repo_root/config/mame/default.cfg"
@@ -257,19 +257,19 @@ artifact_copy binary "$repo_root/build/UNET509B.DLL" "$binary_copy" "$script_dir
 cmp "$repo_root/build/UNET509B.DLL" "$binary_copy"
 
 version="$(tr -d '\r\n' < "$repo_root/VERSION")"
-if [ "$version" != "0.1.3" ] || ! grep -q 'PACKAGE_VERSION.*"0.1.3"' \
+if [ "$version" != "0.1.4" ] || ! grep -q 'PACKAGE_VERSION.*"0.1.4"' \
   "$repo_root/src/include/version.inc"; then
   echo "Error: package version declarations disagree" >&2
   exit 1
 fi
 for binary in EL3INFO EL3EEP EL3REG EL3LB EL3TX EL3RX ISAPROBE NETCFG IFUP ARP PING PINGALT UDPTEST TFTP NSLOOKUP NTP TCPTEST WGET FTP TELNET DLSPEED DLDIRECT UNETTEST; do
-  if ! grep -a -q "v0.1.3" "$repo_root/build/$binary.EXE"; then
-    echo "Error: $binary banner is not version 0.1.3" >&2
+  if ! grep -a -q "v0.1.4" "$repo_root/build/$binary.EXE"; then
+    echo "Error: $binary banner is not version 0.1.4" >&2
     exit 1
   fi
 done
-if ! grep -a -q "v0.1.3" "$repo_root/build/UNET509B.DLL"; then
-  echo "Error: UNET509B.DLL name field is not version 0.1.3" >&2
+if ! grep -a -q "v0.1.4" "$repo_root/build/UNET509B.DLL"; then
+  echo "Error: UNET509B.DLL name field is not version 0.1.4" >&2
   exit 1
 fi
 

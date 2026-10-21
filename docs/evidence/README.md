@@ -1,5 +1,11 @@
 # Verification evidence
 
+Raw logs and pcaps under `evidence/` are local, ignored test artifacts;
+they are not included in a fresh checkout. Historical paths below identify
+the locally retained captures. Acceptance summaries and hashes remain in
+this documentation and `specs.md`. Intermediate Stage 14 review reports
+are archived locally under `build/review-notes/`.
+
 ## Stage 12: local WGET regressions
 
 Date: 2026-09-03. The sibling-facing golden console fixture is pinned to

@@ -7,7 +7,21 @@ set -eu
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 PROJECT_DIR=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
 RELEASE_DIR=${MAME_RELEASE_DIR:-"$PROJECT_DIR/../mame_images/mame_release_v306_25.05.2025"}
-MAME_BIN=${MAME_BIN:-"$RELEASE_DIR/mame"}
+
+# The binary bundled in RELEASE_DIR predates "osd/netdev/pcap: set PCAP_D_IN
+# after open".  Without that fix BSD-derived libpcap (macOS) captures both
+# directions on the feth pair, the card is handed its own outgoing frames, and
+# every ARP request is answered by its own echo -- DHCP still gets a lease
+# because its replies are broadcast, but PING/WGET/FTP stop at stage=ARP.  Use
+# the MAME source-tree build when it is present, as the sibling launchers do.
+SOURCE_MAME_BIN=${SOURCE_MAME_BIN:-"$PROJECT_DIR/../mame/mame"}
+if [ -n "${MAME_BIN:-}" ]; then
+  :
+elif [ -x "$SOURCE_MAME_BIN" ]; then
+  MAME_BIN=$SOURCE_MAME_BIN
+else
+  MAME_BIN="$RELEASE_DIR/mame"
+fi
 IMAGE_PATH=${SPRINTER_3C509B_IMG:-"$PROJECT_DIR/distr/sprinter-3c509b.img"}
 CFG_DIR=${MAME_CFG_DIR:-"$PROJECT_DIR/.mame-cfg"}
 CFG_TEMPLATE="$PROJECT_DIR/config/mame/sprinter.cfg"

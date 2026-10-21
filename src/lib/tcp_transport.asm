@@ -277,6 +277,10 @@ OPEN_SAFE
 ; (CHOOSE_BURST); either way the wait below is for one cumulative
 ; acknowledgement covering everything that went out.
 ; Clobbers AF/BC/HL; preserves IX/IY.
+	IFDEF UNET_DLL
+	INCLUDE "tcp_send_dll.asm"
+	ELSE
+
 SEND
 	PUSH	IX,IY
 	LD	(S11_CHANNEL),A
@@ -316,12 +320,10 @@ SEND
 	CALL	CHOOSE_SEGMENT_LENGTH
 	LD	HL,(S11_SEGMENT_LENGTH)
 	LD	(S11_ACTIVE_LENGTH),HL
-	IFNDEF	UNET_DLL
 	LD	HL,(S11_SEND_POINTER)
 	LD	DE,TCPX_TX_BUFFER+14+IPV4_HEADER_LENGTH+TCP_HEADER_LENGTH
 	LD	BC,(S11_ACTIVE_LENGTH)
 	LDIR
-	ENDIF
 	ENDIF
 	PUSH	IX
 	POP	HL
@@ -356,17 +358,6 @@ SEND
 	LD	A,(IX+CTX_EVENT)
 	AND	~(EVENT_ACK|EVENT_RST|EVENT_FIN)
 	LD	(IX+CTX_EVENT),A
-	IFDEF	UNET_DLL
-	; Re-copy the payload from the caller's own buffer before every
-	; attempt, not just the first (SEND_WINDOW_PROBE already does the same
-	; for its own 1-byte probe -- see its own comment): TCPX_TX_BUFFER
-	; aliases the RX buffer, and inbound frames read during the waits
-	; below (any channel) may have overwritten it since the last attempt.
-	LD	HL,(S11_SEND_POINTER)
-	LD	DE,TCPX_TX_BUFFER+14+IPV4_HEADER_LENGTH+TCP_HEADER_LENGTH
-	LD	BC,(S11_ACTIVE_LENGTH)
-	LDIR
-	ENDIF
 	IFDEF	TCPX_SEND_BURST
 	CALL	SEND_BURST
 	ELSE
@@ -374,68 +365,16 @@ SEND
 	LD	BC,(S11_ACTIVE_LENGTH)
 	CALL	SEND_SEGMENT
 	ENDIF
-	IFDEF	UNET_DLL
-	JP	C,.SEND_FAIL_XMIT
-	ELSE
 	JP	C,.SEND_FAIL
-	ENDIF
 	LD	A,(IX+CTX_RETRY_LEFT)
 	CALL	ATTEMPT_MS
 .DATA_ATTEMPT_MS
-	IFDEF	TCPX_ASYNCSEND
-	LD	(S11_ASYNC_MS_LEFT),BC
-.DATA_WAIT
-	; Quantum for this wait: the whole remaining attempt budget when
-	; blocking (UNET_OPT_SLICE=0, byte-identical to the non-ASYNCSEND
-	; behavior below), or the smaller of the remaining budget and the
-	; slice when the caller armed UNET_OPT_SENDSLICE.
-	LD	HL,(S11_ASYNC_MS_LEFT)
-	LD	DE,(UNET_OPT_SLICE)
-	LD	A,D
-	OR	E
-	JR	Z,.DATA_QUANTUM_READY
-	OR	A
-	SBC	HL,DE
-	JR	NC,.DATA_QUANTUM_READY
-	ADD	HL,DE			; remaining < slice: use remaining as-is
-.DATA_QUANTUM_READY
-	LD	B,H
-	LD	C,L
-	; The quantum is kept on the stack, not trusted to survive the wait in
-	; BC: the receive poll and the tick pacing both leave BC=0. Charged as
-	; zero, a silent attempt never ran out, and a blocking SEND (slice 0)
-	; suspended with TCP_ERR_AGAIN after its first quiet second -- leaving
-	; CLOSE/NETDONE answering NERR_BUSY to a caller that never asked for a
-	; resumable send.
-	PUSH	BC
-	LD	A,EVENT_ACK|EVENT_FIN|EVENT_RST
-	CALL	WAIT_FOR_EVENT
-	POP	BC
-	JP	NC,.DATA_EVENT
-	CP	TCP_ERR_TIMEOUT
-	JP	NZ,.SEND_FAIL
-	; WAIT_FOR_EVENT only returns F_TIMEOUT after waiting its full
-	; requested quantum, so BC is exactly the elapsed silence.
-	LD	HL,(S11_ASYNC_MS_LEFT)
-	OR	A
-	SBC	HL,BC
-	LD	(S11_ASYNC_MS_LEFT),HL
-	LD	A,H
-	OR	L
-	JP	Z,.DATA_ATTEMPT_EXHAUSTED
-	; Silence within the attempt but budget remains: suspend without
-	; burning a retry or retransmitting. SEND_RESUME re-enters .DATA_WAIT
-	; directly for this same outstanding segment.
-	JP	.SEND_AGAIN
-.DATA_ATTEMPT_EXHAUSTED
-	ELSE
 .DATA_WAIT
 	LD	A,EVENT_ACK|EVENT_FIN|EVENT_RST
 	CALL	WAIT_FOR_EVENT
 	JP	NC,.DATA_EVENT
 	CP	TCP_ERR_TIMEOUT
 	JP	NZ,.SEND_FAIL
-	ENDIF
 	LD	A,(IX+CTX_RETRY_LEFT)
 	DEC	A
 	LD	(IX+CTX_RETRY_LEFT),A
@@ -445,16 +384,6 @@ SEND
 .DATA_EVENT
 	BIT	3,A
 	JP	NZ,.SEND_RESET
-	IFDEF	UNET_DLL
-	; The cold classifier distinguishes a full ACK from FIN-before-full-ACK
-	; and computes the latter's partial progress. It does not release the
-	; context: peer payload and REMOTE_FIN must remain visible to RECV.
-	LD	IY,S11_STATE_BASE
-	LD	A,CFN_TCP_SEND_EVENT
-	CALL	@COLD.RUN
-	JP	C,.SEND_PEER_FIN
-	JP	NZ,.SEND_FAIL
-	ELSE
 	PUSH	IX
 	POP	DE
 	LD	HL,CTX_SND_UNA
@@ -463,7 +392,6 @@ SEND
 	CALL	CMP4
 	LD	A,TCP_ERR_SEQUENCE
 	JP	NZ,.SEND_FAIL
-	ENDIF
 	LD	HL,(S11_SEND_POINTER)
 	LD	DE,(S11_ACTIVE_LENGTH)
 	ADD	HL,DE
@@ -476,69 +404,15 @@ SEND
 	ADD	HL,DE
 	LD	(S11_SEND_CONFIRMED),HL
 	JP	.SEND_NEXT
-	IFDEF	UNET_DLL
-.SEND_PEER_FIN
-	; TCP_SEND_EVENT already returned TCP_ERR_CLOSED and the exact confirmed
-	; prefix in DE. Bypass FAIL_CONTEXT so queued response bytes survive.
-	SCF
-	JP	.SEND_RETURN
-	ENDIF
-	IFDEF	UNET_DLL
-.SEND_FAIL_XMIT
-	; A segment that never left the card on the FIRST attempt leaves nothing
-	; past SND.UNA in flight, so a later CLOSE of this still-open connection
-	; is an orderly FIN. A retransmission that fails is different: the earlier
-	; attempt did go out and only its ACK is missing, so whether the peer took
-	; the bytes is unknowable and SND.NXT stays past them for CLOSE to abort.
-	; (UNETRTL 0.3.10 rewinds on every attempt; that is the one deliberate
-	; divergence from it, see docs/UNET509B.md.)
-	PUSH	AF
-	LD	A,(IX+CTX_RETRY_LEFT)
-	CP	DATA_ATTEMPTS
-	JR	NZ,.SEND_FAIL_POP
-	PUSH	IX
-	POP	HL
-	LD	DE,CTX_SND_UNA
-	ADD	HL,DE
-	LD	D,H
-	LD	E,L
-	INC	DE
-	INC	DE
-	INC	DE
-	INC	DE			; SND.NXT follows SND.UNA
-	CALL	COPY4
-.SEND_FAIL_POP
-	POP	AF
-	JR	.SEND_FAIL
-	ENDIF
 .SEND_RESET
 	LD	A,TCP_ERR_RESET
 .SEND_FAIL
-	IFNDEF	UNET_DLL
 	PUSH	AF
 	CALL	FAIL_CONTEXT
 	POP	AF
-	ELSE
-	; The DLL leaves the connection as the failure found it, as UNETRTL does.
-	; A peer RST already closed the context (HANDLE_SEGMENT .ACCEPT_RST); a
-	; timeout or a cancel leaves it established with SND.NXT past the
-	; unacknowledged segment, so the caller's CLOSE resets the peer instead of
-	; sending a FIN it cannot sequence, or finding nothing left to tell it.
-	ENDIF
 	LD	DE,(S11_SEND_CONFIRMED)
 	SCF
 	JP	.SEND_RETURN
-	IFDEF	TCPX_ASYNCSEND
-; Not a failure: the segment (or window probe) is still legitimately in
-; flight. FAIL_CONTEXT must NOT run here -- the context stays exactly as
-; it is so SEND_RESUME can continue waiting on the SAME outstanding
-; segment/probe.
-.SEND_AGAIN
-	LD	A,TCP_ERR_AGAIN
-	LD	DE,(S11_SEND_CONFIRMED)
-	SCF
-	JP	.SEND_RETURN
-	ENDIF
 .SEND_CLOSED
 	LD	A,TCP_ERR_CLOSED
 	LD	DE,0
@@ -556,18 +430,7 @@ SEND
 	POP	IY,IX
 	RET
 
-	IFDEF	TCPX_ASYNCSEND
-; SEND_RESUME: continue a SEND suspended with TCP_ERR_AGAIN. In: A=channel
-; (the shim's own resume-contract check already confirmed this matches the
-; suspended one). Re-enters SEND's own ACK wait directly for the same
-; outstanding segment -- neither resends nor burns a retry (the window-
-; probe wait is never sliced, so a suspend can only ever be pending there).
-; Out/clobbers: same as SEND.
-SEND_RESUME
-	PUSH	IX,IY
-	CALL	SELECT_CONTEXT
-	JP	C,SEND.SEND_RETURN
-	JP	SEND.DATA_WAIT
+
 	ENDIF
 
 ; RECV
@@ -605,6 +468,11 @@ RECV
 	ENDIF
 	ENDIF
 .RECV_CHECK
+	IFDEF UNET_DLL
+	; A buffered RECV may have drained this channel while another SEND
+	; owned the NIC. Reopen it even if that SEND was subsequently aborted.
+	CALL	SEND_RECV_UPDATE
+	ENDIF
 	LD	L,(IX+CTX_PENDING_LEN)
 	LD	H,(IX+CTX_PENDING_LEN+1)
 	LD	A,H
@@ -854,6 +722,7 @@ CLOSE
 	PUSH	IX,IY
 	CALL	SELECT_CONTEXT
 	JR	C,.CLOSE_RETURN
+.CLOSE_PLAN
 	LD	IY,S11_STATE_BASE
 	LD	A,CFN_TCP_CLOSE_PLAN
 	CALL	@COLD.RUN		; A=flags, BC=0
@@ -988,9 +857,29 @@ CLOSE
 	RET
 	ENDIF
 
-; ABORT emits a best-effort RST for an active channel and always releases it.
+; ABORT always releases the selected channel. DLL: transmit RST at NXT and,
+; if outstanding bytes make the peer's sequence ambiguous, also at UNA.
+; Report failure of either transmission, with no peer wait or keyboard scan.
+; Closed and unaccepted LISTEN contexts need neither NIC nor cold overlay.
 ; In: A=channel. Out: CF/A status. Clobbers AF/BC/DE/HL; preserves IX/IY.
 ABORT
+	IFDEF UNET_DLL
+	PUSH	IX,IY
+	CALL	SELECT_CONTEXT
+	JR	C,CLOSE.CLOSE_RETURN
+	LD	A,(IX+CTX_STATE)
+	OR	A
+	JR	Z,CLOSE.CLOSE_OK
+	CP	TCP_STATE_LISTEN
+	JR	Z,CLOSE.CLOSE_OK
+	CALL	SEND_STREAM_CHECK
+	JP	NZ,CLOSE.CLOSE_PLAN	; two RST candidates, never a FIN or wait
+	LD	A,TCP_FLAG_RST|TCP_FLAG_ACK
+	LD	BC,0
+	CALL	SEND_SEGMENT
+	JP	C,CLOSE.CLOSE_FAIL
+	JP	CLOSE.CLOSE_OK
+	ELSE
 	PUSH	IX,IY
 	CALL	SELECT_CONTEXT
 	JP	C,.ABORT_RETURN
@@ -999,6 +888,7 @@ ABORT
 .ABORT_RETURN
 	POP	IY,IX
 	RET
+	ENDIF
 
 	IFDEF	TCPX_LISTEN
 ; LISTEN arms a channel for exactly one inbound connection. In: A=channel,
@@ -1388,6 +1278,8 @@ SEND_BURST
 	JP	SEND_SEGMENT_COMMON
 	ENDIF
 
+	IFNDEF UNET_DLL
+
 WAIT_REMOTE_WINDOW
 	LD	A,(IX+CTX_REMOTE_WINDOW)
 	OR	(IX+CTX_REMOTE_WINDOW+1)
@@ -1403,10 +1295,6 @@ WAIT_REMOTE_WINDOW
 	RET	C
 	LD	A,(IX+CTX_RETRY_LEFT)
 	CALL	ATTEMPT_MS
-; Unlike SEND's own ACK wait, this window-probe wait is never sliced by
-; TCPX_ASYNCSEND: a fully-closed remote window is rare enough that RTL's
-; own ASYNCSEND does not cover it either (see this DLL's plan notes), and
-; every byte here is scarce.
 .PROBE_WAIT
 	LD	A,EVENT_WINDOW|EVENT_RST|EVENT_FIN
 	CALL	WAIT_FOR_EVENT
@@ -1429,6 +1317,8 @@ WAIT_REMOTE_WINDOW
 	SCF
 	RET
 
+	ENDIF
+
 ; SEND_WINDOW_PROBE sends one already-acknowledged octet at SND.NXT-1. Unlike
 ; an empty ACK, this persist probe requires a conforming peer to answer without
 ; consuming the caller's first unsent byte.
@@ -1450,6 +1340,7 @@ SEND_WINDOW_PROBE
 	LD	BC,1
 	JP	SEND_SEGMENT_COMMON
 
+	IFNDEF UNET_DLL
 ; ATTEMPT_MS: shared by SEND's own retry ladder and WAIT_REMOTE_WINDOW's.
 ; In: A=(IX+CTX_RETRY_LEFT), already loaded by the caller (3/2/1 remaining).
 ; Out: BC=1000/2000/4000. Trashes AF.
@@ -1462,6 +1353,8 @@ ATTEMPT_MS
 	RET	Z
 	LD	BC,4000
 	RET
+
+	ENDIF
 
 ; SEND_SEGMENT builds Ethernet/IPv4/TCP contiguously and transmits it.
 ; In: IX=context, A=flags, BC=payload length already at TX+54.
@@ -2570,7 +2463,9 @@ HANDLE_SEGMENT
 .RST_SYN_RECEIVED
 	LD	L,(IX+CTX_LOCAL_PORT)
 	LD	H,(IX+CTX_LOCAL_PORT+1)
+	PUSH	HL			; CLEAR_CONTEXT advances HL to the context end
 	CALL	CLEAR_CONTEXT
+	POP	HL
 	LD	(IX+CTX_LOCAL_PORT),L
 	LD	(IX+CTX_LOCAL_PORT+1),H
 	LD	(IX+CTX_STATE),TCP_STATE_LISTEN
@@ -2588,6 +2483,13 @@ HANDLE_SEGMENT
 	JP	Z,HANDLE_PASSIVE_SYN
 	CP	TCP_STATE_SYN_RECEIVED
 	JP	Z,.SYN_RECEIVED
+	ENDIF
+	IFDEF UNET_DLL
+	; ACKs on acceptable out-of-order segments still advance our send stream.
+	LD	IY,S11_STATE_BASE
+	LD	A,CFN_TCP_ACK_SEQUENCE
+	CALL	@COLD.RUN
+	JP	C,.ACK_CURRENT		; RFC 9293: unacceptable non-RST earns an ACK
 	ENDIF
 	LD	A,(S11_TCP_PARSE_DESC+TCPP_FLAGS)
 	AND	TCP_FLAG_ACK
@@ -2634,6 +2536,12 @@ HANDLE_SEGMENT
 	LD	A,H
 	OR	L
 	JP	Z,.CHECK_FIN
+	IFDEF UNET_DLL
+	; ACK was processed above; at an advertised zero window neither these
+	; bytes nor the FIN following them can advance RCV.NXT.
+	BIT	0,(IX+CTX_WINDOW_CLOSED)
+	JP	NZ,.ACK_CURRENT
+	ENDIF
 	LD	DE,TCP_MSS+1
 	OR	A
 	SBC	HL,DE

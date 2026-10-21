@@ -256,12 +256,14 @@ S11_RX_DELIVERED	EQU S11_STATE_BASE + 0x63	; word
 S11_FAST_DEST		EQU S11_RX_DEST			; only non-DLL fast body uses it
 S11_FAST_DIRECT		EQU S11_STATE_BASE + 0x65
 S11_WAIT_PROGRESS	EQU S11_STATE_BASE + 0x66
-; TCPX_ASYNCSEND (P5): the remaining ms budget within the CURRENT retry
-; attempt of SEND's own .DATA_WAIT, sliced across suspend/resume (the
-; window-probe wait is never sliced -- see tcp_transport.asm's own
-; comment on WAIT_REMOTE_WINDOW -- so no phase flag is needed: a resume
-; always re-enters .DATA_WAIT).
-S11_ASYNC_MS_LEFT	EQU S11_STATE_BASE + 0x67	; word
-	ASSERT S11_ASYNC_MS_LEFT + 2 <= S11_STATE_BASE + 0x69	; == BSS_S11 size, see unet509b_bss.inc
+; Resumable SEND storage, independent of RECV and codec scratch.
+S11_ASYNC_MS_LEFT EQU S11_STATE_BASE + 0x67 ; word: attempt/probe interval left
+S11_SEND_PHASE EQU S11_STATE_BASE + 0x69
+S11_SEND_CALL_LEFT EQU S11_STATE_BASE + 0x6A ; word: current public call budget
+S11_PROBE_INTERVAL EQU S11_STATE_BASE + 0x6C ; word
+S11_PROBE_MISSED EQU S11_STATE_BASE + 0x6E
+S11_PROBE_ANSWERED EQU S11_STATE_BASE + 0x6F
+S11_SEND_BLOCKING EQU S11_STATE_BASE + 0x70
+	ASSERT S11_SEND_BLOCKING + 1 <= S11_STATE_BASE + 0x71
 
 	ENDIF

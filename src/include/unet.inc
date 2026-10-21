@@ -66,7 +66,11 @@ UNET_FN_SEND		EQU 6	; A=channel, DE=buffer, IX=length  ->  A, DE=bytes sent
 				;   NERR_CLOSED. A close after a full chunk ACK is not an error
 				;   for that chunk; remaining bytes are still attempted, and a
 				;   fully acknowledged SEND succeeds before RECV reports close.
-				;   NERR_SEND: no acknowledgement and no peer close was observed.
+				;   NERR_SEND: the current transmission exhausted unanswered attempts.
+				;   DE confirms a prefix, not non-delivery of the remaining bytes.
+				;   Channel retention after this final error is backend-dependent;
+				;   portable callers CLOSE before application-level recovery.
+				;   Never blindly submit an unconfirmed tail as a new SEND.
 				;   With UNET_OPT_SENDSLICE > 0 may return NERR_AGAIN:
 				;   repeat the same call to continue the transaction.
 UNET_FN_RECV		EQU 7	; A=channel, DE=buffer, IX=max, IY=timeout_ms  ->  A, DE=received, IX=flags
@@ -142,8 +146,8 @@ NERR_STATE		EQU 11	; wrong state (e.g. CONNECT before NETINIT, or already open)
 NERR_TIMEOUT		EQU 12	; generic operation timeout (ping / resolve)
 NERR_BUSY		EQU 13	; backend busy (ESP IP stack still warming up)
 NERR_PROTO		EQU 14	; unexpected/protocol error in backend response
-NERR_AGAIN		EQU 15	; SEND suspended: the link was silent for one
-				; UNET_OPT_SENDSLICE quantum. Repeat the SAME call
+NERR_AGAIN		EQU 15	; SEND suspended after a wait budget (see backend policy for
+				; UNET_OPT_SENDSLICE below). Repeat the SAME call
 				; (same channel/buffer/length) to continue the
 				; transaction; DE = bytes confirmed so far. Only
 				; backends with UNET_CAP_ASYNCSEND return this.
@@ -227,12 +231,11 @@ UNET_OPT_RXTRIG		EQU 2	; DE=1/4/8/14 - RX FIFO auto-RTS trigger level (ESP; defa
 				; TR4 is the stable compromise: TR1 throttles ESP to ~1 KB/s,
 				; while TR8 leaves too little headroom and causes overruns. Use
 				; other values only for field diagnostics on specific hardware.
-UNET_OPT_SENDSLICE	EQU 3	; DE=ms of link SILENCE after which SEND suspends with
+UNET_OPT_SENDSLICE	EQU 3	; DE=wait quantum in nominal ms; SEND may suspend with
 				; NERR_AGAIN instead of blocking (0 = blocking, the default;
 				; minimum 50 is enforced). Requires UNET_CAP_ASYNCSEND.
-				; While a send is suspended, RECV serves only already
-				; buffered data and returns immediately, and other
-				; transmitting calls return NERR_BUSY without touching
-				; the UART (see docs/UNETAPI.md).
+				; Wait accounting, permitted calls while suspended and recovery
+				; after a final SEND error are backend policies. See the selected
+				; backend's documentation (docs/UNET509B.md for UNET509B).
 
 	ENDIF

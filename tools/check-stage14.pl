@@ -19,6 +19,8 @@ my $cold = slurp('src/dll/unet509b_cold.asm', 0);
 my $coldctx = slurp('src/include/coldctx.inc', 0);
 my $tcpinc = slurp('src/include/tcp.inc', 0);
 my $transport = slurp('src/lib/tcp_transport.asm', 0);
+my $send = slurp('src/lib/tcp_send_dll.asm', 0);
+my $send_cold = slurp('src/lib/tcp_send_cold.asm', 0);
 my $el3io = slurp('src/lib/el3_io.asm', 0);
 my $fifo = slurp('src/lib/el3_fifo.asm', 0);
 my $win0cold = slurp('src/lib/win0cold.asm', 0);
@@ -106,12 +108,15 @@ die "F_LASTERR does not keep the frozen snapshot after a failure\n"
 # SEND must wake on FIN as well as ACK/RST. The DLL-only completion classifier
 # returns a partial confirmed prefix and its CF path bypasses FAIL_CONTEXT, so
 # a response queued with the FIN remains available to RECV.
-die "TCP SEND wait does not include EVENT_FIN\n"
-    unless $transport_code =~ /LD\s+A,EVENT_ACK\|EVENT_FIN\|EVENT_RST\s*\n\s*CALL\s+WAIT_FOR_EVENT/;
-die "TCP SEND FIN classifier or queue-preserving return is missing\n"
-    unless $transport_code =~ /CFN_TCP_SEND_EVENT.*?CALL\s+\@COLD\.RUN\s*\n\s*JP\s+C,\.SEND_PEER_FIN.*?\.SEND_PEER_FIN\b.*?JP\s+\.SEND_RETURN/ms;
-die "cold SEND completion classifier is missing from the dispatch table\n"
-    unless $cold_code =~ /DW\s+TCP_SEND_EVENT.*?^TCP_SEND_EVENT\b.*?LD\s+A,TCP_ERR_CLOSED\s*\n\s*SCF/ms;
+die "DLL SEND does not wait for ACK/window/FIN/RST\n"
+    unless $send =~ /LD\s+A,EVENT_ACK\|EVENT_WINDOW\|EVENT_FIN\|EVENT_RST\s*\n\s*CALL\s+WAIT_FOR_EVENT/;
+die "DLL SEND no longer charges the actual elapsed wait\n"
+    unless $send =~ /NETTIME_ELAPSED_MS.*?CFN_SEND_CHARGE/s;
+die "SEND FIN classifier or queue-preserving return is missing\n"
+    unless $send_cold =~ /CALL\s+TCP_SEND_EVENT.*?SEND_STORE\s+E,D,S11_SEND_CONFIRMED/s
+    && $cold_code =~ /DW\s+TCP_SEND_EVENT.*?^TCP_SEND_EVENT\b.*?LD\s+A,TCP_ERR_CLOSED\s*\n\s*SCF/ms;
+die "SEND regressed to an unsliced window wait\n"
+    unless $send_cold =~ /S11_PROBE_INTERVAL/ && $send_cold =~ /S11_SEND_CALL_LEFT/;
 
 # The cold overlay (WIN0) never touches ISA, DSS, or a raw RST -- it can only
 # reach the outside world via the COLD_CTX pointers and registers it was
@@ -270,10 +275,8 @@ die "non-release perf-fast path leaked into the artifact manifest\n"
         if $resolve =~ /S9_ENV_BUFFER/;
 }
 
-# src/include/unet.inc stays a frozen, byte-identical mirror of the shared
-# UNET ABI; Stage 7's own gate (check-stage7.pl) already fails the build on
-# divergence, so this is a presence check only -- Stage 14 must not add a
-# second, diverging copy.
+# Executable declarations in src/include/unet.inc stay frozen. Stage 7
+# compares them to the shared UNET ABI while permitting policy comments.
 die "src/include/unet.inc is missing\n" unless -f "$root/src/include/unet.inc";
 
 # Build and structural verification via the actual tool, not a re-implemented

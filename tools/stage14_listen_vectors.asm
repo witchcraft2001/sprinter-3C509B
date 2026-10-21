@@ -42,7 +42,7 @@ TEST_COMPLETE	EQU 0x3F01		; 0xA5 once MARK_COMPLETE was reached
 TEST_CASE	EQU 0x3F02
 STACK_TOP	EQU 0x3E00
 
-CAP_BUF		EQU 0x2000		; what the SEND_FRAME stub captured
+CAP_BUF		EQU 0x2200		; what the SEND_FRAME stub captured
 CAP_LEN		EQU 0x2800		; word
 CAP_COUNT	EQU 0x2802		; byte, frames the stub saw
 PSEUDO		EQU 0x2810		; 12-byte TCP pseudo-header scratch
@@ -130,6 +130,7 @@ SYNACK_LEN	EQU 14 + 20 + 24	; MSS is the only option we emit
 
 	ORG	0x0000
 	INCBIN	"cold.bin"
+	ASSERT $ <= CAP_BUF
 
 	ORG	DLL_BASE
 	INCBIN	"dll_image.bin"

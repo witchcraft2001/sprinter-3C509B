@@ -171,6 +171,8 @@ TCP_ERR_STATE		EQU 35
 ; SEND suspended: the link was silent for one UNET_OPT_SENDSLICE quantum
 ; within the current attempt's budget. TCPX_ASYNCSEND only.
 TCP_ERR_AGAIN		EQU 36
+; A new SEND was refused because a previous final error left an ambiguous stream.
+TCP_ERR_SEND_FAILED	EQU 37
 
 ; Stable diagnostic stages published by TCPX for the application error line.
 TCP_STAGE_LINK		EQU 0

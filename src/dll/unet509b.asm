@@ -292,6 +292,10 @@ INIT
 ; returns A=0, CF=0.
 ; ------------------------------------------------------
 FINI
+	LD	A,(UNET_APEND_ACTIVE)
+	OR	A
+	LD	A,(UNET_APEND_CHANNEL)
+	CALL	NZ,F_CLOSE		; suspended owner must be reset, even at win=0
 	CALL	CLOSE_LINK
 	JP	TEARDOWN_LINK
 
@@ -348,9 +352,7 @@ F_NETINIT
 ; did not close cleanly (CLOSE_LINK).
 ; ------------------------------------------------------
 F_NETDONE
-	IFDEF	TCPX_ASYNCSEND
 	CALL	CHECK_ASYNC_PEND
-	ENDIF
 	CALL	CLOSE_LINK
 	JP	RET_A
 
@@ -408,16 +410,11 @@ F_SEND
 	LD	(UNET_ARG_A),A
 	LD	(UNET_ARG_DE),DE
 	LD	(UNET_ARG_IX),IX
-	IFDEF	TCPX_ASYNCSEND
-	LD	A,(UNET_APEND_ACTIVE)
-	OR	A
-	JP	NZ,.resume
-	ENDIF
+	LD	A,ST_SEND
+	LD	(UNET_STAGE),A
 	LD	A,(UNET_ARG_A)
 	CALL	CHECK_CHANNEL
 	JP	C,RET_PARAM
-	LD	A,ST_SEND
-	LD	(UNET_STAGE),A
 	LD	A,(UNET_ARG_A)
 	CALL	CH_STATE_PTR
 	LD	A,(HL)
@@ -425,6 +422,11 @@ F_SEND
 	JP	Z,RET_STATE
 	CP	2
 	JP	Z,F_SEND_UDP
+	IFDEF	TCPX_ASYNCSEND
+	LD	A,(UNET_APEND_ACTIVE)
+	OR	A
+	JP	NZ,.resume
+	ENDIF
 	LD	HL,(UNET_ARG_IX)
 	LD	A,H
 	OR	L
@@ -491,6 +493,7 @@ F_SEND
 	JP	RET_A
 	IFDEF	TCPX_ASYNCSEND
 .again
+	PUSH	DE
 	; Not an error: the link was silent for one UNET_OPT_SENDSLICE quantum
 	; but the send is still legitimately in flight. Park the resume
 	; contract (the caller must repeat this exact call) and report
@@ -505,6 +508,7 @@ F_SEND
 	LD	A,1
 	LD	(UNET_APEND_ACTIVE),A
 	LD	A,NERR_AGAIN
+	POP	DE
 	JP	RET_A
 	ENDIF
 
@@ -574,24 +578,27 @@ F_RECV
 	LD	A,(HL)
 	OR	A
 	JP	Z,RET_STATE
+	LD	B,A
+	; Validate every RECV buffer alike, including UDP and pending LISTEN.
+	PUSH	BC
+	CALL	CHECK_RECV_BUFFER
+	POP	BC
+	JP	C,RET_PARAM
+	LD	A,(UNET_APEND_ACTIVE)
+	OR	A
+	JP	NZ,F_RECV_BUFFERED
+	LD	A,B
 	CP	2
 	JP	Z,F_RECV_UDP
 	CP	3
 	JP	Z,F_RECV_LISTEN
 F_RECV_TCP
-	LD	HL,(UNET_ARG_IX)
-	LD	A,H
-	OR	L
-	JP	Z,RET_PARAM			; max=0 has no room
-	LD	HL,(UNET_ARG_DE)
-	LD	BC,(UNET_ARG_IX)
-	CALL	CHECK_BUF_RANGE
-	JP	C,RET_PARAM
 	LD	A,(UNET_ARG_A)
 	LD	HL,(UNET_ARG_DE)
 	LD	BC,(UNET_ARG_IX)
 	LD	DE,(UNET_ARG_IY)
 	CALL	@TCPX.RECV
+.received
 	JR	C,.fail
 	LD	IX,0
 	LD	D,B
@@ -618,6 +625,26 @@ F_RECV_TCP
 	LD	IX,0
 	JP	RET_A
 
+; During a suspended SEND all RECV paths validate arguments, then serve
+; durable TCP bytes only. UDP/listener have no queued user data here.
+F_RECV_BUFFERED
+	LD	A,B
+	CP	1
+	JP	NZ,F_RECV_TCP.idle
+	LD	IX,UNET_COLD_CTX
+	LD	IY,UNET_ARG_A
+	LD	A,CFN_RECV_BUFFERED
+	CALL	@COLD.RUN
+	JP	C,F_RECV_TCP.received
+	LD	A,B
+	OR	C
+	JR	Z,.copied
+	PUSH	BC
+	LDIR			; caller buffer may be in WIN0; overlay is now unmapped
+	POP	BC
+.copied
+	JP	F_RECV_TCP.received
+
 ; F_RECV_LISTEN: progress the pending accept. On success the channel
 ; becomes an ordinary established one and this same call also tries the
 ; normal TCP RECV path below, so data piggybacked on the handshake's
@@ -635,15 +662,11 @@ F_RECV_LISTEN
 	LD	(UNET_LISTEN_ACCEPTED),A
 	JP	F_RECV_TCP
 .listen_idle
-	JR	F_RECV_TCP.idle
+	JP	F_RECV_TCP.idle
 
 ; F_RECV_UDP: one datagram per call; oversized datagrams are truncated
 ; (UNET_RXF_TRUNC), matching unet.inc's documented UNETESP behaviour.
 F_RECV_UDP
-	LD	HL,(UNET_ARG_IX)
-	LD	A,H
-	OR	L
-	JP	Z,RET_PARAM
 	LD	A,(UNET_ARG_A)
 	CALL	SELECT_UDP_CONTEXT
 	LD	BC,(UNET_ARG_IY)
@@ -651,10 +674,10 @@ F_RECV_UDP
 	JR	NC,.udp_got
 	CP	NETDRV_ERR_CANCELLED
 	JR	Z,.udp_cancel
-	JR	F_RECV_TCP.idle
+	JP	F_RECV_TCP.idle
 .udp_cancel
 	LD	A,NERR_CANCEL
-	JR	F_RECV_TCP.empty
+	JP	F_RECV_TCP.empty
 .udp_got
 	; HL=payload, BC=length; truncate to the caller's max (UNET_ARG_IX).
 	PUSH	HL
@@ -685,14 +708,25 @@ F_RECV_UDP
 ; instead of going idle (unet.inc's documented CLOSE contract).
 ; ------------------------------------------------------
 F_CLOSE
-	IFDEF	TCPX_ASYNCSEND
-	CALL	CHECK_ASYNC_PEND
-	ENDIF
 	CALL	CHECK_CHANNEL
 	JP	C,RET_PARAM
 	LD	(UNET_ARG_A),A
 	LD	A,ST_CLOSE
 	LD	(UNET_STAGE),A
+	LD	A,(UNET_ARG_A)
+	LD	HL,UNET_APEND_ACTIVE
+	BIT	0,(HL)
+	JR	Z,.ordinary
+	LD	HL,UNET_APEND_CHANNEL
+	CP	(HL)
+	CALL	NZ,CHECK_ASYNC_PEND
+	XOR	A
+	LD	(UNET_APEND_ACTIVE),A
+	LD	A,(UNET_ARG_A)
+	CALL	@TCPX.ABORT		; same RST/status rules as ordinary CLOSE, no wait
+	CALL	CLOSE_CHANNEL.closed
+	JP	RET_A
+.ordinary
 	CALL	CLOSE_CHANNEL
 	JP	RET_A
 
@@ -709,6 +743,7 @@ CLOSE_CHANNEL
 	JR	Z,.listening
 	LD	A,(UNET_ARG_A)
 	CALL	@TCPX.CLOSE
+.closed
 	JR	NC,RELEASE_WITH_STATUS
 	CALL	CAPTURE_DIAG		; LASTERR: st=05 tcp=<raw>
 	LD	E,A
@@ -1223,6 +1258,7 @@ F_LASTERR
 ; NERR_PARAM: the id itself is not garbage).
 ; ------------------------------------------------------
 F_SETOPT
+	CALL	CHECK_ASYNC_PEND
 	CP	UNET_OPT_CANCELKEYS
 	JR	Z,.cancelkeys
 	CP	UNET_OPT_RXTRIG
@@ -1294,15 +1330,14 @@ RET_STATE
 ; the resuming SEND itself while a SEND is suspended -- completing the
 ; transaction from elsewhere would lose its byte-count result, and a later
 ; SEND retry would duplicate stream bytes (see F_SEND's own resume path).
-; RECV is deliberately NOT gated by this: it only ever serves already-
-; buffered data or polls the NIC (which is how the suspended send's ACK
-; gets discovered in the first place), never builds or sends anything.
+; RECV serves buffered bytes only. CLOSE's owner is an explicit abort;
+; CLOSE of the other channel and NETDONE remain busy.
 ; No pend: returns normally to the caller with A (the channel argument
 ; of CONNECT/CLOSE/UDPOPEN/LISTEN/UNLISTEN) untouched -- the flag is
 ; tested in place with INC/DEC (HL) for exactly that reason. A pend:
 ; drops the return into the F_ function and reports NERR_BUSY straight to
-; the DLL's caller -- every call site is the first instruction of its F_
-; function, with nothing on the stack to undo. Trashes HL (never an
+; the DLL's caller -- call sites have no saved registers or mapped pages
+; on the stack to undo. Trashes HL (never an
 ; argument register in the UNET ABI).
 ; ------------------------------------------------------
 CHECK_ASYNC_PEND
@@ -1662,6 +1697,15 @@ CHECK_BUF
 	SCF
 	RET
 
+; CHECK_RECV_BUFFER: validate saved RECV pointer and nonzero capacity.
+; Out CF=1 invalid; clobbers AF/BC/HL.
+CHECK_RECV_BUFFER
+	LD	BC,(UNET_ARG_IX)
+	LD	A,B
+	OR	C
+	SCF
+	RET	Z
+	LD	HL,(UNET_ARG_DE)
 ; CHECK_BUF_RANGE: both ends of [HL, HL+BC-1] must be usable and the
 ; range must not wrap past 0xFFFF. BC=0 checks the start only.
 ;   Out: CF=1 invalid. Trashes A, BC, HL.
@@ -1721,8 +1765,11 @@ BUILD_LASTERR
 	LD	B,6
 .field
 	LD	A,(HL)
-	ADD	A,E			; BSS_TX+13..41 cannot cross a page
+	ADD	A,E
 	LD	E,A
+	JR	NC,.field_address
+	INC	D			; the relocated template may cross a 256-byte boundary
+.field_address
 	LD	A,(IY+0)
 	INC	IY
 	CALL	FORMAT_HEX_A

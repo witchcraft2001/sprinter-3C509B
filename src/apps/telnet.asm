@@ -223,6 +223,7 @@ START
 	LD	(IDLE_SECS),A
 	LD	(SPIN_TICK),A
 	LD	(SPIN_IDX),A
+	LD	(TX_BATCH_LEN),A
 	LD	A,1
 	LD	(SESSION_ACTIVE),A
 	CALL	INIT_SCREEN
@@ -233,6 +234,7 @@ MAIN_LOOP
 	CALL	HANDLE_KEY
 	JR	C,QUIT
 	JR	NZ,.DRAIN_KEYS
+	CALL	FLUSH_TX_KEYS
 	LD	A,(LINK_DOWN)
 	OR	A
 	JP	NZ,REMOTE_CLOSED
@@ -278,6 +280,7 @@ REMOTE_CLOSED
 	JP	EXIT_FAIL
 
 QUIT
+	CALL	FLUSH_TX_KEYS			; typed keys still beat the FIN
 	CALL	NET_CLOSE
 	CALL	REST_VMODE
 	PRINTLN	MSG_DONE
@@ -335,12 +338,19 @@ SHOW_MODEM_ERROR
 ;   Out: CF=1            -> Alt+X pressed (quit).
 ;        CF=0, ZF=0 (NZ) -> a key was handled (caller drains for more).
 ;        CF=0, ZF=1 (Z)  -> no key pending.
-; Alt+X is the ONLY quit; every other key is forwarded to the host. Enter is
+; Alt+X is the ONLY quit; every other key is queued for the host. Enter is
 ; sent as the keyboard CR after TRANSMIT-BINARY is accepted, or as NVT CR,LF
 ; before that. Any other ASCII (including control codes such as Esc 0x1B, Tab,
 ; Backspace) is sent as-is, so BBSes that navigate with Esc work. Keys with no ASCII
 ; (E=0) carry a scancode in D - arrows and Home/End/PgUp/PgDn/Del are mapped to
 ; their ANSI sequences (SEND_SPECIAL_KEY); anything else is consumed.
+; Key bytes go to TX_BATCH_BUF, not straight to the wire: TCPX.SEND is
+; stop-and-wait (it returns only on the peer's cumulative ACK), so one
+; segment per key would serialize a typed burst at one RTT per character.
+; FLUSH_TX_KEYS ships the batch as a single segment once the DSS queue is
+; empty, so a burst costs one round trip -- the same latency the sibling
+; kits get from their fire-and-forget sends, without giving up the
+; retransmission this stack's single-outstanding-segment design needs.
 ; ------------------------------------------------------
 HANDLE_KEY
 	DSS_EXEC	DSS_SCANKEY
@@ -366,12 +376,15 @@ HANDLE_KEY
 	JR	Z,.YMODEM_G_DOWNLOAD
 	CP	0x16				; U position code -> Alt+U: send to remote rb
 	JR	NZ,.SEND
+	CALL	FLUSH_TX_KEYS			; typed keys precede the transfer
 	CALL	@MODEM.RUN_Y_SEND
 	JR	.YMODEM_DONE
 .YMODEM_DOWNLOAD
+	CALL	FLUSH_TX_KEYS
 	CALL	@MODEM.RUN_Y_RECEIVE
 	JR	.YMODEM_DONE
 .YMODEM_G_DOWNLOAD
+	CALL	FLUSH_TX_KEYS
 	CALL	@MODEM.RUN_Y_RECEIVE_G
 .YMODEM_DONE
 	JR	NC,.YMODEM_RESET
@@ -390,33 +403,22 @@ HANDLE_KEY
 	JR	Z,.SPECIAL			; no ASCII -> arrow/navigation key (scancode in D)
 	CP	CR
 	JR	Z,.SEND_ENTER
-	LD	(TX_KEY_BUF),A
-	LD	HL,TX_KEY_BUF
-	LD	BC,1
-	CALL	WIFI.UART_TX_BUFFER
-	CALL	NOTE_TX_RESULT
+	CALL	TX_KEY_PUT
 	JR	.HANDLED
 .SPECIAL
-	CALL	SEND_SPECIAL_KEY		; D = scancode; sends an ANSI seq if known
-	CALL	NOTE_TX_RESULT
+	CALL	SEND_SPECIAL_KEY		; D = scancode; queues an ANSI seq if known
 	JR	.HANDLED
 .SEND_ENTER
 	LD	A,CR
-	LD	(TX_KEY_BUF),A
-	LD	BC,1
+	CALL	TX_KEY_PUT
 	LD	A,(TN_PEER_SEEN)
 	OR	A
-	JR	Z,.SEND_ENTER_BYTES		; raw TCP/PTY: Enter is one keyboard CR
+	JR	Z,.HANDLED			; raw TCP/PTY: Enter is one keyboard CR
 	LD	A,(TX_BINARY)
 	OR	A
-	JR	NZ,.SEND_ENTER_BYTES		; binary mode has no NVT CR translation
+	JR	NZ,.HANDLED			; binary mode has no NVT CR translation
 	LD	A,LF
-	LD	(TX_KEY_BUF+1),A
-	INC	BC				; default NVT newline is CR,LF
-.SEND_ENTER_BYTES
-	LD	HL,TX_KEY_BUF
-	CALL	WIFI.UART_TX_BUFFER
-	CALL	NOTE_TX_RESULT
+	CALL	TX_KEY_PUT			; default NVT newline is CR,LF
 .HANDLED
 	OR	1				; ZF=0 (key handled), CF=0
 	RET
@@ -427,7 +429,7 @@ HANDLE_KEY
 
 ; ------------------------------------------------------
 ; SEND_SPECIAL_KEY: D = scancode of a non-ASCII key. If it is a known
-; navigation key, transmit its ANSI escape sequence to the host; otherwise do
+; navigation key, queue its ANSI escape sequence for the host; otherwise do
 ; nothing. Scancodes are the DSS values used by the Sprinter text editor.
 ; ------------------------------------------------------
 SEND_SPECIAL_KEY
@@ -448,20 +450,16 @@ SEND_SPECIAL_KEY
 	INC	HL
 	LD	D,(HL)				; DE -> ASCIIZ sequence
 	EX	DE,HL				; HL -> sequence
-; SEND_ASCIIZ: transmit the ASCIIZ string at HL over TCP.
+; SEND_ASCIIZ: append the ASCIIZ string at HL to the pending key batch.
 SEND_ASCIIZ
-	PUSH	HL
-	LD	BC,0
-.len
 	LD	A,(HL)
 	OR	A
-	JR	Z,.go
-	INC	HL
-	INC	BC
-	JR	.len
-.go
+	RET	Z
+	PUSH	HL
+	CALL	TX_KEY_PUT
 	POP	HL
-	JP	WIFI.UART_TX_BUFFER
+	INC	HL
+	JR	SEND_ASCIIZ
 
 ; Scancode -> ANSI sequence map (terminated by scancode 0). Arrows use normal
 ; cursor-key mode (CSI), the form BBS menus expect.
@@ -1743,6 +1741,45 @@ PUTC_STATUS
 	RET
 
 
+; ------------------------------------------------------
+; TX_KEY_PUT: append byte A to the key batch; a full batch is flushed first.
+; Clobbers AF, C, DE, HL.
+; FLUSH_TX_KEYS: send the queued batch as one TCP segment. Send failures are
+; folded into NOTE_TX_RESULT's consecutive-failure count, and a failed batch
+; is dropped rather than kept: a retransmit of its tail would duplicate bytes
+; the peer may already hold.
+; ------------------------------------------------------
+TX_KEY_PUT
+	LD	C,A				; C = byte to queue
+	LD	A,(TX_BATCH_LEN)
+	CP	TX_BATCH_SIZE
+	JR	C,.ROOM
+	PUSH	BC				; FLUSH_TX_KEYS clobbers C via NET_SEND
+	CALL	FLUSH_TX_KEYS			; batch full -> ship it before appending
+	POP	BC
+.ROOM
+	LD	A,(TX_BATCH_LEN)
+	LD	E,A
+	LD	D,0
+	LD	HL,TX_BATCH_BUF
+	ADD	HL,DE
+	LD	(HL),C
+	INC	A
+	LD	(TX_BATCH_LEN),A
+	RET
+
+FLUSH_TX_KEYS
+	LD	A,(TX_BATCH_LEN)
+	OR	A
+	RET	Z
+	LD	B,0
+	LD	C,A
+	XOR	A
+	LD	(TX_BATCH_LEN),A
+	LD	HL,TX_BATCH_BUF
+	CALL	NET_SEND
+	JP	NOTE_TX_RESULT
+
 ; Native TCP transport. Calls enter and leave with the ISA window closed.
 NET_SEND
 	XOR	A
@@ -2121,13 +2158,22 @@ ZM_STATE_BASE	EQU TELMODEM_ZM_STATE_BASE
 YM_STATE_BASE	EQU TELMODEM_YM_STATE_BASE
 TRANSFER_BSS_END EQU TELMODEM_BSS_END
 
+	; The keystroke batch sits past the cold page's pinned administration:
+	; HANDLE_KEY is never re-entered while a transfer runs, so no transfer
+	; state can share these addresses.  TX_BATCH_LEN is past the startup BSS
+	; clear (TN_STATE..TRANSFER_BSS_END), so START zeroes it explicitly.
+TX_BATCH_LEN	EQU TRANSFER_BSS_END
+TX_BATCH_SIZE	EQU 255			; stays 8-bit: TX_KEY_PUT compares against it
+TX_BATCH_BUF	EQU TX_BATCH_LEN + 1
+TX_BATCH_END	EQU TX_BATCH_BUF + TX_BATCH_SIZE
+
 	; The WIN1 entry stack is live only from the EXEC handoff to the
 	; LD SP,SCROLL_STACK_TOP in START -- two shallow DSS calls deep --
 	; so 0x80 of headroom is ample.  If the image outgrows THIS
 	; margin, shrink code; do not thin the margin further.
 	ASSERT $ <= PAGE_BASE
-	ASSERT TRANSFER_BSS_END < SCROLL_STACK_TOP - 0x0100
-	ASSERT SCROLL_STACK_TOP - TRANSFER_BSS_END >= 0x0400
+	ASSERT TX_BATCH_END < SCROLL_STACK_TOP - 0x0100
+	ASSERT SCROLL_STACK_TOP - TX_BATCH_END >= 0x0400
 	ASSERT APP_BSS_BASE >= NETCFG_SCRATCH + 0x0200
 
 	ENDMODULE
